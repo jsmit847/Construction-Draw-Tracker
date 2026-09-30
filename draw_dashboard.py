@@ -23,8 +23,9 @@ Built on the Advance__c model we mapped:
   anchor  = Date_Submitted_to_Capital_Partner__c  ("Date Full Draw Package Received")
   wire    = Wire_Date__c
 The SELECTs are built from describe(), so a field that doesn't exist in the org
-is skipped instead of breaking the query. Fields whose API names we don't know
-yet (construction manager, hold reason, notes, loan #) are found by label.
+is skipped instead of breaking the query. Deal and Property API names come from
+the org's column glossary (Column_objects_cleaned.docx); Advance__c isn't in it,
+so construction manager, hold reason and notes are still found by label there.
 
 Draws are selected straight off Advance__c by wire date, with no filter on the
 loan's status — so a draw funded one day and paid off the next still shows up
@@ -95,13 +96,27 @@ WISH_TEXT = ["Name", "Deal__r.Name", "Lender__c", "Status__c", "IC_Approval_Stat
              "Underwriter__r.Name", "Advance_Requestor__r.Name"]
 WISH_AMOUNT = ["Net_Funded_Amount__c", "Current_Draw_Amount__c", "Draw_Amount__c",
                "Advance_Amount__c", "Amount__c"]
-# Fields found by label, since we don't know their API names yet. Searched on
-# Advance__c first, then on the related Deal.
+# Deal (Opportunity) fields, API names from the org's column glossary
+# (Column_objects_cleaned.docx). role -> (candidate paths, first that exists wins; heading)
+DEAL_WISH = {
+    "loan_number":    (["Deal__r.Deal_Loan_Number__c"], "Loan #"),
+    "loan_manager":   (["Deal__r.Loan_Coordinator__r.Name", "Deal__r.Loan_Coordinator__c"], "Loan manager"),
+    "product_type":   (["Deal__r.LOC_Loan_Type__c"], "Product type"),
+    "product_sub":    (["Deal__r.Product_Sub_Type__c"], "Product sub-type"),
+    "servicer_status":(["Deal__r.Servicer_Status__c"], "Servicer loan status"),
+    "payoff_date":    (["Deal__r.Payoff_Date__c"], "Loan payoff date"),
+    "deal_comments":  (["Deal__r.Construction_Comments__c"], "Construction comments (deal)"),
+}
+# Property__c fields rolled up per deal (a deal can have several properties).
+PROPERTY_WISH = {
+    "ConstructionManagementLoanId__c": "Land Gorilla loan ID",
+    "Servicer_Loan_Number__c":         "Servicer loan #",
+}
+# Advance__c isn't in the glossary, so these are still found by label on Advance__c.
 #   key -> (label keywords, allowed field types, max fields, column heading)
 _TEXTY = ("string", "textarea", "picklist", "multipicklist")
 DISCOVER = {
     "construction_manager": (["construction manager"], _TEXTY + ("reference",), 1, "Construction manager"),
-    "loan_number":          (["loan number", "loan #", "loan no", "servicer loan"], ("string",), 1, "Loan #"),
     "hold_reason":          (["hold reason", "on hold", "delay reason", "pending reason"], _TEXTY, 2, None),
     "notes":                (["note", "comment"], ("string", "textarea"), 3, None),
 }
@@ -325,33 +340,53 @@ class Schema:
 
 
 def _discover(inst: str, tok: str) -> tuple[dict[str, list[str]], dict[str, str]]:
-    adv = _describe(inst, tok, "Advance__c")
-    deal_ref = next((f for f in adv if f["rel"] == "Deal__r" and f["ref"]), None)
-    deal = _describe(inst, tok, deal_ref["ref"]) if deal_ref else []
     roles: dict[str, list[str]] = {}
     labels: dict[str, str] = {}
     for key, (words, types, limit, heading) in DISCOVER.items():
         hits: list[str] = []
-        # prefer a field on the advance itself; fall back to the deal
-        for fields, prefix, lab_prefix in [(adv, "", ""), (deal, "Deal__r.", "Deal: ")]:
-            for f in fields:
-                if f["type"] in types and any(w in f["label"].lower() for w in words):
-                    path = (f"{prefix}{f['rel']}.Name" if f["type"] == "reference" and f["rel"]
-                            else f"{prefix}{f['name']}")
-                    if path not in hits:
-                        hits.append(path)
-                        labels[path] = heading or f"{lab_prefix}{f['label']}"
-            if hits:
-                break
+        for f in _describe(inst, tok, "Advance__c"):
+            if f["type"] in types and any(w in f["label"].lower() for w in words):
+                path = f"{f['rel']}.Name" if f["type"] == "reference" and f["rel"] else f["name"]
+                if path not in hits:
+                    hits.append(path)
+                    labels[path] = heading or f["label"]
         roles[key] = hits[:limit]
+    for key, (candidates, heading) in DEAL_WISH.items():
+        path = next((p for p in candidates if field_exists(inst, tok, p)), None)
+        roles[key] = [path] if path else []
+        if path:
+            labels[path] = heading
     return roles, labels
+
+
+def attach_property_ids(inst: str, tok: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Add Land Gorilla loan ID / servicer loan # from Property__c, joined per deal."""
+    if df.empty or "Deal__c" not in df:
+        return df
+    fields = [f for f in PROPERTY_WISH if field_exists(inst, tok, f, "Property__c")]
+    if not fields or not field_exists(inst, tok, "Deal__c", "Property__c"):
+        return df
+    deal_ids = sorted(df["Deal__c"].dropna().astype(str).unique())
+    frames = []
+    for i in range(0, len(deal_ids), 200):
+        ids = ",".join(f"'{soql_escape(x)}'" for x in deal_ids[i:i + 200])
+        frames.append(run_soql(inst, tok, f"SELECT Deal__c,{','.join(fields)} FROM Property__c "
+                                          f"WHERE Deal__c IN ({ids})"))
+    props = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if props.empty:
+        return df
+    joined = props.groupby("Deal__c")[[f for f in fields if f in props]].agg(
+        lambda s: "; ".join(dict.fromkeys(s.dropna().astype(str))) or None)
+    joined.columns = [f"Property.{c}" for c in joined.columns]
+    return df.merge(joined, left_on="Deal__c", right_index=True, how="left")
 
 
 def load_schema(inst: str, tok: str) -> Schema:
     present = {f["name"] for f in _describe(inst, tok, "Advance__c")}
     labels = {f["name"]: f["label"] for f in _describe(inst, tok, "Advance__c")}
+    labels.update({f"Property.{k}": v for k, v in PROPERTY_WISH.items()})
     fields = ["Id"]
-    for f in WISH_TEXT + [m[1] for m in MILESTONES] + ["Target_Advance_Date__c"]:
+    for f in ["Deal__c"] + WISH_TEXT + [m[1] for m in MILESTONES] + ["Target_Advance_Date__c"]:
         if f not in fields and field_exists(inst, tok, f):
             fields.append(f)
     amt = next((a for a in WISH_AMOUNT if a in present), None)
@@ -362,6 +397,23 @@ def load_schema(inst: str, tok: str) -> Schema:
     for paths in roles.values():
         fields += [p for p in paths if p not in fields]
     return Schema(fields, amt, roles, labels)
+
+
+def id_cols(schema: Schema) -> list[str | None]:
+    """Columns that identify a draw: advance, property, loan numbers, product."""
+    return ["Name", "Deal__r.Name", schema.role("loan_number"),
+            *[f"Property.{k}" for k in PROPERTY_WISH],
+            schema.role("product_type"), schema.role("product_sub"), "Lender__c", "Status__c"]
+
+
+def people_cols(schema: Schema) -> list[str | None]:
+    return [schema.role("construction_manager"), schema.role("loan_manager"),
+            "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name"]
+
+
+def note_cols(schema: Schema) -> list[str | None]:
+    return [*schema.roles.get("hold_reason", []), "Exception__c", *schema.roles.get("notes", []),
+            schema.role("deal_comments")]
 
 
 # ───────────────────────────── turn-time math ───────────────────────────────
@@ -392,7 +444,7 @@ def add_intervals(df: pd.DataFrame, same_day_as: int) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    for _, f in MILESTONES:
+    for f in [m[1] for m in MILESTONES] + [DEAL_WISH["payoff_date"][0][0]]:
         if f in df:
             df[f] = to_date(df[f])
     if PKG_FIELD in df and WIRE_FIELD in df:
@@ -567,10 +619,10 @@ def render_pulse(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
         aged = aged.sort_values("Days open", ascending=False)
         show = [c for c in ["Name", "Deal__r.Name", "Status__c", "Days open"] if c in aged]
         st.dataframe(aged[show].head(15).rename(columns=schema.label), width="stretch", height=300)
-        cols = [c for c in ["Name", "Deal__r.Name", schema.role("loan_number"), "Lender__c", "Status__c",
-                            *hold_cols, schema.role("construction_manager"), "Advance_Coordinator__r.Name",
-                            amt, *[m[1] for m in MILESTONES], "Days open",
-                            *schema.roles.get("notes", [])] if c and c in aged]
+        aged = attach_property_ids(inst, tok, aged)
+        cols = [*id_cols(schema), *people_cols(schema), amt, *[m[1] for m in MILESTONES],
+                "Days open", *note_cols(schema)]
+        cols = list(dict.fromkeys(c for c in cols if c and c in aged))
         st.download_button("Download open pipeline (Excel)",
                            build_workbook({"Open draws": aged[cols].rename(columns=schema.label)},
                                           money_cols=(schema.label(amt),) if amt else ()),
@@ -625,13 +677,10 @@ def build_detail(df: pd.DataFrame, schema: Schema, inst: str) -> pd.DataFrame:
                                   np.where(df["turn_bd"] <= 3, "Yes", "No"))
     if "Id" in df:
         df["sf_link"] = inst.rstrip("/") + "/" + df["Id"].astype(str)
-    cols = ["Name", "Deal__r.Name", schema.role("loan_number"), "Lender__c", "Status__c",
-            schema.role("construction_manager"), "Advance_Coordinator__r.Name",
-            "Advance_Analyst__r.Name", schema.amt,
+    cols = [*id_cols(schema), *people_cols(schema), schema.amt,
             *[m[1] for m in MILESTONES],
             "turn_bd", "within_3", "prepkg_bd", "total_bd", *stage_cols, "longest_stage",
-            *schema.roles.get("hold_reason", []), "Exception__c",
-            *schema.roles.get("notes", []), "sf_link"]
+            *note_cols(schema), schema.role("payoff_date"), schema.role("servicer_status"), "sf_link"]
     cols = list(dict.fromkeys(c for c in cols if c and c in df))
     out = df[cols].rename(columns=schema.label)
     seen: dict[str, int] = {}
@@ -712,7 +761,9 @@ def group_summary(df: pd.DataFrame, by: pd.Series, name: str, amt: str | None) -
 DEFINITIONS = pd.DataFrame([
     ("Scope", "Salesforce Advance__c records with record type 'Construction Advance', "
               "wire date inside the report window. No filter on loan status, so draws on loans "
-              "paid off after funding are still included."),
+              "paid off after funding are still included ('Loan payoff date' shows which)."),
+    ("Land Gorilla loan ID", "From the deal's Property records (ConstructionManagementLoanId__c). "
+                             "Small-balance RTL / fix-and-flip loans start with RB0."),
     ("Official turn-time", "Business days from 'Date full draw package received' "
                            "(Date_Submitted_to_Capital_Partner__c) to wire date. Weekends and US "
                            "federal holidays excluded. This is the internal funding time."),
@@ -744,7 +795,7 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
         f"SELECT {schema.select} FROM Advance__c WHERE RecordTypeId='{rt}' "
         f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d} "
         f"ORDER BY {WIRE_FIELD}")
-    df = add_intervals(raw, same_day)
+    df = attach_property_ids(inst, tok, add_intervals(raw, same_day))
     if df.empty:
         st.info("No construction draws were wired in this window.")
         return
@@ -752,7 +803,14 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
     # --- optional filters ---
     mgr_col = schema.role("construction_manager") or "Advance_Coordinator__r.Name"
     with st.expander("Filters"):
-        f = st.columns(3)
+        f = st.columns(4)
+        prod = schema.role("product_type")
+        if prod and prod in df:
+            types = sorted(df[prod].dropna().astype(str).unique())
+            pick = f[3].multiselect("Product type", types,
+                                    help="e.g. keep small-balance RTL / fix-and-flip, drop build-to-rent.")
+            if pick:
+                df = df[df[prod].astype(str).isin(pick)]
         if "Lender__c" in df:
             lenders = sorted(df["Lender__c"].dropna().astype(str).unique())
             pick = f[0].multiselect("Lender", lenders)
@@ -828,7 +886,8 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
 
     missing = [lbl for key, lbl in [("construction_manager", "construction manager"),
                                     ("hold_reason", "hold / delay reason"),
-                                    ("loan_number", "loan #")] if not schema.roles.get(key)]
+                                    ("loan_number", "loan #"),
+                                    ("product_type", "product type")] if not schema.roles.get(key)]
     if missing:
         st.caption("Not found in Salesforce by label (so not in the export yet): "
                    + ", ".join(missing) + ". Share the field names and they can be added.")
@@ -853,17 +912,20 @@ def render_lookup(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
     st.subheader("Draw Lookup")
     c = st.columns([3, 1])
     text = c[0].text_input("Search by property / deal name or advance #", placeholder="e.g. 745 South 9th Street")
-    mode = c[1].radio("Match on", ["Property / Deal", "Advance #"], label_visibility="collapsed")
+    modes = {"Property / Deal": "Deal__r.Name", "Advance #": "Name"}
+    if schema.role("loan_number"):
+        modes["Loan #"] = schema.role("loan_number")
+    mode = c[1].radio("Match on", list(modes), label_visibility="collapsed")
     if not text:
         st.info("Type a property/deal name or an advance number to see its full draw cycle.")
         return
 
     esc = soql_escape(text)
-    field = "Deal__r.Name" if mode.startswith("Property") else "Name"
+    field = modes[mode]
     df = run_soql(inst, tok,
         f"SELECT {schema.select} FROM Advance__c WHERE RecordTypeId='{rt}' "
         f"AND {field} LIKE '%{esc}%' ORDER BY {REQ_FIELD} DESC NULLS LAST")
-    df = add_intervals(df, same_day)
+    df = attach_property_ids(inst, tok, add_intervals(df, same_day))
     if df.empty:
         st.warning("No matching construction advances.")
         return
@@ -900,8 +962,9 @@ def _render_one_draw(row: pd.Series, schema: Schema):
                  column_config={"": st.column_config.TextColumn(width="small")})
 
     meta = []
-    for f in [schema.role("loan_number"), "Lender__c", schema.role("construction_manager"),
-              "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
+    for f in [schema.role("loan_number"), *[f"Property.{k}" for k in PROPERTY_WISH],
+              schema.role("product_type"), "Lender__c", schema.role("construction_manager"),
+              schema.role("loan_manager"), "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
               "Underwriter__r.Name", "Advance_Requestor__r.Name",
               *schema.roles.get("hold_reason", [])]:
         if f and f in row and pd.notna(row[f]):
