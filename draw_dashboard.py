@@ -600,7 +600,8 @@ def _style(chart: alt.Chart, title: str, subtitle: str | None = None, height: in
                 title=alt.TitleParams(title, subtitle=subtitle or "", anchor="start", fontSize=16,
                                       color=NAVY, subtitleColor=ORANGE, subtitleFontSize=12,
                                       subtitleFontWeight="bold", offset=12),
-                height=height, background="white", padding=12)
+                height=height, background="white",
+                padding={"left": 12, "right": 12, "top": 12, "bottom": 12})
             .configure_view(stroke=None)
             .configure_axis(labelColor=INK, titleColor=MUTED, gridColor="#EEEEEE",
                             domainColor="#CCCCCC", tickColor="#CCCCCC", labelFontSize=11, titleFontSize=11))
