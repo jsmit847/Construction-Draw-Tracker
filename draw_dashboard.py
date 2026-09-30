@@ -3,17 +3,18 @@ Construction Draw Dashboard  (Streamlit)
 ========================================
 Same Salesforce OAuth login as the AM slide app, then three views:
 
+  • Turn-Time Report  — (default view) on-demand, any period (last month / quarter /
+                        year, to-date, all time or a custom range): every construction
+                        draw wired in the window, official turn-time (full draw package
+                        received -> wire, business days), InspRpt->Wire cross-check,
+                        pre-package (borrower/inspection/title) and total elapsed time.
+                        Excel workbook in the same shape as the notebook export: Read Me,
+                        Turn-Time Summary (headline, By Year, By Quarter, % <=3 bd chart),
+                        Draw Detail (pivot source with Wire Year/Quarter/Month), By Month,
+                        By Coordinator.
   • Pipeline Pulse    — what's happening now: open draws by stage, on-hold draws,
-                        completed this period ($ and count), recent wires, aging,
-                        and the median business-day turn-time (package -> wire).
+                        completed this period ($ and count), recent wires, aging.
                         Open pipeline downloads to Excel for the Thursday call.
-  • Turn-Time Report  — on-demand, any period (last month / quarter / year or a
-                        custom range): every draw wired in the window with its
-                        milestone dates, wire date, construction manager, notes,
-                        stage-by-stage business days, and the official turn-time
-                        (full draw package received -> wire). One-click Excel
-                        workbook: Summary, Draw Detail, By Month, By Manager,
-                        Definitions.
   • Draw Lookup       — type a property/deal or advance # and see the full draw
                         cycle for each matching advance: milestone timeline,
                         status, amounts, and the two turn-time intervals.
@@ -123,7 +124,7 @@ DISCOVER = {
 OPEN_EXCLUDE_STATUS = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
 
 PERIODS = ["Last month", "Last quarter", "Last year", "Month to date", "Quarter to date",
-           "Year to date", "Last 90 days", "Custom range"]
+           "Year to date", "Last 90 days", "All time", "Custom range"]
 
 _HOLS = USFederalHolidayCalendar().holidays("2018-01-01", "2032-12-31").values.astype("datetime64[D]")
 
@@ -429,14 +430,15 @@ def to_date(s: pd.Series) -> pd.Series:
     return out
 
 
-def bdays(a: pd.Series, b: pd.Series, same_day_as: int) -> pd.Series:
+def bdays(a: pd.Series, b: pd.Series, same_day_as: int, drop_negative: bool = True) -> pd.Series:
     a, b = pd.to_datetime(a, errors="coerce"), pd.to_datetime(b, errors="coerce")
     m = a.notna() & b.notna()
     out = pd.Series(np.nan, index=a.index)
     if m.any():
         out[m] = np.busday_count(a[m].values.astype("datetime64[D]"),
                                  b[m].values.astype("datetime64[D]"), holidays=_HOLS) + same_day_as
-    out[out < 0] = np.nan
+    if drop_negative:
+        out[out < 0] = np.nan
     return out
 
 
@@ -447,12 +449,16 @@ def add_intervals(df: pd.DataFrame, same_day_as: int) -> pd.DataFrame:
     for f in [m[1] for m in MILESTONES] + [DEAL_WISH["payoff_date"][0][0]]:
         if f in df:
             df[f] = to_date(df[f])
-    if PKG_FIELD in df and WIRE_FIELD in df:
-        df["turn_bd"] = bdays(df[PKG_FIELD], df[WIRE_FIELD], same_day_as)
-    if REQ_FIELD in df and PKG_FIELD in df:
-        df["prepkg_bd"] = bdays(df[REQ_FIELD], df[PKG_FIELD], same_day_as)
-    if REQ_FIELD in df and WIRE_FIELD in df:
-        df["total_bd"] = bdays(df[REQ_FIELD], df[WIRE_FIELD], same_day_as)
+    # official + secondary intervals; a negative one means reversed dates -> blank it, flag the row
+    df["reversed_dates"] = False
+    for key, a, b in [("turn_bd", PKG_FIELD, WIRE_FIELD),       # OFFICIAL: complete package -> wire
+                      ("insp_wire_bd", RPT_FIELD, WIRE_FIELD),  # broader-coverage cross-check
+                      ("prepkg_bd", REQ_FIELD, PKG_FIELD),      # borrower / inspection / title side
+                      ("total_bd", REQ_FIELD, WIRE_FIELD)]:     # total elapsed
+        if a in df and b in df:
+            v = bdays(df[a], df[b], same_day_as, drop_negative=False)
+            df["reversed_dates"] |= (v < 0).fillna(False)
+            df[key] = v.where(v >= 0)
     for key, _, a, b in STAGES:
         if a in df and b in df:
             df[key] = bdays(df[a], df[b], 0)
@@ -481,6 +487,8 @@ def period_bounds(choice: str, today: date | None = None) -> tuple[date, date]:
         return date(end.year, 3 * ((end.month - 1) // 3) + 1, 1), end
     if choice == "Last year":
         return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    if choice == "All time":
+        return date(2018, 1, 1), today
     raise ValueError(f"Unknown period: {choice}")
 
 
@@ -505,40 +513,135 @@ def money(x) -> str:
 
 
 # ───────────────────────────── Excel export ─────────────────────────────────
-def build_workbook(sheets: dict[str, pd.DataFrame], money_cols: tuple[str, ...] = ()) -> bytes:
-    """Write DataFrames to an .xlsx with bold frozen headers, filters, widths, date formats."""
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+# Same look as the notebook export: Arial 10, navy header row, thin grey borders.
+def _xl_styles():
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    thin = Side(style="thin", color="D9D9D9")
+    return {
+        "body": Font(name="Arial", size=10), "bold": Font(name="Arial", size=10, bold=True),
+        "head": Font(name="Arial", size=10, bold=True, color="FFFFFF"),
+        "fill": PatternFill("solid", fgColor="1F3864"),
+        "title": Font(name="Arial", size=14, bold=True, color="1F3864"),
+        "sub": Font(name="Arial", size=9, italic=True, color="808080"),
+        "border": Border(left=thin, right=thin, top=thin, bottom=thin),
+        "center": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        "wrap": Alignment(wrap_text=True, vertical="top"),
+    }
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for name, df in sheets.items():
-            df.to_excel(xw, sheet_name=name[:31], index=False)
-            ws = xw.sheets[name[:31]]
-            ws.freeze_panes = "A2"
-            if len(df):
-                ws.auto_filter.ref = ws.dimensions
-            for cell in ws[1]:
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill("solid", fgColor="1F4E78")
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-            for i, col in enumerate(df.columns, start=1):
-                letter = get_column_letter(i)
-                series = df[col]
-                is_date = pd.api.types.is_datetime64_any_dtype(series)
-                longest = max([len(str(col))] + [len(str(v)) for v in series.head(500) if pd.notna(v)])
-                width = 12 if is_date else min(max(10, longest + 2), 60)
-                ws.column_dimensions[letter].width = width
-                fmt = ("mm/dd/yyyy" if is_date else
-                       "$#,##0" if col in money_cols else
-                       "0.0%" if str(col).startswith("%") else None)
-                wrap = longest > 60
-                if fmt or wrap:
-                    for cell in ws[letter][1:]:
-                        if fmt:
-                            cell.number_format = fmt
-                        if wrap:
-                            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+def _cell_value(v):
+    if v is None or (np.ndim(v) == 0 and pd.isna(v)):
+        return None
+    if isinstance(v, np.generic):
+        return v.item()
+    return v
+
+
+def write_df(ws, df: pd.DataFrame, r0: int, c0: int = 1, money_cols=(), pct_cols=()) -> int:
+    """Write a header + rows at (r0, c0); returns the next free row."""
+    s = _xl_styles()
+    for j, col in enumerate(df.columns):
+        cell = ws.cell(r0, c0 + j, col)
+        cell.font, cell.fill, cell.border, cell.alignment = s["head"], s["fill"], s["border"], s["center"]
+    for i, row in enumerate(df.itertuples(index=False), start=r0 + 1):
+        for j, (col, v) in enumerate(zip(df.columns, row)):
+            cell = ws.cell(i, c0 + j, _cell_value(v))
+            cell.font, cell.border = s["body"], s["border"]
+            if isinstance(cell.value, (datetime, date)):
+                cell.number_format = "mm/dd/yyyy"
+            elif col in money_cols:
+                cell.number_format = "$#,##0"
+            elif col in pct_cols:
+                cell.number_format = "0%"
+    return r0 + len(df) + 1
+
+
+def _size_columns(ws, df: pd.DataFrame, c0: int = 1, wide: tuple[str, ...] = ()):
+    from openpyxl.utils import get_column_letter
+    for j, col in enumerate(df.columns):
+        vals = [len(str(v)) for v in df[col].head(500) if pd.notna(v)]
+        is_date = pd.api.types.is_datetime64_any_dtype(df[col])
+        width = 14 if is_date else min(max([len(str(col)) * 0.9, 10] + vals) + 2, 60)
+        ws.column_dimensions[get_column_letter(c0 + j)].width = 34 if col in wide else width
+
+
+def _table_sheet(wb, name: str, df: pd.DataFrame, money_cols=(), pct_cols=(), wrap_cols=()):
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet(name[:31])
+    write_df(ws, df, 1, money_cols=money_cols, pct_cols=pct_cols)
+    ws.freeze_panes = "A2"
+    if len(df):
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df) + 1}"
+    _size_columns(ws, df)
+    s = _xl_styles()
+    for j, col in enumerate(df.columns, start=1):
+        if col in wrap_cols:
+            ws.column_dimensions[get_column_letter(j)].width = 50
+            for r in range(2, len(df) + 2):
+                ws.cell(r, j).alignment = s["wrap"]
+    return ws
+
+
+def build_workbook(sheets: dict[str, pd.DataFrame], money_cols: tuple[str, ...] = ()) -> bytes:
+    """Plain multi-sheet export (used for the open pipeline)."""
+    import openpyxl
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    for name, df in sheets.items():
+        _table_sheet(wb, name, df, money_cols=money_cols)
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue()
+
+
+def build_turn_time_workbook(*, readme: list[tuple[str, str]], headline: list[tuple[str, str]],
+                             subtitle: str, rollups: dict[str, pd.DataFrame], detail: pd.DataFrame,
+                             money_cols=(), wrap_cols=()) -> bytes:
+    """Read Me · Turn-Time Summary (headline, By Year, By Quarter, chart) · Draw Detail · extra rollups."""
+    import openpyxl
+    from openpyxl.chart import BarChart, Reference
+    s = _xl_styles()
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+
+    rm = wb.create_sheet("Read Me")
+    rm["A1"] = "Construction Draw Turn-Time Report"; rm["A1"].font = s["title"]
+    for r, (k, v) in enumerate(readme, start=3):
+        rm.cell(r, 1, k).font = s["bold"]
+        c = rm.cell(r, 2, v); c.font = s["body"]; c.alignment = s["wrap"]
+    rm.column_dimensions["A"].width = 26; rm.column_dimensions["B"].width = 95
+
+    sm = wb.create_sheet("Turn-Time Summary")
+    sm["A1"] = "Turn-Time Summary — Full Draw Package Received → Wire"; sm["A1"].font = s["title"]
+    sm["A2"] = subtitle; sm["A2"].font = s["sub"]
+    r = 4
+    for k, v in headline:
+        a, b = sm.cell(r, 1, k), sm.cell(r, 2, v)
+        a.font, b.font, a.border, b.border = s["bold"], s["body"], s["border"], s["border"]
+        r += 1
+    pct = ("% ≤3 bd",)
+    for title in ["By Year", "By Quarter"]:
+        tbl = rollups.get(title)
+        if tbl is None or tbl.empty:
+            continue
+        r += 1; sm.cell(r, 1, title).font = s["title"]; r += 1
+        top = r
+        r = write_df(sm, tbl, r, money_cols=money_cols, pct_cols=pct)
+        if title == "By Quarter" and "% ≤3 bd" in tbl:
+            col = list(tbl.columns).index("% ≤3 bd") + 1
+            ch = BarChart(); ch.title = "% funded within 3 business days, by quarter"
+            ch.y_axis.title = "% ≤3 bd"; ch.y_axis.numFmt = "0%"; ch.height, ch.width = 7, 18
+            ch.add_data(Reference(sm, min_col=col, min_row=top, max_row=top + len(tbl)), titles_from_data=True)
+            ch.set_categories(Reference(sm, min_col=1, min_row=top + 1, max_row=top + len(tbl)))
+            ch.legend = None
+            sm.add_chart(ch, "H4")
+    sm.column_dimensions["A"].width = 46
+    for col in "BCDEF":
+        sm.column_dimensions[col].width = 16
+
+    _table_sheet(wb, "Draw Detail", detail, money_cols=money_cols, wrap_cols=wrap_cols)
+    for name, tbl in rollups.items():
+        if name not in ("By Year", "By Quarter") and tbl is not None and not tbl.empty:
+            _table_sheet(wb, name, tbl, money_cols=money_cols, pct_cols=pct)
+
+    buf = io.BytesIO(); wb.save(buf)
     return buf.getvalue()
 
 
@@ -651,6 +754,7 @@ def render_pulse(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
 # ───────────────────────────── UI: Turn-Time Report ─────────────────────────
 TURN_BUCKETS = [(-1, 0, "0 bd"), (0, 1, "1 bd"), (1, 2, "2 bd"), (2, 3, "3 bd"),
                 (3, 5, "4–5 bd"), (5, 10, "6–10 bd"), (10, np.inf, "11+ bd")]
+INTERVALS = ["turn_bd", "insp_wire_bd", "prepkg_bd", "total_bd"]
 
 
 def _pct(s: pd.Series, limit: int) -> float | None:
@@ -663,26 +767,44 @@ def _med(s: pd.Series) -> float | None:
     return float(s.median()) if len(s) else None
 
 
+def _q90(s: pd.Series) -> float | None:
+    s = s.dropna()
+    return float(s.quantile(0.9)) if len(s) else None
+
+
+def _fmt_bd(x: float | None) -> str:
+    return "—" if x is None or pd.isna(x) else f"{x:.0f}"
+
+
+def _fmt_pct(x: float | None) -> str:
+    return "—" if x is None else f"{x:.0%}"
+
+
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    return df[name] if name in df else pd.Series(np.nan, index=df.index)
+
+
 def build_detail(df: pd.DataFrame, schema: Schema, inst: str) -> pd.DataFrame:
-    """One row per draw, in the column order Melanie asked for, with readable headings."""
+    """One row per draw — the pivot source. Notebook column order, plus deal/property IDs."""
     df = df.copy()
-    stage_cols = [k for k, *_ in STAGES if k in df]
-    if stage_cols:
-        stage_names = {k: lbl.replace(" (bd)", "") for k, lbl, *_ in STAGES}
-        has = df[stage_cols].notna().any(axis=1)
-        df["longest_stage"] = None
-        df.loc[has, "longest_stage"] = df.loc[has, stage_cols].idxmax(axis=1).map(stage_names)
-    if "turn_bd" in df:
-        df["within_3"] = np.where(df["turn_bd"].isna(), None,
-                                  np.where(df["turn_bd"] <= 3, "Yes", "No"))
+    if WIRE_FIELD in df:
+        w = df[WIRE_FIELD]
+        df["wire_year"] = w.dt.year.astype("Int64")
+        df["wire_quarter"] = w.dt.to_period("Q").astype(str).replace("NaT", None)
+        df["wire_month"] = w.dt.to_period("M").astype(str).replace("NaT", None)
     if "Id" in df:
         df["sf_link"] = inst.rstrip("/") + "/" + df["Id"].astype(str)
-    cols = [*id_cols(schema), *people_cols(schema), schema.amt,
-            *[m[1] for m in MILESTONES],
-            "turn_bd", "within_3", "prepkg_bd", "total_bd", *stage_cols, "longest_stage",
-            *note_cols(schema), schema.role("payoff_date"), schema.role("servicer_status"), "sf_link"]
+    cols = ["Name", "Deal__r.Name", schema.role("loan_number"), *[f"Property.{k}" for k in PROPERTY_WISH],
+            schema.role("product_type"), "Lender__c", "Status__c", "IC_Approval_Status__c",
+            schema.role("construction_manager"), "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
+            "Underwriter__r.Name", schema.role("loan_manager"), "Exception__c", "Cancellation_Reason__c",
+            "Inspection_Method__c", schema.amt,
+            *[m[1] for m in MILESTONES], *INTERVALS,
+            *schema.roles.get("hold_reason", []), *schema.roles.get("notes", []),
+            schema.role("deal_comments"), schema.role("payoff_date"), schema.role("servicer_status"),
+            "wire_year", "wire_quarter", "wire_month", "sf_link"]
     cols = list(dict.fromkeys(c for c in cols if c and c in df))
-    out = df[cols].rename(columns=schema.label)
+    out = df.sort_values(WIRE_FIELD, ascending=False)[cols].rename(columns=schema.label)
     seen: dict[str, int] = {}
     heads = []
     for h in out.columns:       # two fields can share a label; keep headings unique
@@ -692,100 +814,78 @@ def build_detail(df: pd.DataFrame, schema: Schema, inst: str) -> pd.DataFrame:
     return out
 
 
-def build_summary(df: pd.DataFrame, schema: Schema, start: date, end: date,
-                  period: str, same_day: int) -> pd.DataFrame:
-    t = df.get("turn_bd", pd.Series(dtype=float))
-    rows = [
-        ("Report period", period),
-        ("Wire date from", start.strftime("%m/%d/%Y")),
-        ("Wire date to", end.strftime("%m/%d/%Y")),
-        ("Generated", datetime.now().strftime("%m/%d/%Y %I:%M %p")),
-        ("Same-day convention", f"Package in and wired same day = {same_day} business day(s)"),
-        ("", ""),
-        ("Draws wired", len(df)),
-    ]
-    if schema.amt and schema.amt in df:
-        rows.append(("Total funded", money(pd.to_numeric(df[schema.amt], errors="coerce").sum())))
-    measured = int(t.notna().sum())
-    rows += [
-        ("Draws with a full-package date (measured)", measured),
-        ("Measured coverage", f"{measured / len(df):.0%}" if len(df) else "—"),
-        ("", ""),
-        ("OFFICIAL TURN-TIME: full package received → wire", ""),
-        ("  Median (business days)", _fmt_bd(_med(t))),
-        ("  Average (business days)", _fmt_bd(float(t.mean()) if measured else None)),
-        ("  Funded within 1 business day", _fmt_pct(_pct(t, 1))),
-        ("  Funded within 3 business days", _fmt_pct(_pct(t, 3))),
-        ("  Funded within 5 business days", _fmt_pct(_pct(t, 5))),
-        ("", ""),
-        ("BORROWER / THIRD-PARTY TIME: request → full package", ""),
-        ("  Median (business days)", _fmt_bd(_med(df.get("prepkg_bd", pd.Series(dtype=float))))),
-    ]
-    for key, lbl, *_ in STAGES:
-        if key in df:
-            rows.append((f"    {lbl.replace(' (bd)', '')} — median bd", _fmt_bd(_med(df[key]))))
-    rows += [
-        ("", ""),
-        ("END TO END: request → wire", ""),
-        ("  Median (business days)", _fmt_bd(_med(df.get("total_bd", pd.Series(dtype=float))))),
-    ]
-    return pd.DataFrame(rows, columns=["Metric", "Value"])
-
-
-def _fmt_bd(x: float | None) -> str:
-    return "—" if x is None or pd.isna(x) else f"{x:.1f}"
-
-
-def _fmt_pct(x: float | None) -> str:
-    return "—" if x is None else f"{x:.0%}"
-
-
-def group_summary(df: pd.DataFrame, by: pd.Series, name: str, amt: str | None) -> pd.DataFrame:
+def rollup(df: pd.DataFrame, by: pd.Series, name: str, amt: str | None) -> pd.DataFrame:
+    """Per-group turn-time stats (official metric over draws that have a package date)."""
     g = df.groupby(by, dropna=False)
-    out = pd.DataFrame({"Draws wired": g.size()})
+    t = _col(df, "turn_bd")
+    out = pd.DataFrame({"Draws wired": g.size(), "Measured": t.groupby(by, dropna=False).count()})
     if amt and amt in df:
-        out["Funded $"] = g[amt].apply(lambda s: pd.to_numeric(s, errors="coerce").sum())
-    if "turn_bd" in df:
-        out["Measured"] = g["turn_bd"].count()
-        out["Median turn-time (bd)"] = g["turn_bd"].median().round(1)
-        out["Avg turn-time (bd)"] = g["turn_bd"].mean().round(1)
-        out["% within 3 bd"] = g["turn_bd"].apply(lambda s: _pct(s, 3))
-    if "prepkg_bd" in df:
-        out["Median request → package (bd)"] = g["prepkg_bd"].median().round(1)
-    if "total_bd" in df:
-        out["Median request → wire (bd)"] = g["total_bd"].median().round(1)
+        out["Funded $"] = pd.to_numeric(df[amt], errors="coerce").groupby(by, dropna=False).sum()
+    tg = t.groupby(by, dropna=False)
+    out["Median bd"] = tg.median()
+    out["Mean bd"] = tg.mean().round(1)
+    out["% ≤3 bd"] = tg.apply(lambda s: _pct(s, 3))
+    out["Median Pre-Package bd"] = _col(df, "prepkg_bd").groupby(by, dropna=False).median()
     out.index.name = name
     return out.reset_index()
 
 
-DEFINITIONS = pd.DataFrame([
-    ("Scope", "Salesforce Advance__c records with record type 'Construction Advance', "
-              "wire date inside the report window. No filter on loan status, so draws on loans "
-              "paid off after funding are still included ('Loan payoff date' shows which)."),
-    ("Land Gorilla loan ID", "From the deal's Property records (ConstructionManagementLoanId__c). "
-                             "Small-balance RTL / fix-and-flip loans start with RB0."),
-    ("Official turn-time", "Business days from 'Date full draw package received' "
-                           "(Date_Submitted_to_Capital_Partner__c) to wire date. Weekends and US "
-                           "federal holidays excluded. This is the internal funding time."),
-    ("Full draw package", "Package is complete only when everything needed to fund is in hand — "
-                          "e.g. inspection report, lien waivers, title cleared. A draw with an "
-                          "open lien is not a complete package until the lien is resolved."),
-    ("Request → full package", "Business days from draw requested to full package received — time "
-                               "waiting on the borrower, inspection, title or other conditions."),
-    ("Stage columns", "Plain business-day counts between consecutive milestones, to show where "
-                      "pre-package time went. 'Longest stage' is the biggest of those."),
-    ("Request → wire", "End-to-end business days, borrower request to funding."),
-    ("Blank values", "A blank interval means one of its two dates is not recorded in Salesforce. "
-                     "Those draws are excluded from medians and percentages."),
-    ("Same-day convention", "Whether a package received and wired the same day counts as 0 or 1 "
-                            "business day (sidebar setting; shown on the Summary sheet)."),
-], columns=["Term", "Definition"])
+def headline_rows(df: pd.DataFrame, amt: str | None) -> list[tuple[str, str]]:
+    t, n = _col(df, "turn_bd"), len(df)
+    no = int(t.notna().sum())
+    ins = _col(df, "insp_wire_bd"); pre = _col(df, "prepkg_bd")
+    rows = [("Construction advances (wired)", f"{n:,}")]
+    if amt and amt in df:
+        rows.append(("Total funded", money(pd.to_numeric(df[amt], errors="coerce").sum())))
+    rows += [
+        ("…with a Full Draw Package Received date", f"{no:,}  ({no / n:.0%} coverage)" if n else "0"),
+        ("Median turn-time (business days)", _fmt_bd(_med(t))),
+        ("Mean turn-time (business days)", "—" if not no else f"{t.mean():.1f}"),
+        ("% funded within 1 business day", _fmt_pct(_pct(t, 1))),
+        ("% funded within 3 business days", _fmt_pct(_pct(t, 3))),
+        ("% funded within 5 business days", _fmt_pct(_pct(t, 5))),
+        ("Median PRE-package (borrower/inspection/title)",
+         f"{_fmt_bd(_med(pre))} bd  (90th pct {_fmt_bd(_q90(pre))})"),
+        ("Median total elapsed (request → wire)", f"{_fmt_bd(_med(_col(df, 'total_bd')))} bd"),
+        ("Secondary view — Inspection Report→Wire",
+         f"median {_fmt_bd(_med(ins))} bd, {_fmt_pct(_pct(ins, 3))} ≤3  (n={int(ins.notna().sum()):,})"),
+    ]
+    return rows
+
+
+def readme_rows(*, period: str, start: date, end: date, same_day: int, coverage: float,
+                reversed_rows: int, filters: list[str]) -> list[tuple[str, str]]:
+    return [
+        ("Generated", datetime.now().strftime("%m/%d/%Y %H:%M")),
+        ("Report period", f"{period}  ·  wire date {start:%m/%d/%Y} – {end:%m/%d/%Y}"),
+        ("Filters", "; ".join(filters) if filters else "None"),
+        ("Source", "Salesforce Advance__c · Record Type: Construction Advance · wired advances only. "
+                   "No filter on loan status, so draws on loans paid off after funding are included."),
+        ("Official metric", "Business days from FULL DRAW PACKAGE RECEIVED to WIRE DATE"),
+        ("  field used", "Date_Submitted_to_Capital_Partner__c  (label: 'Date Full Draw Package Received')"),
+        ("Business days", "Excludes weekends and US federal bank holidays"),
+        ("Same-day convention", f"package-in / wire same-day = {same_day} business day(s)"),
+        ("Coverage caveat", f"Only {coverage:.0%} of these draws carry a package-received date; the metric "
+                            "covers that subset. Fuller coverage needs the Land Gorilla feed / better SF data "
+                            "entry (ref ticket IHD-109768)."),
+        ("Complete package", "A package is complete only when everything needed to fund is in hand — a draw "
+                             "with an open lien or title issue is not complete until it is resolved."),
+        ("Delay story", "For completed draws Status shows 'Completed' only (hold history not retained). Use "
+                        "the Pre-Package interval (Req→Package) as the borrower/inspection/title delay measure."),
+        ("Secondary view", "Inspection Report Received→Wire is included for broader coverage as a cross-check."),
+        ("Reversed-date rows", f"{reversed_rows} rows had an end date before the start date; those intervals "
+                               "were blanked and excluded from metrics."),
+        ("Land Gorilla loan ID", "From the deal's Property records (ConstructionManagementLoanId__c). "
+                                 "Small-balance RTL / fix-and-flip loans start with RB0."),
+        ("How to filter by period", "Use 'Draw Detail' → filter on Wire Year / Wire Quarter / Wire Month, "
+                                    "or build a PivotTable off that sheet."),
+    ]
 
 
 def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
     st.subheader("Turn-Time Report")
-    st.caption("Every construction draw wired in the window, with milestone dates and business-day "
-               "turn-times. Download as Excel for pivots or management requests.")
+    st.caption("Business days from full draw package received to wire, for every construction draw "
+               "wired in the window. Download the Excel workbook for pivots or management requests.")
     amt = schema.amt
     top = st.columns([1, 1, 2])
     start, end, period = period_picker(top[0], "report", PERIODS, index=0)
@@ -802,42 +902,45 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
 
     # --- optional filters ---
     mgr_col = schema.role("construction_manager") or "Advance_Coordinator__r.Name"
+    applied: list[str] = []
     with st.expander("Filters"):
         f = st.columns(4)
-        prod = schema.role("product_type")
-        if prod and prod in df:
-            types = sorted(df[prod].dropna().astype(str).unique())
-            pick = f[3].multiselect("Product type", types,
-                                    help="e.g. keep small-balance RTL / fix-and-flip, drop build-to-rent.")
-            if pick:
-                df = df[df[prod].astype(str).isin(pick)]
-        if "Lender__c" in df:
-            lenders = sorted(df["Lender__c"].dropna().astype(str).unique())
-            pick = f[0].multiselect("Lender", lenders)
-            if pick:
-                df = df[df["Lender__c"].astype(str).isin(pick)]
-        if mgr_col in df:
-            mgrs = sorted(df[mgr_col].dropna().astype(str).unique())
-            pick = f[1].multiselect(schema.label(mgr_col), mgrs)
-            if pick:
-                df = df[df[mgr_col].astype(str).isin(pick)]
-        if f[2].checkbox("Only draws with a full-package date", value=False):
-            df = df[df.get("turn_bd", pd.Series(np.nan, index=df.index)).notna()]
+        for slot, col, label, help_ in [
+            (f[0], "Lender__c", "Lender", None),
+            (f[1], schema.role("product_type"), "Product type",
+             "e.g. keep small-balance RTL / fix-and-flip, drop build-to-rent."),
+            (f[2], "Inspection_Method__c", "Inspection method", "Land Gorilla, Trinity or TrustPoint."),
+            (f[3], mgr_col, schema.label(mgr_col), None),
+        ]:
+            if col and col in df:
+                opts = sorted(df[col].dropna().astype(str).unique())
+                pick = slot.multiselect(label, opts, help=help_, key=f"report_f_{col}")
+                if pick:
+                    df = df[df[col].astype(str).isin(pick)]
+                    applied.append(f"{label}: {', '.join(pick)}")
+        if st.checkbox("Only draws with a full-package date", value=False):
+            df = df[_col(df, "turn_bd").notna()]
+            applied.append("Only draws with a full-package date")
     if df.empty:
         st.info("No draws match these filters.")
         return
 
     # --- KPIs ---
-    t = df.get("turn_bd", pd.Series(np.nan, index=df.index))
+    t = _col(df, "turn_bd")
+    no = int(t.notna().sum())
     k = st.columns(5)
-    k[0].metric("Draws wired", f"{len(df):,}")
-    k[1].metric("Funded", money(pd.to_numeric(df[amt], errors="coerce").sum()) if amt and amt in df else "—")
-    k[2].metric("Median turn-time", f"{_med(t):.1f} bd" if t.notna().any() else "—",
-                f"{_pct(t, 3):.0%} within 3 bd" if t.notna().any() else None, delta_color="off")
-    k[3].metric("Median request → package", _fmt_bd(_med(df.get("prepkg_bd", pd.Series(dtype=float)))) + " bd",
-                help="Borrower / inspection / title time before the package is complete.")
-    k[4].metric("Measured", f"{int(t.notna().sum())} of {len(df)}",
-                help="Draws with both a full-package date and a wire date.")
+    k[0].metric("Wired draws", f"{len(df):,}",
+                money(pd.to_numeric(df[amt], errors="coerce").sum()) if amt and amt in df else None,
+                delta_color="off", delta_arrow="off")
+    k[1].metric("With package date", f"{no:,}", f"{no / len(df):.0%} coverage", delta_color="off")
+    k[2].metric("Median turn-time", f"{_fmt_bd(_med(t))} bd", help="Full draw package received → wire.")
+    k[3].metric("Funded within 3 bd", _fmt_pct(_pct(t, 3)))
+    k[4].metric("Median pre-package", f"{_fmt_bd(_med(_col(df, 'prepkg_bd')))} bd",
+                help="Advance requested → full package: borrower / inspection / title time.")
+    reversed_rows = int(_col(df, "reversed_dates").fillna(False).astype(bool).sum())
+    if reversed_rows:
+        st.caption(f"⚠ {reversed_rows} draw(s) have an end date before the start date — those intervals "
+                   "are blanked and excluded from the metrics.")
 
     # --- charts ---
     c1, c2 = st.columns(2)
@@ -847,12 +950,11 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
             labels = [lbl for *_, lbl in TURN_BUCKETS]
             buckets = pd.cut(t.dropna(), [lo for lo, *_ in TURN_BUCKETS] + [np.inf],
                              labels=labels, right=True)
-            dist = buckets.value_counts().reindex(labels, fill_value=0).rename("Draws")
-            st.bar_chart(dist)
+            st.bar_chart(buckets.value_counts().reindex(labels, fill_value=0).rename("Draws"))
         else:
             st.info("No full-package dates recorded in this window.")
     with c2:
-        st.markdown("**Where the time goes** (median business days)")
+        st.markdown("**Before vs. after the package is complete** (median business days)")
         parts = {lbl.replace(" (bd)", ""): _med(df[key]) for key, lbl, *_ in STAGES if key in df}
         parts["Full package → Wire"] = _med(t)
         parts = {k2: v for k2, v in parts.items() if v is not None}
@@ -861,49 +963,67 @@ def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
         else:
             st.info("Not enough milestone dates to break this down.")
 
-    # --- tables ---
-    wire_month = df[WIRE_FIELD].dt.to_period("M").astype(str)
-    by_month = group_summary(df, wire_month, "Wire month", amt)
-    mgr_series = df[mgr_col].fillna("(none)") if mgr_col in df else pd.Series("(none)", index=df.index)
-    by_mgr = group_summary(df, mgr_series, schema.label(mgr_col), amt)
+    # --- rollups + detail ---
+    w = df[WIRE_FIELD]
+    rollups = {
+        "By Year": rollup(df, w.dt.year.astype("Int64").astype(str), "Wire Year", amt),
+        "By Quarter": rollup(df, w.dt.to_period("Q").astype(str), "Wire Quarter", amt),
+        "By Month": rollup(df, w.dt.to_period("M").astype(str), "Wire Month", amt),
+    }
+    mgr_label = schema.label(mgr_col)
+    if mgr_col in df:
+        rollups[f"By {mgr_label}"[:31]] = rollup(df, df[mgr_col].fillna("(none)"), mgr_label, amt)
     detail = build_detail(df, schema, inst)
 
-    tabs = st.tabs(["Draw detail", "By month", f"By {schema.label(mgr_col).lower()}"])
-    tabs[0].dataframe(detail, width="stretch", hide_index=True, height=420,
-                      column_config={"Salesforce": st.column_config.LinkColumn(display_text="open")})
-    pct = {"% within 3 bd": st.column_config.NumberColumn(format="percent")}
-    tabs[1].dataframe(by_month, width="stretch", hide_index=True, column_config=pct)
-    tabs[2].dataframe(by_mgr, width="stretch", hide_index=True, column_config=pct)
+    names = list(rollups)
+    tabs = st.tabs(names + ["Draw detail"])
+    pct = {"% ≤3 bd": st.column_config.NumberColumn(format="percent"),
+           "Funded $": st.column_config.NumberColumn(format="dollar")}
+    for tab, name in zip(tabs, names):
+        tab.dataframe(rollups[name], width="stretch", hide_index=True, column_config=pct)
+    tabs[-1].dataframe(detail, width="stretch", hide_index=True, height=420,
+                       column_config={"Salesforce": st.column_config.LinkColumn(display_text="open")})
 
-    summary = build_summary(df, schema, start, end, period, same_day)
+    # --- workbook ---
     money_cols = ("Funded $",) + ((schema.label(amt),) if amt else ())
-    xlsx = build_workbook({"Summary": summary, "Draw Detail": detail, "By Month": by_month,
-                           f"By {schema.label(mgr_col)}"[:31]: by_mgr, "Definitions": DEFINITIONS},
-                          money_cols=money_cols)
+    wrap_cols = tuple(schema.label(c) for c in [*schema.roles.get("notes", []), schema.role("deal_comments")] if c)
+    xlsx = build_turn_time_workbook(
+        readme=readme_rows(period=period, start=start, end=end, same_day=same_day,
+                           coverage=no / len(df), reversed_rows=reversed_rows, filters=applied),
+        headline=headline_rows(df, amt),
+        subtitle=f"{period} ({start:%m/%d/%Y} – {end:%m/%d/%Y}) · median {_fmt_bd(_med(t))} business "
+                 f"day(s) · {_fmt_pct(_pct(t, 3))} funded within 3 · n={no:,}",
+        rollups=rollups, detail=detail, money_cols=money_cols, wrap_cols=wrap_cols)
     st.download_button("⬇️ Download Excel report", xlsx,
-                       f"draw_turn_time_{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.xlsx",
+                       f"Construction_Draw_TurnTime_{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.xlsx",
                        type="primary")
 
     missing = [lbl for key, lbl in [("construction_manager", "construction manager"),
-                                    ("hold_reason", "hold / delay reason"),
                                     ("loan_number", "loan #"),
                                     ("product_type", "product type")] if not schema.roles.get(key)]
     if missing:
-        st.caption("Not found in Salesforce by label (so not in the export yet): "
-                   + ", ".join(missing) + ". Share the field names and they can be added.")
+        st.caption("Not found in Salesforce (so not in the export yet): " + ", ".join(missing) + ".")
 
 
 # ───────────────────────────── UI: Draw Lookup ──────────────────────────────
+# Column headings — same names as the notebook export.
 _pretty = {
-    "Name": "Advance #", "Deal__r.Name": "Property / Deal", "Status__c": "Status",
-    "Lender__c": "Lender", "Advance_Coordinator__r.Name": "Coordinator",
-    "Advance_Analyst__r.Name": "Analyst", "Underwriter__r.Name": "Underwriter",
-    "Advance_Requestor__r.Name": "Requestor", "Exception__c": "Exception",
-    **{f: lbl for lbl, f in MILESTONES},
-    PKG_FIELD: "Full package received", WIRE_FIELD: "Wire date",
-    "turn_bd": "Turn-time (bd)", "prepkg_bd": "Request → package (bd)",
-    "total_bd": "Request → wire (bd)", "within_3": "Within 3 bd?",
-    "longest_stage": "Longest pre-package stage", "sf_link": "Salesforce",
+    "Name": "Advance #", "Deal__r.Name": "Property", "Status__c": "Status", "Lender__c": "Lender",
+    "IC_Approval_Status__c": "IC Approval", "Exception__c": "Exception",
+    "Cancellation_Reason__c": "Cancellation Reason", "Inspection_Method__c": "Inspection Method",
+    "Advance_Coordinator__r.Name": "Advance Coordinator", "Advance_Analyst__r.Name": "Advance Analyst",
+    "Underwriter__r.Name": "Underwriter", "Advance_Requestor__r.Name": "Advance Requestor",
+    "Net_Funded_Amount__c": "Net Funded ($)",
+    REQ_FIELD: "Advance Requested", "Date_Inspection_Ordered__c": "Inspection Ordered",
+    INSP_FIELD: "Inspection Date", RPT_FIELD: "Inspection Report Received",
+    "Date_Submitted_For_Approval__c": "Submitted For Review",
+    "Date_Internal_Review_Complete__c": "Internal Review Complete",
+    PKG_FIELD: "Full Draw Package Received", "Manager_Approval_Date__c": "Manager Approval",
+    WIRE_FIELD: "Wire Date",
+    "turn_bd": "Turn-Time bd (Package→Wire)", "insp_wire_bd": "Turn-Time bd (InspRpt→Wire)",
+    "prepkg_bd": "Pre-Package bd (Req→Package)", "total_bd": "Total Elapsed bd (Req→Wire)",
+    "wire_year": "Wire Year", "wire_quarter": "Wire Quarter", "wire_month": "Wire Month",
+    "sf_link": "Salesforce",
     **{k: lbl for k, lbl, *_ in STAGES},
 }
 
@@ -1022,7 +1142,7 @@ def main():
     inst = st.session_state["salesforce_auth"]["instance_url"]
     tok = st.session_state["salesforce_auth"]["access_token"]
 
-    page = st.sidebar.radio("View", ["Pipeline Pulse", "Turn-Time Report", "Draw Lookup"])
+    page = st.sidebar.radio("View", ["Turn-Time Report", "Pipeline Pulse", "Draw Lookup"])
     try:
         rt = construction_rt_id(inst, tok)
         if not rt:
