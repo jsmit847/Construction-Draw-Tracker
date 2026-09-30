@@ -1,21 +1,34 @@
 """
 Construction Draw Dashboard  (Streamlit)
 ========================================
-Same Salesforce OAuth login as the AM slide app, then two views:
+Same Salesforce OAuth login as the AM slide app, then three views:
 
-  • Pipeline Pulse  — what's happening now: open draws by stage, on-hold draws,
-                      completed this period ($ and count), recent wires, aging,
-                      and the median business-day turn-time (package -> wire).
-  • Draw Lookup     — type a property/deal or advance # and see the full draw
-                      cycle for each matching advance: milestone timeline,
-                      status, amounts, and the two turn-time intervals.
+  • Pipeline Pulse    — what's happening now: open draws by stage, on-hold draws,
+                        completed this period ($ and count), recent wires, aging,
+                        and the median business-day turn-time (package -> wire).
+                        Open pipeline downloads to Excel for the Thursday call.
+  • Turn-Time Report  — on-demand, any period (last month / quarter / year or a
+                        custom range): every draw wired in the window with its
+                        milestone dates, wire date, construction manager, notes,
+                        stage-by-stage business days, and the official turn-time
+                        (full draw package received -> wire). One-click Excel
+                        workbook: Summary, Draw Detail, By Month, By Manager,
+                        Definitions.
+  • Draw Lookup       — type a property/deal or advance # and see the full draw
+                        cycle for each matching advance: milestone timeline,
+                        status, amounts, and the two turn-time intervals.
 
 Built on the Advance__c model we mapped:
   scope   = Record Type "Construction Advance"
   anchor  = Date_Submitted_to_Capital_Partner__c  ("Date Full Draw Package Received")
   wire    = Wire_Date__c
 The SELECTs are built from describe(), so a field that doesn't exist in the org
-is skipped instead of breaking the query.
+is skipped instead of breaking the query. Fields whose API names we don't know
+yet (construction manager, hold reason, notes, loan #) are found by label.
+
+Draws are selected straight off Advance__c by wire date, with no filter on the
+loan's status — so a draw funded one day and paid off the next still shows up
+(the gap in the existing Salesforce pipeline report).
 
 Secrets (same as the reference app), in .streamlit/secrets.toml:
   [salesforce]
@@ -32,9 +45,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import secrets
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -48,21 +62,31 @@ from simple_salesforce import Salesforce
 
 # ───────────────────────────── domain constants ─────────────────────────────
 CONSTRUCTION_DEV_NAME = "Construction_Advance"
-PKG_FIELD  = "Date_Submitted_to_Capital_Partner__c"     # "Date Full Draw Package Received"
+PKG_FIELD  = "Date_Submitted_to_Capital_Partner__c"     # "Date full draw package received"
 WIRE_FIELD = "Wire_Date__c"
 REQ_FIELD  = "Date_Advance_Requested__c"
+INSP_FIELD = "Date_Of_Inspection__c"
+RPT_FIELD  = "Date_Inspection_Report_Received__c"
+BUSINESS_TZ = "America/Los_Angeles"   # datetime fields are converted to this before taking the date
 
 # Milestone chain, in order, for the "full draw cycle" timeline.
 MILESTONES = [
     ("Requested",                 REQ_FIELD),
     ("Inspection ordered",        "Date_Inspection_Ordered__c"),
-    ("Inspection",                "Date_Of_Inspection__c"),
-    ("Inspection report received","Date_Inspection_Report_Received__c"),
+    ("Inspection",                INSP_FIELD),
+    ("Inspection report received",RPT_FIELD),
     ("Submitted for review",      "Date_Submitted_For_Approval__c"),
     ("Internal review complete",  "Date_Internal_Review_Complete__c"),
     ("Full draw package received",PKG_FIELD),
     ("Manager approval",          "Manager_Approval_Date__c"),
     ("Wired",                     WIRE_FIELD),
+]
+# Stage-by-stage business days (plain business-day counts, so they add up) —
+# shows where the time went before the package was complete.
+STAGES = [
+    ("stage_req_insp", "Requested → Inspection (bd)",           REQ_FIELD, INSP_FIELD),
+    ("stage_insp_rpt", "Inspection → Report received (bd)",     INSP_FIELD, RPT_FIELD),
+    ("stage_rpt_pkg",  "Report received → Full package (bd)",   RPT_FIELD, PKG_FIELD),
 ]
 # Fields we'd like if the org has them (intersected with describe()).
 WISH_TEXT = ["Name", "Deal__r.Name", "Lender__c", "Status__c", "IC_Approval_Status__c",
@@ -71,7 +95,20 @@ WISH_TEXT = ["Name", "Deal__r.Name", "Lender__c", "Status__c", "IC_Approval_Stat
              "Underwriter__r.Name", "Advance_Requestor__r.Name"]
 WISH_AMOUNT = ["Net_Funded_Amount__c", "Current_Draw_Amount__c", "Draw_Amount__c",
                "Advance_Amount__c", "Amount__c"]
+# Fields found by label, since we don't know their API names yet. Searched on
+# Advance__c first, then on the related Deal.
+#   key -> (label keywords, allowed field types, max fields, column heading)
+_TEXTY = ("string", "textarea", "picklist", "multipicklist")
+DISCOVER = {
+    "construction_manager": (["construction manager"], _TEXTY + ("reference",), 1, "Construction manager"),
+    "loan_number":          (["loan number", "loan #", "loan no", "servicer loan"], ("string",), 1, "Loan #"),
+    "hold_reason":          (["hold reason", "on hold", "delay reason", "pending reason"], _TEXTY, 2, None),
+    "notes":                (["note", "comment"], ("string", "textarea"), 3, None),
+}
 OPEN_EXCLUDE_STATUS = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
+
+PERIODS = ["Last month", "Last quarter", "Last year", "Month to date", "Quarter to date",
+           "Year to date", "Last 90 days", "Custom range"]
 
 _HOLS = USFederalHolidayCalendar().holidays("2018-01-01", "2032-12-31").values.astype("datetime64[D]")
 
@@ -205,31 +242,50 @@ def get_sf_from_session() -> Salesforce | None:
     return Salesforce(instance_url=auth["instance_url"], session_id=auth["access_token"])
 
 
+
 # ───────────────────────────── query helpers ────────────────────────────────
 def soql_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def flatten(rec: dict) -> dict:
-    """Flatten one/two levels of relationship dicts to dotted keys; drop 'attributes'."""
+def flatten(rec: dict, prefix: str = "") -> dict:
+    """Flatten relationship dicts (any depth) to dotted keys; drop 'attributes'."""
     out: dict[str, Any] = {}
     for k, v in rec.items():
         if k == "attributes":
             continue
         if isinstance(v, dict):
-            for k2, v2 in v.items():
-                if k2 == "attributes":
-                    continue
-                out[f"{k}.{k2}"] = v2.get("Name") if isinstance(v2, dict) else v2
+            out.update(flatten(v, f"{prefix}{k}."))
         else:
-            out[k] = v
+            out[f"{prefix}{k}"] = v
     return out
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def describe_fields(instance_url: str, token: str) -> list[str]:
+def describe_object(instance_url: str, token: str, sobject: str) -> list[dict]:
     sf = Salesforce(instance_url=instance_url, session_id=token)
-    return [f["name"] for f in sf.Advance__c.describe()["fields"]]
+    return [{"name": f["name"], "label": f["label"], "type": f["type"],
+             "rel": f.get("relationshipName"), "ref": (f.get("referenceTo") or [None])[0]}
+            for f in getattr(sf, sobject).describe()["fields"]]
+
+
+def _describe(inst: str, tok: str, sobject: str) -> list[dict]:
+    try:
+        return describe_object(inst, tok, sobject)
+    except Exception as exc:
+        if "INVALID_SESSION_ID" in str(exc):
+            raise
+        return []
+
+
+def field_exists(inst: str, tok: str, path: str, sobject: str = "Advance__c") -> bool:
+    """True if a (possibly dotted, e.g. Deal__r.Name) field path exists in the org."""
+    head, _, rest = path.partition(".")
+    fields = _describe(inst, tok, sobject)
+    if not rest:
+        return any(f["name"] == head for f in fields)
+    rel = next((f for f in fields if f["rel"] == head and f["ref"]), None)
+    return bool(rel) and field_exists(inst, tok, rest, rel["ref"])
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -249,20 +305,78 @@ def run_soql(instance_url: str, token: str, soql: str) -> pd.DataFrame:
     return pd.DataFrame([flatten(r) for r in recs])
 
 
-def available(instance_url: str, token: str) -> list[str]:
-    present = set(describe_fields(instance_url, token))
+class Schema:
+    """What this org actually has: SELECT list, amount field, discovered fields."""
+
+    def __init__(self, fields: list[str], amt: str | None,
+                 roles: dict[str, list[str]], labels: dict[str, str]):
+        self.fields, self.amt, self.roles, self.labels = fields, amt, roles, labels
+
+    @property
+    def select(self) -> str:
+        return ",".join(self.fields)
+
+    def role(self, key: str) -> str | None:
+        hits = self.roles.get(key) or []
+        return hits[0] if hits else None
+
+    def label(self, col: str) -> str:
+        return _pretty.get(col) or self.labels.get(col) or col
+
+
+def _discover(inst: str, tok: str) -> tuple[dict[str, list[str]], dict[str, str]]:
+    adv = _describe(inst, tok, "Advance__c")
+    deal_ref = next((f for f in adv if f["rel"] == "Deal__r" and f["ref"]), None)
+    deal = _describe(inst, tok, deal_ref["ref"]) if deal_ref else []
+    roles: dict[str, list[str]] = {}
+    labels: dict[str, str] = {}
+    for key, (words, types, limit, heading) in DISCOVER.items():
+        hits: list[str] = []
+        # prefer a field on the advance itself; fall back to the deal
+        for fields, prefix, lab_prefix in [(adv, "", ""), (deal, "Deal__r.", "Deal: ")]:
+            for f in fields:
+                if f["type"] in types and any(w in f["label"].lower() for w in words):
+                    path = (f"{prefix}{f['rel']}.Name" if f["type"] == "reference" and f["rel"]
+                            else f"{prefix}{f['name']}")
+                    if path not in hits:
+                        hits.append(path)
+                        labels[path] = heading or f"{lab_prefix}{f['label']}"
+            if hits:
+                break
+        roles[key] = hits[:limit]
+    return roles, labels
+
+
+def load_schema(inst: str, tok: str) -> Schema:
+    present = {f["name"] for f in _describe(inst, tok, "Advance__c")}
+    labels = {f["name"]: f["label"] for f in _describe(inst, tok, "Advance__c")}
     fields = ["Id"]
     for f in WISH_TEXT + [m[1] for m in MILESTONES] + ["Target_Advance_Date__c"]:
-        base = f.split(".")[0]
-        if base in present and f not in fields:
+        if f not in fields and field_exists(inst, tok, f):
             fields.append(f)
     amt = next((a for a in WISH_AMOUNT if a in present), None)
     if amt:
         fields.append(amt)
-    return fields, amt
+    roles, found_labels = _discover(inst, tok)
+    labels.update(found_labels)
+    for paths in roles.values():
+        fields += [p for p in paths if p not in fields]
+    return Schema(fields, amt, roles, labels)
 
 
 # ───────────────────────────── turn-time math ───────────────────────────────
+def to_date(s: pd.Series) -> pd.Series:
+    """Salesforce Date ('2025-09-03') or DateTime ('...T17:02:00.000+0000') -> naive date."""
+    s = pd.Series(s, dtype="object").astype("string")
+    is_dt = (s.str.len() > 10).fillna(False).astype(bool)
+    out = pd.to_datetime(s.str[:10].where(~is_dt), errors="coerce", format="%Y-%m-%d")
+    if is_dt.any():
+        dt = (pd.to_datetime(s.where(is_dt), errors="coerce", utc=True)
+              .dt.tz_convert(BUSINESS_TZ).dt.tz_localize(None).dt.normalize())
+        out = out.where(~is_dt, dt)
+    return out
+
+
 def bdays(a: pd.Series, b: pd.Series, same_day_as: int) -> pd.Series:
     a, b = pd.to_datetime(a, errors="coerce"), pd.to_datetime(b, errors="coerce")
     m = a.notna() & b.notna()
@@ -278,29 +392,57 @@ def add_intervals(df: pd.DataFrame, same_day_as: int) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
+    for _, f in MILESTONES:
+        if f in df:
+            df[f] = to_date(df[f])
     if PKG_FIELD in df and WIRE_FIELD in df:
         df["turn_bd"] = bdays(df[PKG_FIELD], df[WIRE_FIELD], same_day_as)
     if REQ_FIELD in df and PKG_FIELD in df:
         df["prepkg_bd"] = bdays(df[REQ_FIELD], df[PKG_FIELD], same_day_as)
     if REQ_FIELD in df and WIRE_FIELD in df:
         df["total_bd"] = bdays(df[REQ_FIELD], df[WIRE_FIELD], same_day_as)
+    for key, _, a, b in STAGES:
+        if a in df and b in df:
+            df[key] = bdays(df[a], df[b], 0)
     return df
 
 
-def period_bounds(choice: str) -> tuple[date, date]:
-    today = date.today()
-    if choice == "This week":
-        start = today - pd.Timedelta(days=today.weekday()); return start, today
-    if choice == "This month":
-        return today.replace(day=1), today
-    if choice == "This quarter":
-        q = (today.month - 1) // 3
-        return date(today.year, q * 3 + 1, 1), today
-    if choice == "This year":
+def period_bounds(choice: str, today: date | None = None) -> tuple[date, date]:
+    today = today or date.today()
+    month_start = today.replace(day=1)
+    q_start = date(today.year, 3 * ((today.month - 1) // 3) + 1, 1)
+    if choice == "Week to date":
+        return today - timedelta(days=today.weekday()), today
+    if choice == "Month to date":
+        return month_start, today
+    if choice == "Quarter to date":
+        return q_start, today
+    if choice == "Year to date":
         return date(today.year, 1, 1), today
     if choice == "Last 90 days":
-        return today - pd.Timedelta(days=90), today
-    return date(today.year, 1, 1), today
+        return today - timedelta(days=90), today
+    if choice == "Last month":
+        end = month_start - timedelta(days=1)
+        return end.replace(day=1), end
+    if choice == "Last quarter":
+        end = q_start - timedelta(days=1)
+        return date(end.year, 3 * ((end.month - 1) // 3) + 1, 1), end
+    if choice == "Last year":
+        return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    raise ValueError(f"Unknown period: {choice}")
+
+
+def period_picker(col, key: str, options: list[str], index: int = 0) -> tuple[date, date, str]:
+    choice = col.selectbox("Wire date window", options, index=index, key=f"{key}_period")
+    if choice == "Custom range":
+        d = st.columns(2)
+        start = d[0].date_input("From", date.today().replace(day=1), key=f"{key}_from")
+        end = d[1].date_input("To", date.today(), key=f"{key}_to")
+        if start > end:
+            st.error("'From' is after 'To'."); st.stop()
+        return start, end, f"{start:%m/%d/%Y}–{end:%m/%d/%Y}"
+    start, end = period_bounds(choice)
+    return start, end, choice
 
 
 def money(x) -> str:
@@ -310,23 +452,63 @@ def money(x) -> str:
         return "—"
 
 
+# ───────────────────────────── Excel export ─────────────────────────────────
+def build_workbook(sheets: dict[str, pd.DataFrame], money_cols: tuple[str, ...] = ()) -> bytes:
+    """Write DataFrames to an .xlsx with bold frozen headers, filters, widths, date formats."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+            ws = xw.sheets[name[:31]]
+            ws.freeze_panes = "A2"
+            if len(df):
+                ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1F4E78")
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            for i, col in enumerate(df.columns, start=1):
+                letter = get_column_letter(i)
+                series = df[col]
+                is_date = pd.api.types.is_datetime64_any_dtype(series)
+                longest = max([len(str(col))] + [len(str(v)) for v in series.head(500) if pd.notna(v)])
+                width = 12 if is_date else min(max(10, longest + 2), 60)
+                ws.column_dimensions[letter].width = width
+                fmt = ("mm/dd/yyyy" if is_date else
+                       "$#,##0" if col in money_cols else
+                       "0.0%" if str(col).startswith("%") else None)
+                wrap = longest > 60
+                if fmt or wrap:
+                    for cell in ws[letter][1:]:
+                        if fmt:
+                            cell.number_format = fmt
+                        if wrap:
+                            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    return buf.getvalue()
+
+
 # ───────────────────────────── UI: Pipeline Pulse ───────────────────────────
-def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | None, same_day: int):
+def render_pulse(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
     st.subheader("Pipeline Pulse")
+    amt = schema.amt
     colf = st.columns([1, 1, 2])
-    period = colf[0].selectbox("Completed window",
-                               ["This week", "This month", "This quarter", "This year", "Last 90 days"],
-                               index=1)
-    start, end = period_bounds(period)
+    start, end, period = period_picker(
+        colf[0], "pulse",
+        ["Week to date", "Month to date", "Quarter to date", "Year to date", "Last 90 days",
+         "Last month", "Last quarter", "Custom range"], index=1)
     colf[1].caption(f"{start:%m/%d/%Y} → {end:%m/%d/%Y}")
 
-    sel = ",".join(fields)
+    sel = schema.select
 
     # --- open (in-flight) draws: not wired, not terminal ---
     open_status = "(" + ",".join(f"'{s}'" for s in OPEN_EXCLUDE_STATUS) + ")"
     open_df = run_soql(inst, tok,
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
         f"AND {WIRE_FIELD}=null AND Status__c NOT IN {open_status}")
+    open_df = add_intervals(open_df, same_day)
     # --- completed in window ---
     done_df = run_soql(inst, tok,
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
@@ -343,7 +525,7 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
         k[2].metric("Funded in window", "—")
     if "turn_bd" in done_df and done_df["turn_bd"].notna().any():
         med = done_df["turn_bd"].median()
-        within3 = (done_df["turn_bd"] <= 3).mean() * 100
+        within3 = (done_df["turn_bd"].dropna() <= 3).mean() * 100
         k[3].metric("Median turn-time", f"{med:.0f} bd", f"{within3:.0f}% ≤3 bd")
     else:
         k[3].metric("Median turn-time", "—", "no package dates in window")
@@ -351,6 +533,7 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
     st.divider()
 
     # --- open by stage + on hold ---
+    hold_cols = schema.roles.get("hold_reason", [])
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Open draws by stage**")
@@ -368,8 +551,9 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
                         .str.contains("Hold|Pending Borrower|Revision", case=False, na=False)] \
                 if not open_df.empty else open_df
         if not holds.empty:
-            show = [c for c in ["Name", "Deal__r.Name", "Status__c", "Advance_Coordinator__r.Name"] if c in holds]
-            st.dataframe(holds[show].rename(columns=_pretty), use_container_width=True, height=240)
+            show = [c for c in ["Name", "Deal__r.Name", "Status__c", *hold_cols,
+                                "Advance_Coordinator__r.Name"] if c in holds]
+            st.dataframe(holds[show].rename(columns=schema.label), width="stretch", height=240)
         else:
             st.success("Nothing sitting on hold.")
 
@@ -379,10 +563,18 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
     st.markdown("**Aging — oldest open draws (calendar days since requested)**")
     if not open_df.empty and REQ_FIELD in open_df:
         aged = open_df.copy()
-        aged["Days open"] = (pd.Timestamp(date.today()) - pd.to_datetime(aged[REQ_FIELD], errors="coerce")).dt.days
+        aged["Days open"] = (pd.Timestamp(date.today()) - aged[REQ_FIELD]).dt.days
         aged = aged.sort_values("Days open", ascending=False)
         show = [c for c in ["Name", "Deal__r.Name", "Status__c", "Days open"] if c in aged]
-        st.dataframe(aged[show].head(15).rename(columns=_pretty), use_container_width=True, height=300)
+        st.dataframe(aged[show].head(15).rename(columns=schema.label), width="stretch", height=300)
+        cols = [c for c in ["Name", "Deal__r.Name", schema.role("loan_number"), "Lender__c", "Status__c",
+                            *hold_cols, schema.role("construction_manager"), "Advance_Coordinator__r.Name",
+                            amt, *[m[1] for m in MILESTONES], "Days open",
+                            *schema.roles.get("notes", [])] if c and c in aged]
+        st.download_button("Download open pipeline (Excel)",
+                           build_workbook({"Open draws": aged[cols].rename(columns=schema.label)},
+                                          money_cols=(schema.label(amt),) if amt else ()),
+                           f"open_draw_pipeline_{date.today():%Y-%m-%d}.xlsx")
     else:
         st.info("No requested-date data on open draws.")
 
@@ -393,9 +585,8 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
     if not done_df.empty:
         rc = done_df.sort_values(WIRE_FIELD, ascending=False).head(15)
         show = [c for c in ["Name", "Deal__r.Name", WIRE_FIELD, amt, "turn_bd"] if c and c in rc]
-        st.dataframe(rc[show].rename(columns=_pretty), use_container_width=True, height=300)
-        st.download_button("Download completed (window) as CSV",
-                           done_df.to_csv(index=False).encode(), f"completed_{start}_{end}.csv")
+        st.dataframe(rc[show].rename(columns=schema.label), width="stretch", height=300)
+        st.caption("Full detail and Excel export for any period: **Turn-Time Report** in the sidebar.")
     else:
         st.info("No completed draws in this window.")
 
@@ -405,18 +596,260 @@ def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | Non
                    "Land Gorilla (IHD-109768) fills the rest.")
 
 
+# ───────────────────────────── UI: Turn-Time Report ─────────────────────────
+TURN_BUCKETS = [(-1, 0, "0 bd"), (0, 1, "1 bd"), (1, 2, "2 bd"), (2, 3, "3 bd"),
+                (3, 5, "4–5 bd"), (5, 10, "6–10 bd"), (10, np.inf, "11+ bd")]
+
+
+def _pct(s: pd.Series, limit: int) -> float | None:
+    s = s.dropna()
+    return float((s <= limit).mean()) if len(s) else None
+
+
+def _med(s: pd.Series) -> float | None:
+    s = s.dropna()
+    return float(s.median()) if len(s) else None
+
+
+def build_detail(df: pd.DataFrame, schema: Schema, inst: str) -> pd.DataFrame:
+    """One row per draw, in the column order Melanie asked for, with readable headings."""
+    df = df.copy()
+    stage_cols = [k for k, *_ in STAGES if k in df]
+    if stage_cols:
+        stage_names = {k: lbl.replace(" (bd)", "") for k, lbl, *_ in STAGES}
+        has = df[stage_cols].notna().any(axis=1)
+        df["longest_stage"] = None
+        df.loc[has, "longest_stage"] = df.loc[has, stage_cols].idxmax(axis=1).map(stage_names)
+    if "turn_bd" in df:
+        df["within_3"] = np.where(df["turn_bd"].isna(), None,
+                                  np.where(df["turn_bd"] <= 3, "Yes", "No"))
+    if "Id" in df:
+        df["sf_link"] = inst.rstrip("/") + "/" + df["Id"].astype(str)
+    cols = ["Name", "Deal__r.Name", schema.role("loan_number"), "Lender__c", "Status__c",
+            schema.role("construction_manager"), "Advance_Coordinator__r.Name",
+            "Advance_Analyst__r.Name", schema.amt,
+            *[m[1] for m in MILESTONES],
+            "turn_bd", "within_3", "prepkg_bd", "total_bd", *stage_cols, "longest_stage",
+            *schema.roles.get("hold_reason", []), "Exception__c",
+            *schema.roles.get("notes", []), "sf_link"]
+    cols = list(dict.fromkeys(c for c in cols if c and c in df))
+    out = df[cols].rename(columns=schema.label)
+    seen: dict[str, int] = {}
+    heads = []
+    for h in out.columns:       # two fields can share a label; keep headings unique
+        seen[h] = seen.get(h, 0) + 1
+        heads.append(h if seen[h] == 1 else f"{h} ({seen[h]})")
+    out.columns = heads
+    return out
+
+
+def build_summary(df: pd.DataFrame, schema: Schema, start: date, end: date,
+                  period: str, same_day: int) -> pd.DataFrame:
+    t = df.get("turn_bd", pd.Series(dtype=float))
+    rows = [
+        ("Report period", period),
+        ("Wire date from", start.strftime("%m/%d/%Y")),
+        ("Wire date to", end.strftime("%m/%d/%Y")),
+        ("Generated", datetime.now().strftime("%m/%d/%Y %I:%M %p")),
+        ("Same-day convention", f"Package in and wired same day = {same_day} business day(s)"),
+        ("", ""),
+        ("Draws wired", len(df)),
+    ]
+    if schema.amt and schema.amt in df:
+        rows.append(("Total funded", money(pd.to_numeric(df[schema.amt], errors="coerce").sum())))
+    measured = int(t.notna().sum())
+    rows += [
+        ("Draws with a full-package date (measured)", measured),
+        ("Measured coverage", f"{measured / len(df):.0%}" if len(df) else "—"),
+        ("", ""),
+        ("OFFICIAL TURN-TIME: full package received → wire", ""),
+        ("  Median (business days)", _fmt_bd(_med(t))),
+        ("  Average (business days)", _fmt_bd(float(t.mean()) if measured else None)),
+        ("  Funded within 1 business day", _fmt_pct(_pct(t, 1))),
+        ("  Funded within 3 business days", _fmt_pct(_pct(t, 3))),
+        ("  Funded within 5 business days", _fmt_pct(_pct(t, 5))),
+        ("", ""),
+        ("BORROWER / THIRD-PARTY TIME: request → full package", ""),
+        ("  Median (business days)", _fmt_bd(_med(df.get("prepkg_bd", pd.Series(dtype=float))))),
+    ]
+    for key, lbl, *_ in STAGES:
+        if key in df:
+            rows.append((f"    {lbl.replace(' (bd)', '')} — median bd", _fmt_bd(_med(df[key]))))
+    rows += [
+        ("", ""),
+        ("END TO END: request → wire", ""),
+        ("  Median (business days)", _fmt_bd(_med(df.get("total_bd", pd.Series(dtype=float))))),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+
+def _fmt_bd(x: float | None) -> str:
+    return "—" if x is None or pd.isna(x) else f"{x:.1f}"
+
+
+def _fmt_pct(x: float | None) -> str:
+    return "—" if x is None else f"{x:.0%}"
+
+
+def group_summary(df: pd.DataFrame, by: pd.Series, name: str, amt: str | None) -> pd.DataFrame:
+    g = df.groupby(by, dropna=False)
+    out = pd.DataFrame({"Draws wired": g.size()})
+    if amt and amt in df:
+        out["Funded $"] = g[amt].apply(lambda s: pd.to_numeric(s, errors="coerce").sum())
+    if "turn_bd" in df:
+        out["Measured"] = g["turn_bd"].count()
+        out["Median turn-time (bd)"] = g["turn_bd"].median().round(1)
+        out["Avg turn-time (bd)"] = g["turn_bd"].mean().round(1)
+        out["% within 3 bd"] = g["turn_bd"].apply(lambda s: _pct(s, 3))
+    if "prepkg_bd" in df:
+        out["Median request → package (bd)"] = g["prepkg_bd"].median().round(1)
+    if "total_bd" in df:
+        out["Median request → wire (bd)"] = g["total_bd"].median().round(1)
+    out.index.name = name
+    return out.reset_index()
+
+
+DEFINITIONS = pd.DataFrame([
+    ("Scope", "Salesforce Advance__c records with record type 'Construction Advance', "
+              "wire date inside the report window. No filter on loan status, so draws on loans "
+              "paid off after funding are still included."),
+    ("Official turn-time", "Business days from 'Date full draw package received' "
+                           "(Date_Submitted_to_Capital_Partner__c) to wire date. Weekends and US "
+                           "federal holidays excluded. This is the internal funding time."),
+    ("Full draw package", "Package is complete only when everything needed to fund is in hand — "
+                          "e.g. inspection report, lien waivers, title cleared. A draw with an "
+                          "open lien is not a complete package until the lien is resolved."),
+    ("Request → full package", "Business days from draw requested to full package received — time "
+                               "waiting on the borrower, inspection, title or other conditions."),
+    ("Stage columns", "Plain business-day counts between consecutive milestones, to show where "
+                      "pre-package time went. 'Longest stage' is the biggest of those."),
+    ("Request → wire", "End-to-end business days, borrower request to funding."),
+    ("Blank values", "A blank interval means one of its two dates is not recorded in Salesforce. "
+                     "Those draws are excluded from medians and percentages."),
+    ("Same-day convention", "Whether a package received and wired the same day counts as 0 or 1 "
+                            "business day (sidebar setting; shown on the Summary sheet)."),
+], columns=["Term", "Definition"])
+
+
+def render_report(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
+    st.subheader("Turn-Time Report")
+    st.caption("Every construction draw wired in the window, with milestone dates and business-day "
+               "turn-times. Download as Excel for pivots or management requests.")
+    amt = schema.amt
+    top = st.columns([1, 1, 2])
+    start, end, period = period_picker(top[0], "report", PERIODS, index=0)
+    top[1].caption(f"{start:%m/%d/%Y} → {end:%m/%d/%Y}")
+
+    raw = run_soql(inst, tok,
+        f"SELECT {schema.select} FROM Advance__c WHERE RecordTypeId='{rt}' "
+        f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d} "
+        f"ORDER BY {WIRE_FIELD}")
+    df = add_intervals(raw, same_day)
+    if df.empty:
+        st.info("No construction draws were wired in this window.")
+        return
+
+    # --- optional filters ---
+    mgr_col = schema.role("construction_manager") or "Advance_Coordinator__r.Name"
+    with st.expander("Filters"):
+        f = st.columns(3)
+        if "Lender__c" in df:
+            lenders = sorted(df["Lender__c"].dropna().astype(str).unique())
+            pick = f[0].multiselect("Lender", lenders)
+            if pick:
+                df = df[df["Lender__c"].astype(str).isin(pick)]
+        if mgr_col in df:
+            mgrs = sorted(df[mgr_col].dropna().astype(str).unique())
+            pick = f[1].multiselect(schema.label(mgr_col), mgrs)
+            if pick:
+                df = df[df[mgr_col].astype(str).isin(pick)]
+        if f[2].checkbox("Only draws with a full-package date", value=False):
+            df = df[df.get("turn_bd", pd.Series(np.nan, index=df.index)).notna()]
+    if df.empty:
+        st.info("No draws match these filters.")
+        return
+
+    # --- KPIs ---
+    t = df.get("turn_bd", pd.Series(np.nan, index=df.index))
+    k = st.columns(5)
+    k[0].metric("Draws wired", f"{len(df):,}")
+    k[1].metric("Funded", money(pd.to_numeric(df[amt], errors="coerce").sum()) if amt and amt in df else "—")
+    k[2].metric("Median turn-time", f"{_med(t):.1f} bd" if t.notna().any() else "—",
+                f"{_pct(t, 3):.0%} within 3 bd" if t.notna().any() else None, delta_color="off")
+    k[3].metric("Median request → package", _fmt_bd(_med(df.get("prepkg_bd", pd.Series(dtype=float)))) + " bd",
+                help="Borrower / inspection / title time before the package is complete.")
+    k[4].metric("Measured", f"{int(t.notna().sum())} of {len(df)}",
+                help="Draws with both a full-package date and a wire date.")
+
+    # --- charts ---
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Turn-time distribution** (package → wire)")
+        if t.notna().any():
+            labels = [lbl for *_, lbl in TURN_BUCKETS]
+            buckets = pd.cut(t.dropna(), [lo for lo, *_ in TURN_BUCKETS] + [np.inf],
+                             labels=labels, right=True)
+            dist = buckets.value_counts().reindex(labels, fill_value=0).rename("Draws")
+            st.bar_chart(dist)
+        else:
+            st.info("No full-package dates recorded in this window.")
+    with c2:
+        st.markdown("**Where the time goes** (median business days)")
+        parts = {lbl.replace(" (bd)", ""): _med(df[key]) for key, lbl, *_ in STAGES if key in df}
+        parts["Full package → Wire"] = _med(t)
+        parts = {k2: v for k2, v in parts.items() if v is not None}
+        if parts:
+            st.bar_chart(pd.Series(parts, name="Median bd"), horizontal=True)
+        else:
+            st.info("Not enough milestone dates to break this down.")
+
+    # --- tables ---
+    wire_month = df[WIRE_FIELD].dt.to_period("M").astype(str)
+    by_month = group_summary(df, wire_month, "Wire month", amt)
+    mgr_series = df[mgr_col].fillna("(none)") if mgr_col in df else pd.Series("(none)", index=df.index)
+    by_mgr = group_summary(df, mgr_series, schema.label(mgr_col), amt)
+    detail = build_detail(df, schema, inst)
+
+    tabs = st.tabs(["Draw detail", "By month", f"By {schema.label(mgr_col).lower()}"])
+    tabs[0].dataframe(detail, width="stretch", hide_index=True, height=420,
+                      column_config={"Salesforce": st.column_config.LinkColumn(display_text="open")})
+    pct = {"% within 3 bd": st.column_config.NumberColumn(format="percent")}
+    tabs[1].dataframe(by_month, width="stretch", hide_index=True, column_config=pct)
+    tabs[2].dataframe(by_mgr, width="stretch", hide_index=True, column_config=pct)
+
+    summary = build_summary(df, schema, start, end, period, same_day)
+    money_cols = ("Funded $",) + ((schema.label(amt),) if amt else ())
+    xlsx = build_workbook({"Summary": summary, "Draw Detail": detail, "By Month": by_month,
+                           f"By {schema.label(mgr_col)}"[:31]: by_mgr, "Definitions": DEFINITIONS},
+                          money_cols=money_cols)
+    st.download_button("⬇️ Download Excel report", xlsx,
+                       f"draw_turn_time_{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.xlsx",
+                       type="primary")
+
+    missing = [lbl for key, lbl in [("construction_manager", "construction manager"),
+                                    ("hold_reason", "hold / delay reason"),
+                                    ("loan_number", "loan #")] if not schema.roles.get(key)]
+    if missing:
+        st.caption("Not found in Salesforce by label (so not in the export yet): "
+                   + ", ".join(missing) + ". Share the field names and they can be added.")
+
+
 # ───────────────────────────── UI: Draw Lookup ──────────────────────────────
 _pretty = {
     "Name": "Advance #", "Deal__r.Name": "Property / Deal", "Status__c": "Status",
     "Lender__c": "Lender", "Advance_Coordinator__r.Name": "Coordinator",
     "Advance_Analyst__r.Name": "Analyst", "Underwriter__r.Name": "Underwriter",
-    "Advance_Requestor__r.Name": "Requestor", WIRE_FIELD: "Wire date",
-    REQ_FIELD: "Requested", PKG_FIELD: "Full package received",
-    "turn_bd": "Turn-time (bd)", "prepkg_bd": "Pre-package (bd)", "total_bd": "Total (bd)",
+    "Advance_Requestor__r.Name": "Requestor", "Exception__c": "Exception",
+    **{f: lbl for lbl, f in MILESTONES},
+    PKG_FIELD: "Full package received", WIRE_FIELD: "Wire date",
+    "turn_bd": "Turn-time (bd)", "prepkg_bd": "Request → package (bd)",
+    "total_bd": "Request → wire (bd)", "within_3": "Within 3 bd?",
+    "longest_stage": "Longest pre-package stage", "sf_link": "Salesforce",
+    **{k: lbl for k, lbl, *_ in STAGES},
 }
 
 
-def render_lookup(inst: str, tok: str, rt: str, fields: list[str], amt: str | None, same_day: int):
+def render_lookup(inst: str, tok: str, rt: str, schema: Schema, same_day: int):
     st.subheader("Draw Lookup")
     c = st.columns([3, 1])
     text = c[0].text_input("Search by property / deal name or advance #", placeholder="e.g. 745 South 9th Street")
@@ -427,9 +860,8 @@ def render_lookup(inst: str, tok: str, rt: str, fields: list[str], amt: str | No
 
     esc = soql_escape(text)
     field = "Deal__r.Name" if mode.startswith("Property") else "Name"
-    sel = ",".join(fields)
     df = run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
+        f"SELECT {schema.select} FROM Advance__c WHERE RecordTypeId='{rt}' "
         f"AND {field} LIKE '%{esc}%' ORDER BY {REQ_FIELD} DESC NULLS LAST")
     df = add_intervals(df, same_day)
     if df.empty:
@@ -442,10 +874,11 @@ def render_lookup(inst: str, tok: str, rt: str, fields: list[str], amt: str | No
     for deal, g in df.groupby(deal_col, dropna=False):
         with st.expander(f"{deal}  ·  {len(g)} draw(s)", expanded=(len(df) <= 5)):
             for _, row in g.iterrows():
-                _render_one_draw(row, amt)
+                _render_one_draw(row, schema)
 
 
-def _render_one_draw(row: pd.Series, amt: str | None):
+def _render_one_draw(row: pd.Series, schema: Schema):
+    amt = schema.amt
     top = st.columns([2, 1, 1])
     top[0].markdown(f"**{row.get('Name','(advance)')}** — {row.get('Status__c','')}")
     if amt and amt in row and pd.notna(row[amt]):
@@ -463,14 +896,16 @@ def _render_one_draw(row: pd.Series, amt: str | None):
     tdf = pd.DataFrame(steps)
     done = tdf["Date"].notna().sum()
     st.progress(done / len(MILESTONES), text=f"{done}/{len(MILESTONES)} milestones recorded")
-    st.dataframe(tdf, hide_index=True, use_container_width=True,
+    st.dataframe(tdf, hide_index=True, width="stretch",
                  column_config={"": st.column_config.TextColumn(width="small")})
 
     meta = []
-    for f in ["Lender__c", "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
-              "Underwriter__r.Name", "Advance_Requestor__r.Name"]:
-        if f in row and pd.notna(row[f]):
-            meta.append(f"**{_pretty.get(f, f)}:** {row[f]}")
+    for f in [schema.role("loan_number"), "Lender__c", schema.role("construction_manager"),
+              "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
+              "Underwriter__r.Name", "Advance_Requestor__r.Name",
+              *schema.roles.get("hold_reason", [])]:
+        if f and f in row and pd.notna(row[f]):
+            meta.append(f"**{schema.label(f)}:** {row[f]}")
     if "prepkg_bd" in row and pd.notna(row.get("prepkg_bd")):
         meta.append(f"**Pre-package:** {row['prepkg_bd']:.0f} bd (borrower/inspection/title)")
     if meta:
@@ -502,7 +937,7 @@ def main():
         else:
             st.success("Connected")
             st.caption(st.session_state.get("salesforce_auth", {}).get("instance_url", ""))
-            if st.button("Log out", use_container_width=True):
+            if st.button("Log out", width="stretch"):
                 clear_salesforce_session(); st.rerun()
         st.divider()
         same_day = 1 if st.radio(
@@ -512,10 +947,10 @@ def main():
         ).startswith("1") else 0
 
     # login gate
-    st.subheader("Step 1 — Log in to Salesforce")
     if setup_error:
         st.error(setup_error); st.stop()
     if sf is None:
+        st.subheader("Log in to Salesforce")
         st.info("Log in to load the construction draw pipeline.")
         st.link_button("Log in to Salesforce", build_salesforce_login_url(cfg))
         st.caption(f"Callback URL: {cfg['redirect_uri']}")
@@ -524,17 +959,18 @@ def main():
     inst = st.session_state["salesforce_auth"]["instance_url"]
     tok = st.session_state["salesforce_auth"]["access_token"]
 
-    rt = construction_rt_id(inst, tok)
-    if not rt:
-        st.error("Could not find the 'Construction Advance' record type on Advance__c."); st.stop()
-    fields, amt = available(inst, tok)
-
-    page = st.sidebar.radio("View", ["Pipeline Pulse", "Draw Lookup"])
+    page = st.sidebar.radio("View", ["Pipeline Pulse", "Turn-Time Report", "Draw Lookup"])
     try:
+        rt = construction_rt_id(inst, tok)
+        if not rt:
+            st.error("Could not find the 'Construction Advance' record type on Advance__c."); st.stop()
+        schema = load_schema(inst, tok)
         if page == "Pipeline Pulse":
-            render_pulse(inst, tok, rt, fields, amt, same_day)
+            render_pulse(inst, tok, rt, schema, same_day)
+        elif page == "Turn-Time Report":
+            render_report(inst, tok, rt, schema, same_day)
         else:
-            render_lookup(inst, tok, rt, fields, amt, same_day)
+            render_lookup(inst, tok, rt, schema, same_day)
     except Exception as exc:
         msg = str(exc)
         if "INVALID_SESSION_ID" in msg or "Session expired" in msg:
