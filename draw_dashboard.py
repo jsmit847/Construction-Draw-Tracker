@@ -537,13 +537,19 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     for p in periods:
         g = done[done["Period"] == p]
         tt = g["turn_bd"].dropna() if "turn_bd" in g else pd.Series(dtype=float)
+        pp = g["prepkg_bd"].dropna() if "prepkg_bd" in g else pd.Series(dtype=float)
+        funded = float(pd.to_numeric(g.get(AMT), errors="coerce").sum()) if AMT else None
+        n = len(g)
         rows.append({
             "_raw": p,
             "Period": p + ("  (in progress)" if p == cur_key else ""),
-            "Draws funded": len(g),
-            "Funded ($)": (float(pd.to_numeric(g.get(AMT), errors="coerce").sum()) if AMT else None),
+            "Draws funded": n,
+            "Loans": (g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None),
+            "Funded ($)": funded,
+            "Avg draw ($)": (funded / n if (funded is not None and n) else None),
             "Funding time (days)": (round(tt.median(), 1) if len(tt) else None),
             "% within 3 days": (round((tt <= 3).mean() * 100) if len(tt) else None),
+            "Before-package (days)": (round(pp.median(), 1) if len(pp) else None),
             "% with package date": (round(g["turn_bd"].notna().mean() * 100) if "turn_bd" in g else 0),
         })
     roll = pd.DataFrame(rows)
@@ -572,7 +578,10 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     st.markdown(f"**By {gran.lower()}**")
     disp = roll.drop(columns="_raw").copy()
-    disp["Funded ($)"] = disp["Funded ($)"].map(lambda x: money(x) if x is not None else "—")
+    for c in ["Funded ($)", "Avg draw ($)"]:
+        disp[c] = disp[c].map(lambda x: money(x) if pd.notna(x) else "—")
+    for c in ["Loans", "Funding time (days)", "% within 3 days", "Before-package (days)", "% with package date"]:
+        disp[c] = disp[c].map(lambda x: x if pd.notna(x) else "—")
     st.dataframe(disp.iloc[::-1], hide_index=True, use_container_width=True)
     st.bar_chart(roll.set_index("_raw")["Draws funded"])
 
@@ -597,24 +606,34 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
 
 # ───────────────────────────── Loan detail (micro) ──────────────────────────
+def lg_filenumber(loan_no) -> str | None:
+    """LG file number is 'rb0'+the SF loan number, but only for the clean numeric RB0 book.
+       Hyphenated/alpha loan numbers aren't RB0 loans, so skip LG for them (keeps it quiet)."""
+    s = str(loan_no).strip()
+    return f"rb0{s}" if s.isdigit() else None
+
+
 def render_loan_detail(inst, tok, rt, sel, same_day):
-    st.subheader("Loan detail")
-    c = st.columns([3, 1])
-    text = c[0].text_input("Search borrower, property, or loan #", placeholder="e.g. 63390  ·  116 South Street")
-    mode = c[1].radio("Match on", ["Loan #", "Property", "Borrower"], label_visibility="collapsed")
+    st.markdown("## 🔎  Find a draw")
+    st.caption("Search by **loan number**, **property / deal name**, **borrower**, or **draw number** — "
+               "type any part of it.")
+    text = st.text_input("search", label_visibility="collapsed",
+                         placeholder="e.g.   64806      116 South Street      Panache Properties")
     if not text:
-        st.info("Search a loan to see every draw's full cycle — Salesforce milestones + the Land Gorilla draw timeline.")
+        st.info("Start typing above to pull up a draw and its full cycle.")
         return
 
-    esc = soql_escape(text)
-    field = {"Loan #": "Loan_Number__c", "Property": "Deal__r.Name", "Borrower": "Borrower_Name_Text__c"}[mode]
-    op = "=" if mode == "Loan #" and text.isdigit() else "LIKE"
-    val = f"'{esc}'" if op == "=" else f"'%{esc}%'"
+    q = soql_escape(text)
+    searchable = [f for f in ["Loan_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
+                              "Loan_Advance_Number__c"] if f in sel]
+    ors = " OR ".join(f"{f} LIKE '%{q}%'" for f in searchable) or "Id != null"
     df = add_intervals(run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {field} {op} {val} "
+        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND ({ors}) "
         f"ORDER BY Loan_Number__c, {REQ_FIELD}"), same_day)
     if df.empty:
-        st.warning("No matching construction draws."); return
+        st.warning("No matching draws."); return
+    nloans = df["Loan_Number__c"].nunique() if "Loan_Number__c" in df else len(df)
+    st.caption(f"Found **{len(df)}** draw(s) across **{nloans}** loan(s).")
 
     cfg = lg_config()
     tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
@@ -622,105 +641,94 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
         prop = g["Deal__r.Name"].dropna().iloc[0] if "Deal__r.Name" in g and g["Deal__r.Name"].notna().any() else ""
         borrower = g["Borrower_Name_Text__c"].dropna().iloc[0] if "Borrower_Name_Text__c" in g and g["Borrower_Name_Text__c"].notna().any() else ""
         st.markdown(f"### Loan {loan_no} — {prop}")
-        if borrower:
-            st.caption(f"Borrower: {borrower}  ·  Land Gorilla file: rb0{loan_no}")
+        sub = []
+        if borrower: sub.append(f"Borrower: {borrower}")
+        sub.append(f"{len(g)} draw(s)")
+        st.caption("  ·  ".join(sub))
 
-        # Land Gorilla loan-level overview (project progress, funded/last-draw dates, balances, risk)
-        if cfg and pd.notna(loan_no) and str(loan_no).strip():
-            ov = lg_loan_overview(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(tmpl), str(loan_no))
-            if ov and not ov.get("_error"):
-                st.markdown("**Land Gorilla — loan status**")
-                m = st.columns(4)
-                if ov.get("project_pct") is not None:
-                    pct = float(ov["project_pct"])
-                    m[0].metric("Project complete", f"{pct:.0f}%")
-                    m[0].progress(min(max(pct / 100, 0), 1.0))
-                    if ov.get("duration_pct") is not None:
-                        m[0].caption(f"{float(ov['duration_pct']):.0f}% of loan term elapsed")
-                if ov.get("to_finish") is not None:
-                    m[1].metric("Remaining to fund", money(ov["to_finish"]))
-                if ov.get("balance") is not None:
-                    m[2].metric("Loan balance", money(ov["balance"]))
-                if ov.get("last_draw"):
-                    m[3].metric("Last draw", f"{ov['last_draw']}")
-                # status line
-                bits = []
-                if ov.get("status"): bits.append(f"**Status:** {ov['status']}")
-                if ov.get("program"): bits.append(f"**Program:** {ov['program']}")
-                loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
-                if loc: bits.append(f"**Location:** {loc}")
-                if ov.get("funded_date"): bits.append(f"**Funded:** {ov['funded_date']}")
-                if ov.get("due_date"): bits.append(f"**Due:** {ov['due_date']}")
-                if ov.get("last_note_at"): bits.append(f"**Last note:** {ov['last_note_at']}")
-                if bits:
-                    st.caption("  ·  ".join(bits))
-                if ov.get("risk"):
-                    st.caption("**Risk labels:** " + " · ".join(ov["risk"]))
-                if ov.get("users"):
-                    st.caption("**LG team:** " + ", ".join(ov["users"]))
-            elif ov and ov.get("_error"):
-                st.caption(f"Land Gorilla loan overview unavailable ({ov['_error']}).")
-
+        # --- Salesforce leads: each draw's cycle ---
         for _, row in g.iterrows():
-            _render_draw(row, cfg)
+            _render_draw_sf(row)
+
+        # --- Land Gorilla: secondary, collapsed so it doesn't clutter ---
+        if cfg:
+            with st.expander("🦍  Land Gorilla details", expanded=False):
+                _render_lg_for_loan(cfg, tmpl, loan_no, g)
         st.divider()
 
 
-def _render_draw(row: pd.Series, cfg: dict | None):
+def _render_draw_sf(row: pd.Series):
     draw_no = row.get("Loan_Advance_Number__c") or row.get("Name") or "draw"
-    top = st.columns([2, 1, 1, 1])
+    top = st.columns([2, 1, 1])
     top[0].markdown(f"**Draw {draw_no}** — {row.get('Status__c','')}")
     if NET_FIELD in row and pd.notna(row.get(NET_FIELD)):
-        top[1].metric("Net", money(row[NET_FIELD]))
-    if GROSS_FIELD in row and pd.notna(row.get(GROSS_FIELD)):
-        top[2].metric("Gross", money(row[GROSS_FIELD]))
+        top[1].metric("Funded", money(row[NET_FIELD]))
     if "turn_bd" in row and pd.notna(row.get("turn_bd")):
-        top[3].metric("Turn-time", f"{row['turn_bd']:.0f} bd")
+        top[2].metric("Funding time", f"{row['turn_bd']:.0f} days")
 
-    # Salesforce milestone timeline
     steps = [{"Milestone": lbl, "Date": (pd.to_datetime(row.get(f)).date() if pd.notna(row.get(f)) else None),
               "": "✅" if pd.notna(row.get(f)) else "⬜"} for lbl, f in MILESTONES]
     tdf = pd.DataFrame(steps)
     recorded = tdf["Date"].notna().sum()
-    st.progress(recorded / len(MILESTONES), text=f"Salesforce milestones {recorded}/{len(MILESTONES)}")
-    cc = st.columns([1, 1])
-    cc[0].dataframe(tdf, hide_index=True, use_container_width=True,
-                    column_config={"": st.column_config.TextColumn(width="small")})
-
-    # Land Gorilla per-draw timeline via DrawContainerId__c
-    with cc[1]:
-        st.markdown("**Land Gorilla draw**")
-        container = row.get(CONTAINER_FIELD)
-        if not cfg:
-            st.caption("Add [landgorilla] secrets to show the LG draw timeline.")
-        elif pd.isna(container) or not container:
-            st.caption("No Land Gorilla draw container on this advance yet.")
-        else:
-            det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
-            if not det or det.get("_error"):
-                st.caption(f"LG draw detail unavailable ({(det or {}).get('_error','no data')}).")
-            else:
-                lg_steps = [("Created", det["created"]), ("Submitted", det["submitted"]),
-                            ("Approved", det["approved"]), ("Funded", det["funded"])]
-                st.dataframe(pd.DataFrame([{"Stage": s, "Date": d} for s, d in lg_steps]),
-                             hide_index=True, use_container_width=True)
-                line = [f"Status: {det.get('status','—')}"]
-                if det.get("type"):
-                    line.append(det["type"])
-                if det.get("amount") is not None:
-                    line.append(f"Amount: {money(det['amount'])}")
-                st.caption(" · ".join(line))
-                payees = det.get("payees") or []
-                if payees:
-                    with st.expander(f"Payees ({len(payees)})"):
-                        st.dataframe(pd.DataFrame([{"Payee": p["payee"],
-                                                    "Amount": money(p["amount"]) if p.get("amount") is not None else "—"}
-                                                   for p in payees]),
-                                     hide_index=True, use_container_width=True)
-
+    st.progress(recorded / len(MILESTONES), text=f"Milestones recorded: {recorded}/{len(MILESTONES)}")
+    st.dataframe(tdf, hide_index=True, use_container_width=True,
+                 column_config={"": st.column_config.TextColumn(width="small")})
     note = row.get(NOTES_FIELD)
     if pd.notna(note) and str(note).strip():
         st.caption(f"📝 {note}")
+
+
+def _render_lg_for_loan(cfg: dict, tmpl: str, loan_no, g: pd.DataFrame):
+    fn = lg_filenumber(loan_no)
+    if fn:
+        ov = lg_loan_overview(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(tmpl), str(loan_no))
+        if ov and not ov.get("_error"):
+            m = st.columns(4)
+            if ov.get("project_pct") is not None:
+                pct = float(ov["project_pct"]); m[0].metric("Project complete", f"{pct:.0f}%")
+                m[0].progress(min(max(pct / 100, 0), 1.0))
+                if ov.get("duration_pct") is not None:
+                    m[0].caption(f"{float(ov['duration_pct']):.0f}% of term elapsed")
+            if ov.get("to_finish") is not None: m[1].metric("Remaining to fund", money(ov["to_finish"]))
+            if ov.get("balance") is not None: m[2].metric("Loan balance", money(ov["balance"]))
+            if ov.get("last_draw"): m[3].metric("Last draw", f"{ov['last_draw']}")
+            bits = []
+            for lbl, key in [("Status", "status"), ("Program", "program"),
+                             ("Funded", "funded_date"), ("Due", "due_date"), ("Last note", "last_note_at")]:
+                if ov.get(key): bits.append(f"**{lbl}:** {ov[key]}")
+            loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
+            if loc: bits.append(f"**Location:** {loc}")
+            if bits: st.caption("  ·  ".join(bits))
+            if ov.get("risk"): st.caption("**Risk:** " + " · ".join(ov["risk"]))
+            if ov.get("users"): st.caption("**LG team:** " + ", ".join(ov["users"]))
+        else:
+            st.caption(f"No matching loan in Land Gorilla ({fn}).")
+    else:
+        st.caption("This loan number isn't an RB0 Land Gorilla file, so there's no Land Gorilla match.")
+
+    # per-draw LG detail (only where a container id exists)
+    for _, row in g.iterrows():
+        container = row.get(CONTAINER_FIELD)
+        if pd.isna(container) or not container:
+            continue
+        det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
+        st.markdown(f"**Draw {row.get('Loan_Advance_Number__c') or row.get('Name','')}**  ·  Land Gorilla")
+        if not det or det.get("_error"):
+            st.caption(f"Draw detail unavailable ({(det or {}).get('_error','no data')}).")
+            continue
+        lg_steps = [("Created", det["created"]), ("Submitted", det["submitted"]),
+                    ("Approved", det["approved"]), ("Funded", det["funded"])]
+        st.dataframe(pd.DataFrame([{"Stage": s, "Date": d} for s, d in lg_steps]),
+                     hide_index=True, use_container_width=True)
+        line = [f"Status: {det.get('status','—')}"]
+        if det.get("type"): line.append(det["type"])
+        if det.get("amount") is not None: line.append(f"Amount: {money(det['amount'])}")
+        st.caption(" · ".join(line))
+        payees = det.get("payees") or []
+        if payees:
+            st.dataframe(pd.DataFrame([{"Payee": p["payee"],
+                                        "Amount": money(p["amount"]) if p.get("amount") is not None else "—"}
+                                       for p in payees]), hide_index=True, use_container_width=True)
 
 
 # ───────────────────────────────── main ─────────────────────────────────────
