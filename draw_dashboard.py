@@ -281,6 +281,32 @@ def add_intervals(df: pd.DataFrame, same_day: int) -> pd.DataFrame:
         df["turn_bd"] = bdays(df[PKG_FIELD], df[WIRE_FIELD], same_day)
     if REQ_FIELD in df and PKG_FIELD in df:
         df["prepkg_bd"] = bdays(df[REQ_FIELD], df[PKG_FIELD], same_day)
+    # effective days-to-fund = Salesforce value, with the source (Land Gorilla) filling blanks later
+    df["_days"] = pd.to_numeric(df.get(DAYS_FIELD), errors="coerce") if DAYS_FIELD in df else np.nan
+    df["_days_src"] = np.where(df["_days"].notna(), "Salesforce", "")
+    return df
+
+
+def backfill_days_from_lg(df: pd.DataFrame, cfg: dict | None) -> pd.DataFrame:
+    """Land Gorilla is the source that imports into Salesforce. Where SF's days-to-fund is blank
+       (the import missed it), compute it from LG's draw createdDate -> wire via DrawContainerId__c."""
+    if df.empty or not cfg or "_days" not in df:
+        return df
+    df = df.copy()
+    need = df["_days"].isna() & df.get(CONTAINER_FIELD, pd.Series(index=df.index)).notna() \
+           & df.get(WIRE_FIELD, pd.Series(index=df.index)).notna()
+    for idx in df.index[need]:
+        container = df.at[idx, CONTAINER_FIELD]
+        det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
+        if not det or det.get("_error") or not det.get("created"):
+            continue
+        created = pd.to_datetime(det["created"], errors="coerce")
+        wire = pd.to_datetime(df.at[idx, WIRE_FIELD], errors="coerce")
+        if pd.notna(created) and pd.notna(wire):
+            d = (wire - created).days
+            if d >= 0:
+                df.at[idx, "_days"] = d
+                df.at[idx, "_days_src"] = "Land Gorilla"
     return df
 
 
@@ -545,7 +571,8 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gi)
     AMT = NET_FIELD if NET_FIELD in done else None
-    done["_days"] = pd.to_numeric(done.get(DAYS_FIELD), errors="coerce") if DAYS_FIELD in done else np.nan
+    if "_days" not in done:   # add_intervals sets _days; guard in case of an empty frame
+        done["_days"] = pd.to_numeric(done.get(DAYS_FIELD), errors="coerce") if DAYS_FIELD in done else np.nan
     periods = sorted(done["Period"].unique())
     cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
 
@@ -718,6 +745,11 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
     st.caption(f"Found **{len(df)}** draw(s) across **{nloans}** loan(s).")
 
     cfg = lg_config()
+    # Land Gorilla is the upstream source — backfill days-to-fund where the SF import left it blank
+    df = backfill_days_from_lg(df, cfg)
+    filled = (df["_days_src"] == "Land Gorilla").sum() if "_days_src" in df else 0
+    if filled:
+        st.caption(f"↳ filled **{filled}** missing days-to-fund value(s) from Land Gorilla (the import source).")
     tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
     for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
         prop = g["Deal__r.Name"].dropna().iloc[0] if "Deal__r.Name" in g and g["Deal__r.Name"].notna().any() else ""
@@ -745,8 +777,12 @@ def _render_draw_sf(row: pd.Series):
     top[0].markdown(f"**Draw {draw_no}** — {row.get('Status__c','')}")
     if NET_FIELD in row and pd.notna(row.get(NET_FIELD)):
         top[1].metric("Funded", money(row[NET_FIELD]))
-    if DAYS_FIELD in row and pd.notna(row.get(DAYS_FIELD)):
-        top[2].metric("Days to fund", f"{float(row[DAYS_FIELD]):.0f}")
+    if "_days" in row and pd.notna(row.get("_days")):
+        src = row.get("_days_src", "")
+        top[2].metric("Days to fund", f"{float(row['_days']):.0f}",
+                      f"via {src}" if src == "Land Gorilla" else None,
+                      help="Calendar days from the borrower's draw request to the wire." +
+                           (" Backfilled from Land Gorilla (the SF import source)." if src == "Land Gorilla" else ""))
     elif "turn_bd" in row and pd.notna(row.get("turn_bd")):
         top[2].metric("Once-complete", f"{row['turn_bd']:.0f} bd")
 
