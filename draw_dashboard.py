@@ -1,43 +1,39 @@
 """
-Construction Draw Dashboard  (Streamlit)
-========================================
-Same Salesforce OAuth login as the AM slide app, then two views:
+Construction Draw Tracker  (Streamlit)
+======================================
+ONE fused tracker — not separate Salesforce vs Land Gorilla views.
 
-  • Pipeline Pulse  — what's happening now: open draws by stage, on-hold draws,
-                      completed this period ($ and count), recent wires, aging,
-                      and the median business-day turn-time (package -> wire).
-  • Draw Lookup     — type a property/deal or advance # and see the full draw
-                      cycle for each matching advance: milestone timeline,
-                      status, amounts, and the two turn-time intervals.
+Salesforce is the spine: the Construction Advance record type IS the small-balance
+RTL / fix-and-flip (RB0) book. Queried from the Advance__c OBJECT (not the pipeline
+report), so paid-off draws are retained — closing the "paid off today drops off the
+report" gap Melanie flagged. It carries the rb number (Loan_Number__c), the milestone
+dates, Notes__c, and the real dollars.
 
-Built on the Advance__c model we mapped:
-  scope   = Record Type "Construction Advance"
-  anchor  = Date_Submitted_to_Capital_Partner__c  ("Date Full Draw Package Received")
-  wire    = Wire_Date__c
-The SELECTs are built from describe(), so a field that doesn't exist in the org
-is skipped instead of breaking the query.
+Land Gorilla is folded in for one thing only: each advance's per-draw timeline
+(submitted -> approved -> funded + amount), reached directly via the advance's
+DrawContainerId__c. No noisy separate tab, no loan-list scraping.
 
-Secrets (same as the reference app), in .streamlit/secrets.toml:
-  [salesforce]
-  client_id     = "..."
-  client_secret = "..."
-  redirect_uri  = "https://<your-app-host>/"
-  auth_host     = "https://login.salesforce.com"   # or https://test.salesforce.com
-  scope         = "api refresh_token"
-  prompt        = "login"
+Two lenses on the same data:
+  • Pipeline (macro) — the on-demand monthly/quarter/year report: turn-time
+    (complete package -> wire) beside the pre-package (borrower/inspection/title)
+    interval, status, notes, both dollar figures, KPIs, by-month rollup, CSV.
+  • Loan detail (micro) — search a borrower / property / loan# and see each draw's
+    full cycle: the Salesforce milestone timeline + notes, with the Land Gorilla
+    draw detail stacked beneath.
 
-Run:  streamlit run draw_dashboard.py
+Secrets (.streamlit/secrets.toml): [salesforce] (OAuth, same as the AM app) and
+[landgorilla] (user, password, verify).  Run:  streamlit run draw_tracker.py
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
-import secrets
 import re
+import secrets
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -48,39 +44,36 @@ import streamlit as st
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from simple_salesforce import Salesforce
 
-
 # ───────────────────────────── domain constants ─────────────────────────────
 CONSTRUCTION_DEV_NAME = "Construction_Advance"
-PKG_FIELD  = "Date_Submitted_to_Capital_Partner__c"     # "Date Full Draw Package Received"
+PKG_FIELD  = "Date_Submitted_to_Capital_Partner__c"   # "Date Full Draw Package Received"
 WIRE_FIELD = "Wire_Date__c"
 REQ_FIELD  = "Date_Advance_Requested__c"
+NOTES_FIELD = "Notes__c"
+CONTAINER_FIELD = "DrawContainerId__c"
+NET_FIELD, GROSS_FIELD = "Net_Funding_Total__c", "Aggregate_Funding__c"
 
-# Milestone chain, in order, for the "full draw cycle" timeline.
 MILESTONES = [
-    ("Requested",                 REQ_FIELD),
-    ("Inspection ordered",        "Date_Inspection_Ordered__c"),
-    ("Inspection",                "Date_Of_Inspection__c"),
-    ("Inspection report received","Date_Inspection_Report_Received__c"),
-    ("Submitted for review",      "Date_Submitted_For_Approval__c"),
-    ("Internal review complete",  "Date_Internal_Review_Complete__c"),
-    ("Full draw package received",PKG_FIELD),
-    ("Manager approval",          "Manager_Approval_Date__c"),
-    ("Wired",                     WIRE_FIELD),
+    ("Requested",                  REQ_FIELD),
+    ("Inspection ordered",         "Date_Inspection_Ordered__c"),
+    ("Inspection",                 "Date_Of_Inspection__c"),
+    ("Inspection report received", "Date_Inspection_Report_Received__c"),
+    ("Submitted for review",       "Date_Submitted_For_Approval__c"),
+    ("Internal review complete",   "Date_Internal_Review_Complete__c"),
+    ("Full draw package received", PKG_FIELD),
+    ("Manager approval",           "Manager_Approval_Date__c"),
+    ("Wired",                      WIRE_FIELD),
 ]
-# Fields we'd like if the org has them (intersected with describe()).
-WISH_TEXT = ["Name", "Deal__r.Name", "Lender__c", "Status__c", "IC_Approval_Status__c",
-             "Exception__c", "Cancellation_Reason__c", "Inspection_Method__c",
-             "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
-             "Underwriter__r.Name", "Advance_Requestor__r.Name"]
-WISH_AMOUNT = ["Net_Funded_Amount__c", "Current_Draw_Amount__c", "Draw_Amount__c",
-               "Advance_Amount__c", "Amount__c"]
-OPEN_EXCLUDE_STATUS = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
+WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name",
+         "Borrower_Name_Text__c", "Lender__c", "Status__c", "Inspection_Method__c",
+         "Advance_Coordinator__r.Name", NOTES_FIELD, CONTAINER_FIELD,
+         NET_FIELD, GROSS_FIELD] + [m[1] for m in MILESTONES])
+TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
 
 _HOLS = USFederalHolidayCalendar().holidays("2018-01-01", "2032-12-31").values.astype("datetime64[D]")
 
 
 # ───────────────────────────── Salesforce OAuth ─────────────────────────────
-# (Faithful to the AM slide app so it uses the same secrets + redirect URI.)
 def install_truststore() -> None:
     try:
         import truststore
@@ -89,18 +82,15 @@ def install_truststore() -> None:
         pass
 
 
-def load_salesforce_oauth_config() -> dict[str, str]:
-    section = dict(st.secrets.get("salesforce", {}))
-    required = ["client_id", "client_secret", "redirect_uri", "auth_host"]
-    missing = [k for k in required if not section.get(k)]
+def load_sf_oauth() -> dict[str, str]:
+    sec = dict(st.secrets.get("salesforce", {}))
+    missing = [k for k in ("client_id", "client_secret", "redirect_uri", "auth_host") if not sec.get(k)]
     if missing:
-        raise RuntimeError(
-            "Missing Salesforce OAuth secrets: " + ", ".join(missing)
-            + ". Add them under [salesforce] in Streamlit secrets."
-        )
-    section.setdefault("scope", "api refresh_token")
-    section.setdefault("prompt", "login")
-    return section
+        raise RuntimeError("Missing Salesforce OAuth secrets: " + ", ".join(missing)
+                           + ". Add them under [salesforce] in Streamlit secrets.")
+    sec.setdefault("scope", "api refresh_token")
+    sec.setdefault("prompt", "login")
+    return sec
 
 
 @st.cache_resource
@@ -108,54 +98,40 @@ def _pkce_store() -> dict:
     return {}
 
 
-def generate_pkce_pair() -> tuple[str, str]:
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return verifier, challenge
+def _pkce_pair() -> tuple[str, str]:
+    v = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+    c = base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
+    return v, c
 
 
-def build_salesforce_login_url(cfg: dict[str, str]) -> str:
-    auth_host = str(cfg["auth_host"]).rstrip("/")
+def login_url(cfg: dict[str, str]) -> str:
     state = secrets.token_urlsafe(24)
-    verifier, challenge = generate_pkce_pair()
-    store = _pkce_store()
-    store[state] = verifier
+    verifier, challenge = _pkce_pair()
+    store = _pkce_store(); store[state] = verifier
     if len(store) > 50:
         for old in list(store.keys())[:-50]:
             store.pop(old, None)
-    query = urlencode({
-        "response_type": "code",
-        "client_id": cfg["client_id"],
-        "redirect_uri": cfg["redirect_uri"],
-        "scope": cfg.get("scope", "api refresh_token"),
-        "prompt": cfg.get("prompt", "login"),
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    })
-    return f"{auth_host}/services/oauth2/authorize?{query}"
+    q = urlencode({"response_type": "code", "client_id": cfg["client_id"],
+                   "redirect_uri": cfg["redirect_uri"], "scope": cfg.get("scope", "api refresh_token"),
+                   "prompt": cfg.get("prompt", "login"), "state": state,
+                   "code_challenge": challenge, "code_challenge_method": "S256"})
+    return f"{str(cfg['auth_host']).rstrip('/')}/services/oauth2/authorize?{q}"
 
 
-def exchange_code_for_token(cfg: dict[str, str], code: str, verifier: str | None) -> dict[str, Any]:
+def exchange_code(cfg: dict[str, str], code: str, verifier: str | None) -> dict[str, Any]:
     install_truststore()
-    token_url = f"{str(cfg['auth_host']).rstrip('/')}/services/oauth2/token"
-    fields = {
-        "grant_type": "authorization_code",
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
-        "redirect_uri": cfg["redirect_uri"],
-        "code": code,
-    }
+    url = f"{str(cfg['auth_host']).rstrip('/')}/services/oauth2/token"
+    fields = {"grant_type": "authorization_code", "client_id": cfg["client_id"],
+              "client_secret": cfg["client_secret"], "redirect_uri": cfg["redirect_uri"], "code": code}
     if verifier:
         fields["code_verifier"] = verifier
-    req = Request(token_url, data=urlencode(fields).encode(),
+    req = Request(url, data=urlencode(fields).encode(),
                   headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     try:
         with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
+        body = exc.read().decode("utf-8", "ignore")
         try:
             body = json.loads(body).get("error_description", body)
         except Exception:
@@ -168,16 +144,15 @@ def _qp(name: str) -> str | None:
     return v[0] if isinstance(v, list) else v
 
 
-def clear_salesforce_session() -> None:
-    for k in ["salesforce_auth", "_last_sf_code"]:
+def clear_sf_session() -> None:
+    for k in ("salesforce_auth", "_last_sf_code"):
         st.session_state.pop(k, None)
 
 
-def maybe_finish_oauth(cfg: dict[str, str]) -> None:
+def finish_oauth(cfg: dict[str, str]) -> None:
     if _qp("error"):
-        desc = _qp("error_description") or _qp("error")
-        st.query_params.clear()
-        raise RuntimeError(f"Salesforce login was not completed: {desc}")
+        d = _qp("error_description") or _qp("error"); st.query_params.clear()
+        raise RuntimeError(f"Salesforce login was not completed: {d}")
     code = _qp("code")
     if not code:
         return
@@ -188,536 +163,180 @@ def maybe_finish_oauth(cfg: dict[str, str]) -> None:
     if state and not verifier:
         st.query_params.clear()
         raise RuntimeError("Login could not be completed (PKCE verifier missing — the app likely "
-                           "restarted between steps). Click 'Log in to Salesforce' and try again.")
-    payload = exchange_code_for_token(cfg, code, verifier)
-    access_token = payload.get("access_token")
-    instance_url = payload.get("instance_url")
-    if not access_token or not instance_url:
-        raise RuntimeError("Login succeeded but no access token / instance URL was returned.")
-    st.session_state["salesforce_auth"] = {"access_token": access_token, "instance_url": instance_url}
+                           "restarted). Click 'Log in to Salesforce' and try again.")
+    payload = exchange_code(cfg, code, verifier)
+    at, iu = payload.get("access_token"), payload.get("instance_url")
+    if not at or not iu:
+        raise RuntimeError("Login succeeded but no access token / instance URL returned.")
+    st.session_state["salesforce_auth"] = {"access_token": at, "instance_url": iu}
     st.session_state["_last_sf_code"] = code
-    st.query_params.clear()
-    st.rerun()
+    st.query_params.clear(); st.rerun()
 
 
-def get_sf_from_session() -> Salesforce | None:
+def sf_from_session() -> Salesforce | None:
     install_truststore()
-    auth = st.session_state.get("salesforce_auth", {})
-    if not auth.get("instance_url") or not auth.get("access_token"):
+    a = st.session_state.get("salesforce_auth", {})
+    if not a.get("instance_url") or not a.get("access_token"):
         return None
-    return Salesforce(instance_url=auth["instance_url"], session_id=auth["access_token"])
+    return Salesforce(instance_url=a["instance_url"], session_id=a["access_token"])
 
 
-# ───────────────────────────── query helpers ────────────────────────────────
+# ───────────────────────────── SF query helpers ─────────────────────────────
 def soql_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def flatten(rec: dict) -> dict:
-    """Flatten one/two levels of relationship dicts to dotted keys; drop 'attributes'."""
     out: dict[str, Any] = {}
     for k, v in rec.items():
         if k == "attributes":
             continue
         if isinstance(v, dict):
             for k2, v2 in v.items():
-                if k2 == "attributes":
-                    continue
-                out[f"{k}.{k2}"] = v2.get("Name") if isinstance(v2, dict) else v2
+                if k2 != "attributes":
+                    out[f"{k}.{k2}"] = v2.get("Name") if isinstance(v2, dict) else v2
         else:
             out[k] = v
     return out
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def describe_fields(instance_url: str, token: str) -> list[str]:
-    sf = Salesforce(instance_url=instance_url, session_id=token)
+def describe_fields(inst: str, tok: str) -> list[str]:
+    sf = Salesforce(instance_url=inst, session_id=tok)
     return [f["name"] for f in sf.Advance__c.describe()["fields"]]
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def construction_rt_id(instance_url: str, token: str) -> str | None:
-    sf = Salesforce(instance_url=instance_url, session_id=token)
-    for r in sf.query("SELECT Id,DeveloperName FROM RecordType "
-                      "WHERE SobjectType='Advance__c'")["records"]:
+def construction_rt(inst: str, tok: str) -> str | None:
+    sf = Salesforce(instance_url=inst, session_id=tok)
+    for r in sf.query("SELECT Id,DeveloperName FROM RecordType WHERE SobjectType='Advance__c'")["records"]:
         if r["DeveloperName"] == CONSTRUCTION_DEV_NAME:
             return r["Id"]
     return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def run_soql(instance_url: str, token: str, soql: str) -> pd.DataFrame:
-    sf = Salesforce(instance_url=instance_url, session_id=token)
-    recs = sf.query_all(soql)["records"]
-    return pd.DataFrame([flatten(r) for r in recs])
+def run_soql(inst: str, tok: str, soql: str) -> pd.DataFrame:
+    sf = Salesforce(instance_url=inst, session_id=tok)
+    return pd.DataFrame([flatten(r) for r in sf.query_all(soql)["records"]])
 
 
-def available(instance_url: str, token: str) -> list[str]:
-    present = set(describe_fields(instance_url, token))
-    fields = ["Id"]
-    for f in WISH_TEXT + [m[1] for m in MILESTONES] + ["Target_Advance_Date__c"]:
-        base = f.split(".")[0]
-        if base in present and f not in fields:
-            fields.append(f)
-    amt = next((a for a in WISH_AMOUNT if a in present), None)
-    if amt:
-        fields.append(amt)
-    return fields, amt
+def select_fields(inst: str, tok: str) -> str:
+    present = set(describe_fields(inst, tok))
+    cols = [f for f in WISH if f.split(".")[0] in present]
+    return ",".join(dict.fromkeys(cols))
 
 
 # ───────────────────────────── turn-time math ───────────────────────────────
-def bdays(a: pd.Series, b: pd.Series, same_day_as: int) -> pd.Series:
+def bdays(a: pd.Series, b: pd.Series, same_day: int) -> pd.Series:
     a, b = pd.to_datetime(a, errors="coerce"), pd.to_datetime(b, errors="coerce")
     m = a.notna() & b.notna()
     out = pd.Series(np.nan, index=a.index)
     if m.any():
         out[m] = np.busday_count(a[m].values.astype("datetime64[D]"),
-                                 b[m].values.astype("datetime64[D]"), holidays=_HOLS) + same_day_as
+                                 b[m].values.astype("datetime64[D]"), holidays=_HOLS) + same_day
     out[out < 0] = np.nan
     return out
 
 
-def add_intervals(df: pd.DataFrame, same_day_as: int) -> pd.DataFrame:
+def add_intervals(df: pd.DataFrame, same_day: int) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
     if PKG_FIELD in df and WIRE_FIELD in df:
-        df["turn_bd"] = bdays(df[PKG_FIELD], df[WIRE_FIELD], same_day_as)
+        df["turn_bd"] = bdays(df[PKG_FIELD], df[WIRE_FIELD], same_day)
     if REQ_FIELD in df and PKG_FIELD in df:
-        df["prepkg_bd"] = bdays(df[REQ_FIELD], df[PKG_FIELD], same_day_as)
-    if REQ_FIELD in df and WIRE_FIELD in df:
-        df["total_bd"] = bdays(df[REQ_FIELD], df[WIRE_FIELD], same_day_as)
+        df["prepkg_bd"] = bdays(df[REQ_FIELD], df[PKG_FIELD], same_day)
     return df
 
 
 def period_bounds(choice: str) -> tuple[date, date]:
-    today = date.today()
-    if choice == "This week":
-        start = today - pd.Timedelta(days=today.weekday()); return start, today
+    t = date.today()
     if choice == "This month":
-        return today.replace(day=1), today
+        return t.replace(day=1), t
     if choice == "This quarter":
-        q = (today.month - 1) // 3
-        return date(today.year, q * 3 + 1, 1), today
+        q = (t.month - 1) // 3
+        return date(t.year, q * 3 + 1, 1), t
     if choice == "This year":
-        return date(today.year, 1, 1), today
+        return date(t.year, 1, 1), t
     if choice == "Last 90 days":
-        return today - pd.Timedelta(days=90), today
-    return date(today.year, 1, 1), today
+        return t - pd.Timedelta(days=90), t
+    if choice == "Last month":
+        first = t.replace(day=1); end = first - pd.Timedelta(days=1)
+        return end.replace(day=1), end.date() if hasattr(end, "date") else end
+    return date(t.year, 1, 1), t
 
 
 def money(x) -> str:
     try:
-        return f"${x:,.0f}"
+        v = float(x)
     except Exception:
         return "—"
+    return f"${v:,.0f}"
 
 
-# ───────────────────────────── UI: Pipeline Pulse ───────────────────────────
-def render_pulse(inst: str, tok: str, rt: str, fields: list[str], amt: str | None, same_day: int):
-    st.subheader("Pipeline Pulse")
-    colf = st.columns([1, 1, 2])
-    period = colf[0].selectbox("Completed window",
-                               ["This week", "This month", "This quarter", "This year", "Last 90 days"],
-                               index=1)
-    start, end = period_bounds(period)
-    colf[1].caption(f"{start:%m/%d/%Y} → {end:%m/%d/%Y}")
+# ───────────────────────────── Land Gorilla (draw detail only) ──────────────
+def lg_config() -> dict | None:
+    sec = dict(st.secrets.get("landgorilla", {}))
+    return sec if sec.get("user") and sec.get("password") else None
 
-    sel = ",".join(fields)
 
-    # --- open (in-flight) draws: not wired, not terminal ---
-    open_status = "(" + ",".join(f"'{s}'" for s in OPEN_EXCLUDE_STATUS) + ")"
-    open_df = run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
-        f"AND {WIRE_FIELD}=null AND Status__c NOT IN {open_status}")
-    # --- completed in window ---
-    done_df = run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
-        f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d}")
-    done_df = add_intervals(done_df, same_day)
+class LGClient:
+    BASE = "https://clmapi.landgorilla.com"
 
-    # --- KPI row ---
-    k = st.columns(4)
-    k[0].metric("Open draws (in flight)", f"{len(open_df):,}")
-    k[1].metric(f"Completed ({period.lower()})", f"{len(done_df):,}")
-    if amt and amt in done_df:
-        k[2].metric("Funded in window", money(pd.to_numeric(done_df[amt], errors="coerce").sum()))
-    else:
-        k[2].metric("Funded in window", "—")
-    if "turn_bd" in done_df and done_df["turn_bd"].notna().any():
-        med = done_df["turn_bd"].median()
-        within3 = (done_df["turn_bd"] <= 3).mean() * 100
-        k[3].metric("Median turn-time", f"{med:.0f} bd", f"{within3:.0f}% ≤3 bd")
-    else:
-        k[3].metric("Median turn-time", "—", "no package dates in window")
-
-    st.divider()
-
-    # --- open by stage + on hold ---
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Open draws by stage**")
-        if not open_df.empty and "Status__c" in open_df:
-            by = open_df["Status__c"].value_counts().rename_axis("Status").reset_index(name="Draws")
-            st.bar_chart(by.set_index("Status"))
-            if amt and amt in open_df:
-                pend = pd.to_numeric(open_df[amt], errors="coerce").sum()
-                st.caption(f"Estimated open exposure: {money(pend)}")
+    def __init__(self, user, password, *, verify=True, session=None):
+        self._u, self._p, self.verify = user, password, verify
+        self._tok, self._exp = None, 0.0
+        if session is not None:
+            self._s = session
         else:
-            st.info("No open draws.")
-    with c2:
-        st.markdown("**On hold / needs attention**")
-        holds = open_df[open_df.get("Status__c", pd.Series(dtype=str)).astype(str)
-                        .str.contains("Hold|Pending Borrower|Revision", case=False, na=False)] \
-                if not open_df.empty else open_df
-        if not holds.empty:
-            show = [c for c in ["Name", "Deal__r.Name", "Status__c", "Advance_Coordinator__r.Name"] if c in holds]
-            st.dataframe(holds[show].rename(columns=_pretty), use_container_width=True, height=240)
-        else:
-            st.success("Nothing sitting on hold.")
+            import requests
+            self._s = requests.Session()
 
-    st.divider()
-
-    # --- aging of open draws ---
-    st.markdown("**Aging — oldest open draws (calendar days since requested)**")
-    if not open_df.empty and REQ_FIELD in open_df:
-        aged = open_df.copy()
-        aged["Days open"] = (pd.Timestamp(date.today()) - pd.to_datetime(aged[REQ_FIELD], errors="coerce")).dt.days
-        aged = aged.sort_values("Days open", ascending=False)
-        show = [c for c in ["Name", "Deal__r.Name", "Status__c", "Days open"] if c in aged]
-        st.dataframe(aged[show].head(15).rename(columns=_pretty), use_container_width=True, height=300)
-    else:
-        st.info("No requested-date data on open draws.")
-
-    st.divider()
-
-    # --- recent wires ---
-    st.markdown("**Recently completed (last 15 wires in window)**")
-    if not done_df.empty:
-        rc = done_df.sort_values(WIRE_FIELD, ascending=False).head(15)
-        show = [c for c in ["Name", "Deal__r.Name", WIRE_FIELD, amt, "turn_bd"] if c and c in rc]
-        st.dataframe(rc[show].rename(columns=_pretty), use_container_width=True, height=300)
-        st.download_button("Download completed (window) as CSV",
-                           done_df.to_csv(index=False).encode(), f"completed_{start}_{end}.csv")
-    else:
-        st.info("No completed draws in this window.")
-
-    if "turn_bd" in done_df:
-        st.caption("Turn-time = business days from full draw package received to wire. Only draws "
-                   "with a recorded package date are measured — coverage in Salesforce is partial; "
-                   "Land Gorilla (IHD-109768) fills the rest.")
-
-
-# ───────────────────────────── UI: Draw Lookup ──────────────────────────────
-_pretty = {
-    "Name": "Advance #", "Deal__r.Name": "Property / Deal", "Status__c": "Status",
-    "Lender__c": "Lender", "Advance_Coordinator__r.Name": "Coordinator",
-    "Advance_Analyst__r.Name": "Analyst", "Underwriter__r.Name": "Underwriter",
-    "Advance_Requestor__r.Name": "Requestor", WIRE_FIELD: "Wire date",
-    REQ_FIELD: "Requested", PKG_FIELD: "Full package received",
-    "turn_bd": "Turn-time (bd)", "prepkg_bd": "Pre-package (bd)", "total_bd": "Total (bd)",
-}
-
-
-def render_lookup(inst: str, tok: str, rt: str, fields: list[str], amt: str | None, same_day: int):
-    st.subheader("Draw Lookup")
-    c = st.columns([3, 1])
-    text = c[0].text_input("Search by property / deal name or advance #", placeholder="e.g. 745 South 9th Street")
-    mode = c[1].radio("Match on", ["Property / Deal", "Advance #"], label_visibility="collapsed")
-    if not text:
-        st.info("Type a property/deal name or an advance number to see its full draw cycle.")
-        return
-
-    esc = soql_escape(text)
-    field = "Deal__r.Name" if mode.startswith("Property") else "Name"
-    sel = ",".join(fields)
-    df = run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
-        f"AND {field} LIKE '%{esc}%' ORDER BY {REQ_FIELD} DESC NULLS LAST")
-    df = add_intervals(df, same_day)
-    if df.empty:
-        st.warning("No matching construction advances.")
-        return
-
-    st.caption(f"{len(df)} matching advance(s).")
-    # group by deal so multiple draws on one property read as a cycle
-    deal_col = "Deal__r.Name" if "Deal__r.Name" in df else "Name"
-    for deal, g in df.groupby(deal_col, dropna=False):
-        with st.expander(f"{deal}  ·  {len(g)} draw(s)", expanded=(len(df) <= 5)):
-            for _, row in g.iterrows():
-                _render_one_draw(row, amt)
-
-
-def _render_one_draw(row: pd.Series, amt: str | None):
-    top = st.columns([2, 1, 1])
-    top[0].markdown(f"**{row.get('Name','(advance)')}** — {row.get('Status__c','')}")
-    if amt and amt in row and pd.notna(row[amt]):
-        top[1].metric("Amount", money(row[amt]))
-    if "turn_bd" in row and pd.notna(row.get("turn_bd")):
-        top[2].metric("Turn-time", f"{row['turn_bd']:.0f} bd")
-
-    # milestone timeline
-    steps = []
-    for label, f in MILESTONES:
-        val = row.get(f)
-        steps.append({"Milestone": label,
-                      "Date": pd.to_datetime(val).date() if pd.notna(val) else None,
-                      "": "✅" if pd.notna(val) else "⬜"})
-    tdf = pd.DataFrame(steps)
-    done = tdf["Date"].notna().sum()
-    st.progress(done / len(MILESTONES), text=f"{done}/{len(MILESTONES)} milestones recorded")
-    st.dataframe(tdf, hide_index=True, use_container_width=True,
-                 column_config={"": st.column_config.TextColumn(width="small")})
-
-    meta = []
-    for f in ["Lender__c", "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name",
-              "Underwriter__r.Name", "Advance_Requestor__r.Name"]:
-        if f in row and pd.notna(row[f]):
-            meta.append(f"**{_pretty.get(f, f)}:** {row[f]}")
-    if "prepkg_bd" in row and pd.notna(row.get("prepkg_bd")):
-        meta.append(f"**Pre-package:** {row['prepkg_bd']:.0f} bd (borrower/inspection/title)")
-    if meta:
-        st.caption("  ·  ".join(meta))
-    st.divider()
-
-
-
-
-# ===================== Land Gorilla client (merged from lg_client.py) =====================
-# ───────────────────────────── helpers ─────────────────────────────
-def items_of(payload: Any) -> list:
-    """Robustly pull the list of records out of LG's {'data': {'items': [...]}} or a bare list."""
-    d = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if isinstance(d, dict):
-        return d.get("items", [])
-    return d if isinstance(d, list) else []
-
-
-def total_items(payload: Any) -> int | None:
-    if isinstance(payload, dict):
-        d = payload.get("data", payload)
-        if isinstance(d, dict) and "totalItems" in d:
-            return int(d["totalItems"])
-    return None
-
-
-def is_rb0(file_number: Any) -> bool:
-    """Small-balance RTL / fix-and-flip book = file numbers beginning 'rb0' (per M. Cave)."""
-    return str(file_number or "").strip().lower().startswith("rb0")
-
-
-def normalize_loan_no(value: Any) -> str:
-    """Join key: lowercase, strip, drop non-alphanumerics so 'RB0 64541' == 'rb064541'."""
-    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
-
-
-def guess_property(loan: dict) -> str:
-    """
-    LG borrower fields smush entity / person / address together, e.g.
-      businessName: 'GOTTSCHEE LLC - Andrew Joseph LoManto - 25 Roslyn Road'
-    Best-effort: pick the ' - '-separated chunk that starts with a street number.
-    """
-    b = loan.get("borrower", {}) or {}
-    for field in ("businessName", "lastName", "firstName"):
-        val = b.get(field)
-        if not val:
-            continue
-        for chunk in str(val).split(" - "):
-            if re.match(r"^\s*\d+\s+\S", chunk):      # starts with a number + a word = address-ish
-                return chunk.strip()
-    return ""
-
-
-def borrower_name(loan: dict) -> str:
-    b = loan.get("borrower", {}) or {}
-    if b.get("businessName"):
-        return str(b["businessName"]).split(" - ")[0].strip()
-    name = f"{b.get('firstName','')} {b.get('lastName','')}".strip()
-    return name
-
-
-def _parse_expiry(value: Any) -> float | None:
-    """LG token 'expired' is a UTC datetime string like '2026-10-06 13:52:43'. Return epoch seconds."""
-    if not value:
-        return None
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
-    except Exception:
-        return None
-
-
-def _parse_lg_date(value: Any):
-    if not value:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"):
+    def token(self):
+        if self._tok and time.time() < self._exp - 120:
+            return self._tok
+        r = self._s.get(f"{self.BASE}/api/token",
+                        headers={"USER": self._u, "PASSWORD": self._p},
+                        data={"api_name": "clm"}, timeout=20, verify=self.verify)
+        r.raise_for_status(); j = r.json()
+        self._tok = j["token"]
         try:
-            return datetime.strptime(str(value)[:19], fmt).date()
+            self._exp = datetime.strptime(j["expired"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            self._exp = time.time() + 1800
+        return self._tok
+
+    def get(self, path, **params):
+        url = path if path.startswith("http") else f"{self.BASE}{path}"
+        return self._s.get(url, headers={"Authorization": f"Bearer {self.token()}", "Accept": "application/json"},
+                           params=params or None, timeout=60, verify=self.verify)
+
+
+def _lg_date(v):
+    if not v:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(v)[:19], fmt).date()
         except Exception:
             continue
     return None
 
 
-# ───────────────────────────── client ─────────────────────────────
-class LGClient:
-    BASE = "https://clmapi.landgorilla.com"
-    API = "clm"
-
-    def __init__(self, user: str, password: str, *, base: str | None = None,
-                 verify: bool = True, session: Any = None, refresh_margin_s: int = 120):
-        self._user = user
-        self._password = password
-        self.base = (base or self.BASE).rstrip("/")
-        self.verify = verify
-        self._margin = refresh_margin_s
-        self._tok: str | None = None
-        self._exp: float = 0.0
-        if session is not None:
-            self._session = session
-        else:
-            import requests
-            self._session = requests.Session()
-
-    # -- auth --
-    def token(self) -> str:
-        if self._tok and time.time() < self._exp - self._margin:
-            return self._tok
-        r = self._session.get(
-            f"{self.base}/api/token",
-            headers={"USER": self._user, "PASSWORD": self._password},
-            data={"api_name": self.API}, timeout=20, verify=self.verify,
-        )
-        r.raise_for_status()
-        j = r.json()
-        self._tok = j["token"]
-        exp = _parse_expiry(j.get("expired"))
-        self._exp = exp if exp else time.time() + 1800     # fall back to ~30 min
-        return self._tok
-
-    # -- low-level GET with bearer --
-    def get(self, path: str, **params):
-        url = path if path.startswith("http") else f"{self.base}{path}"
-        return self._session.get(
-            url,
-            headers={"Authorization": f"Bearer {self.token()}", "Accept": "application/json"},
-            params=params or None, timeout=60, verify=self.verify,
-        )
-
-    # -- loan list (paged) --
-    def iter_loans(self, *, per_page: int = 50, status: str | None = None,
-                   file_number: str | None = None, max_pages: int | None = None):
-        page = 1
-        seen = 0
-        while True:
-            params: dict[str, Any] = {"page": page, "perPage": per_page}
-            if status:
-                params["status[]"] = status          # NB: the API requires the array form
-            if file_number:
-                params["fileNumber"] = file_number
-            r = self.get("/api/clm/loan", **params)
-            r.raise_for_status()
-            payload = r.json()
-            batch = items_of(payload)
-            if not batch:
-                break
-            for loan in batch:
-                yield loan
-            seen += len(batch)
-            tot = total_items(payload)
-            if tot is not None and seen >= tot:
-                break
-            if max_pages and page >= max_pages:
-                break
-            page += 1
-
-    def all_loans(self, **kw) -> list[dict]:
-        return list(self.iter_loans(**kw))
-
-    # -- per-loan summary & draw count (open endpoints) --
-    def loan_summary(self, loan_id) -> dict:
-        r = self.get(f"/api/clm/loan/{loan_id}")
-        if not r.ok:
-            return {}
-        d = r.json()
-        return d.get("data", d) if isinstance(d, dict) else {}
-
-    def draw_count(self, loan_id) -> int:
-        r = self.get("/api/clm/draw", loanId=loan_id)
-        return len(items_of(r.json())) if r.ok else 0
-
-
-# ───────────────────────────── dataframe builders ─────────────────────────────
-def loans_frame(client: LGClient, *, rb0_only: bool = True, status: str | None = None,
-                limit: int | None = None) -> pd.DataFrame:
-    """Fast identity-level frame from the loan list alone (one call per ~per_page loans)."""
-    rows = []
-    for loan in client.iter_loans(status=status):
-        if rb0_only and not is_rb0(loan.get("fileNumber")):
-            continue
-        rows.append({
-            "loan_id": loan.get("id"),
-            "file_number": loan.get("fileNumber"),
-            "join_key": normalize_loan_no(loan.get("fileNumber")),
-            "borrower": borrower_name(loan),
-            "property": guess_property(loan),
-        })
-        if limit and len(rows) >= limit:
-            break
-    return pd.DataFrame(rows)
-
-
-def enrich_with_summary(client: LGClient, df: pd.DataFrame, *,
-                        with_draw_count: bool = True,
-                        progress: Callable[[int, int], None] | None = None) -> pd.DataFrame:
-    """Add balances / last-draw-date / draw count. One or two calls per loan — call on a filtered subset."""
-    if df.empty:
-        return df
-    df = df.copy()
-    bal, tofin, lastdraw, ndraws = [], [], [], []
-    n = len(df)
-    for i, lid in enumerate(df["loan_id"]):
-        s = client.loan_summary(lid)
-        bal.append(pd.to_numeric(s.get("loanBalance"), errors="coerce"))
-        tofin.append(pd.to_numeric(s.get("balanceToFinish"), errors="coerce"))
-        lastdraw.append(_parse_lg_date(s.get("lastApprovedDrawEffectiveDate")))
-        ndraws.append(client.draw_count(lid) if with_draw_count else None)
-        if progress:
-            progress(i + 1, n)
-    df["loan_balance"] = bal
-    df["balance_to_finish"] = tofin
-    df["last_draw_date"] = lastdraw
-    if with_draw_count:
-        df["draw_count"] = ndraws
-    # "fully funded / nothing left to draw" — balance_to_finish at/near zero
-    df["fully_funded"] = pd.to_numeric(df["balance_to_finish"], errors="coerce").fillna(-1).le(0)
-    return df
-
-
-def join_salesforce(lg_df: pd.DataFrame, sf_df: pd.DataFrame, sf_loan_col: str) -> pd.DataFrame:
-    """
-    Left-join LG (the full RB0 book, incl. paid-off loans SF dropped) to Salesforce
-    turn-time, on the normalized loan number. Adds in_salesforce flag.
-    """
-    if lg_df.empty:
-        return lg_df
-    out = lg_df.copy()
-    if sf_df is None or sf_df.empty or sf_loan_col not in sf_df.columns:
-        out["in_salesforce"] = False
-        return out
-    sf = sf_df.copy()
-    sf["join_key"] = sf[sf_loan_col].map(normalize_loan_no)
-    sf = sf.drop_duplicates("join_key")
-    merged = out.merge(sf, on="join_key", how="left", suffixes=("", "_sf"))
-    merged["in_salesforce"] = merged[sf_loan_col].notna() if sf_loan_col in merged else False
-    return merged
-
-
-# ───────────────────────────── Land Gorilla wiring ──────────────────────────
-def lg_config() -> dict | None:
-    """Service credentials live in st.secrets['landgorilla']; the end user never types them."""
-    sec = dict(st.secrets.get("landgorilla", {}))
-    if sec.get("user") and sec.get("password"):
-        return sec
-    return None
+def parse_draw_detail(payload: dict) -> dict:
+    """Pull the per-draw timeline + amount out of GET /api/clm/draw/{id}."""
+    d = payload.get("data", payload) if isinstance(payload, dict) else {}
+    total = (((d.get("lineItems") or {}).get("total")) or {})
+    return {
+        "name": d.get("name"),
+        "status": d.get("status"),
+        "created": _lg_date(d.get("createdDate")),
+        "submitted": _lg_date(d.get("submittedDate")),
+        "approved": _lg_date(d.get("approvedDate")),
+        "funded": _lg_date(d.get("effectiveDate")),
+        "amount": total.get("totalLessRetainage"),
+    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -725,183 +344,228 @@ def get_lg_client(user: str, password: str, verify: bool):
     return LGClient(user, password, verify=verify)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def lg_loans(user: str, password: str, verify: bool, rb0_only: bool) -> pd.DataFrame:
-    client = get_lg_client(user, password, verify)
-    return loans_frame(client, rb0_only=rb0_only)
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def lg_enrich(user: str, password: str, verify: bool, loan_ids: tuple) -> pd.DataFrame:
-    client = get_lg_client(user, password, verify)
-    base = pd.DataFrame({"loan_id": list(loan_ids)})
-    return enrich_with_summary(client, base)
-
-
 @st.cache_data(ttl=600, show_spinner=False)
-def sf_completed_turntime(inst: str, tok: str, rt: str, sf_loan_field: str, same_day: int) -> pd.DataFrame:
-    """Pull completed construction advances with the loan number + turn-time, for the LG join."""
-    present = set(describe_fields(inst, tok))
-    base = present & {PKG_FIELD, WIRE_FIELD, REQ_FIELD, "Name"}
-    sel = ["Id", "Name", PKG_FIELD, WIRE_FIELD, REQ_FIELD]
-    # the loan-number field may live on the Deal relationship; include if resolvable
-    loan_base = sf_loan_field.split(".")[0]
-    if loan_base in present:
-        sel.append(sf_loan_field)
-    soql = (f"SELECT {','.join(dict.fromkeys(sel))} FROM Advance__c "
-            f"WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}!=null")
+def lg_draw_detail(user: str, password: str, verify: bool, draw_id: str) -> dict | None:
+    """Fetch + parse one draw's detail; returns None if gated/unavailable (degrades gracefully)."""
     try:
-        df = run_soql(inst, tok, soql)
-    except Exception:
-        return pd.DataFrame()
-    return add_intervals(df, same_day)
-
-
-def render_rb0_book(inst: str, tok: str, rt: str, same_day: int):
-    st.subheader("RB0 Book — Land Gorilla")
-    cfg = lg_config()
-    if not cfg:
-        st.warning("Land Gorilla credentials aren't set. Add them under `[landgorilla]` in "
-                   "`.streamlit/secrets.toml` (user, password) to enable this view.")
-        st.code('[landgorilla]\nuser = "service-account@cvest.com"\npassword = "..."', language="toml")
-        return
-    verify = bool(cfg.get("verify", True))
-
-    try:
-        loans = lg_loans(cfg["user"], cfg["password"], verify, rb0_only=True)
+        cli = get_lg_client(user, password, verify)
+        r = cli.get(f"/api/clm/draw/{draw_id}")
+        if not r.ok:
+            return {"_error": f"HTTP {r.status_code}"}
+        return parse_draw_detail(r.json())
     except Exception as exc:
-        st.error(f"Could not load Land Gorilla loans: {exc}")
+        return {"_error": str(exc)[:80]}
+
+
+# ───────────────────────────── Pipeline (macro) ─────────────────────────────
+_PRETTY = {
+    "Loan_Number__c": "Loan #", "Deal__r.Name": "Property", "Borrower_Name_Text__c": "Borrower",
+    "Status__c": "Status", NOTES_FIELD: "Notes", REQ_FIELD: "Requested",
+    PKG_FIELD: "Package received", WIRE_FIELD: "Wired", "turn_bd": "Turn-time (bd)",
+    "prepkg_bd": "Pre-package (bd)", NET_FIELD: "Net $", GROSS_FIELD: "Gross $",
+    "Advance_Coordinator__r.Name": "Coordinator", "Loan_Advance_Number__c": "Draw #",
+}
+
+
+def render_pipeline(inst, tok, rt, sel, same_day):
+    st.subheader("Pipeline — construction draws")
+    c = st.columns([1, 1, 2])
+    period = c[0].selectbox("Completed window",
+                            ["This month", "Last month", "This quarter", "This year", "Last 90 days"], index=0)
+    start, end = period_bounds(period)
+    c[1].caption(f"{start:%m/%d/%Y} → {end:%m/%d/%Y}")
+
+    done = add_intervals(run_soql(inst, tok,
+        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
+        f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d}"), same_day)
+    flight = run_soql(inst, tok,
+        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}=null "
+        f"AND Status__c NOT IN ({','.join(chr(39)+s+chr(39) for s in TERMINAL)})")
+
+    # KPIs
+    k = st.columns(5)
+    k[0].metric("Completed (window)", f"{len(done):,}")
+    if "turn_bd" in done and done["turn_bd"].notna().any():
+        k[1].metric("Median turn-time", f"{done['turn_bd'].median():.0f} bd",
+                    f"{(done['turn_bd']<=3).mean()*100:.0f}% ≤3 bd")
+    else:
+        k[1].metric("Median turn-time", "—")
+    k[2].metric("Net funded", money(pd.to_numeric(done.get(NET_FIELD), errors="coerce").sum()) if NET_FIELD in done else "—")
+    k[3].metric("Gross funded", money(pd.to_numeric(done.get(GROSS_FIELD), errors="coerce").sum()) if GROSS_FIELD in done else "—")
+    k[4].metric("In flight", f"{len(flight):,}")
+
+    # pre-package context + on hold
+    cc = st.columns(2)
+    if "prepkg_bd" in done and done["prepkg_bd"].notna().any():
+        pp = done["prepkg_bd"].dropna()
+        cc[0].caption(f"Pre-package (borrower/inspection/title): median {pp.median():.0f} bd · "
+                      f"90th pct {pp.quantile(.9):.0f} bd — this is where the long timelines live, not funding.")
+    if not flight.empty and "Status__c" in flight:
+        holds = flight[flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False)]
+        cc[1].caption(f"On hold / needs attention: **{len(holds)}** of {len(flight)} in flight.")
+
+    # by-month rollup
+    if not done.empty and "turn_bd" in done:
+        d = done.copy(); d["Month"] = pd.to_datetime(d[WIRE_FIELD]).dt.to_period("M").astype(str)
+        roll = (d.groupby("Month")["turn_bd"]
+                .agg(draws="size", median_bd="median", pct_le3=lambda s: round((s <= 3).mean()*100))
+                .reset_index())
+        st.markdown("**By month**")
+        st.dataframe(roll, hide_index=True, use_container_width=True)
+
+    # detail table
+    st.markdown("**Completed draws (window)**")
+    cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
+                        "Status__c", REQ_FIELD, PKG_FIELD, WIRE_FIELD, "turn_bd", "prepkg_bd",
+                        NET_FIELD, GROSS_FIELD, NOTES_FIELD] if c in done]
+    if not done.empty:
+        st.dataframe(done[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False),
+                     use_container_width=True, height=380)
+        st.download_button("Download (CSV)", done[cols].rename(columns=_PRETTY).to_csv(index=False).encode(),
+                           f"draws_{start}_{end}.csv")
+    else:
+        st.info("No completed draws in this window.")
+    st.caption("Queried from the Advance object (not the pipeline report), so paid-off draws are retained. "
+               "Turn-time = business days from full draw package received to wire; only draws with a package "
+               "date are measured.")
+
+
+# ───────────────────────────── Loan detail (micro) ──────────────────────────
+def render_loan_detail(inst, tok, rt, sel, same_day):
+    st.subheader("Loan detail")
+    c = st.columns([3, 1])
+    text = c[0].text_input("Search borrower, property, or loan #", placeholder="e.g. 63390  ·  116 South Street")
+    mode = c[1].radio("Match on", ["Loan #", "Property", "Borrower"], label_visibility="collapsed")
+    if not text:
+        st.info("Search a loan to see every draw's full cycle — Salesforce milestones + the Land Gorilla draw timeline.")
         return
-    if loans.empty:
-        st.info("No RB0 loans returned."); return
 
-    # --- identity-level KPIs (fast: loan list only) ---
-    k = st.columns(3)
-    k[0].metric("RB0 loans (active)", f"{len(loans):,}")
-    k[1].caption("Balances, last-draw date and draw counts load on demand below "
-                 "(one call per loan, so it's slower).")
+    esc = soql_escape(text)
+    field = {"Loan #": "Loan_Number__c", "Property": "Deal__r.Name", "Borrower": "Borrower_Name_Text__c"}[mode]
+    op = "=" if mode == "Loan #" and text.isdigit() else "LIKE"
+    val = f"'{esc}'" if op == "=" else f"'%{esc}%'"
+    df = add_intervals(run_soql(inst, tok,
+        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {field} {op} {val} "
+        f"ORDER BY Loan_Number__c, {REQ_FIELD}"), same_day)
+    if df.empty:
+        st.warning("No matching construction draws."); return
 
-    st.markdown("**Loans** — identity from Land Gorilla, joined to Salesforce turn-time")
-    sf_loan_field = st.text_input(
-        "Salesforce loan-number field (for the join)",
-        value="Deal__r.Deal_Loan_Number__c",
-        help="Field on Advance__c (often via the Deal relationship) that holds the rb0 loan number.")
+    cfg = lg_config()
+    for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
+        prop = g["Deal__r.Name"].dropna().iloc[0] if "Deal__r.Name" in g and g["Deal__r.Name"].notna().any() else ""
+        borrower = g["Borrower_Name_Text__c"].dropna().iloc[0] if "Borrower_Name_Text__c" in g and g["Borrower_Name_Text__c"].notna().any() else ""
+        st.markdown(f"### Loan {loan_no} — {prop}")
+        if borrower:
+            st.caption(f"Borrower: {borrower}  ·  Land Gorilla file: rb0{loan_no}")
+        for _, row in g.iterrows():
+            _render_draw(row, cfg)
+        st.divider()
 
-    sf_tt = sf_completed_turntime(inst, tok, rt, sf_loan_field, same_day)
-    joined = join_salesforce(loans, sf_tt, sf_loan_field) if not sf_tt.empty else loans.assign(in_salesforce=False)
 
-    matched = int(joined["in_salesforce"].sum()) if "in_salesforce" in joined else 0
-    k[2].metric("Matched to Salesforce", f"{matched:,}", f"{matched/len(loans)*100:.0f}% of RB0")
+def _render_draw(row: pd.Series, cfg: dict | None):
+    draw_no = row.get("Loan_Advance_Number__c") or row.get("Name") or "draw"
+    top = st.columns([2, 1, 1, 1])
+    top[0].markdown(f"**Draw {draw_no}** — {row.get('Status__c','')}")
+    if NET_FIELD in row and pd.notna(row.get(NET_FIELD)):
+        top[1].metric("Net", money(row[NET_FIELD]))
+    if GROSS_FIELD in row and pd.notna(row.get(GROSS_FIELD)):
+        top[2].metric("Gross", money(row[GROSS_FIELD]))
+    if "turn_bd" in row and pd.notna(row.get("turn_bd")):
+        top[3].metric("Turn-time", f"{row['turn_bd']:.0f} bd")
 
-    show_cols = [c for c in ["file_number", "borrower", "property", "in_salesforce", "turn_bd"] if c in joined]
-    st.dataframe(joined[show_cols].rename(columns={
-        "file_number": "Loan #", "borrower": "Borrower", "property": "Property",
-        "in_salesforce": "In SF", "turn_bd": "Turn-time (bd)"}),
-        use_container_width=True, height=340)
+    # Salesforce milestone timeline
+    steps = [{"Milestone": lbl, "Date": (pd.to_datetime(row.get(f)).date() if pd.notna(row.get(f)) else None),
+              "": "✅" if pd.notna(row.get(f)) else "⬜"} for lbl, f in MILESTONES]
+    tdf = pd.DataFrame(steps)
+    recorded = tdf["Date"].notna().sum()
+    st.progress(recorded / len(MILESTONES), text=f"Salesforce milestones {recorded}/{len(MILESTONES)}")
+    cc = st.columns([1, 1])
+    cc[0].dataframe(tdf, hide_index=True, use_container_width=True,
+                    column_config={"": st.column_config.TextColumn(width="small")})
 
-    st.caption("Land Gorilla carries loans that paid off and dropped off the Salesforce pipeline report — "
-               "'In SF = False' rows are exactly those (or a loan-number mismatch worth checking).")
+    # Land Gorilla per-draw timeline via DrawContainerId__c
+    with cc[1]:
+        st.markdown("**Land Gorilla draw**")
+        container = row.get(CONTAINER_FIELD)
+        if not cfg:
+            st.caption("Add [landgorilla] secrets to show the LG draw timeline.")
+        elif pd.isna(container) or not container:
+            st.caption("No Land Gorilla draw container on this advance yet.")
+        else:
+            det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
+            if not det or det.get("_error"):
+                st.caption(f"LG draw detail unavailable ({(det or {}).get('_error','no data')}).")
+            else:
+                lg_steps = [("Created", det["created"]), ("Submitted", det["submitted"]),
+                            ("Approved", det["approved"]), ("Funded", det["funded"])]
+                st.dataframe(pd.DataFrame([{"Stage": s, "Date": d} for s, d in lg_steps]),
+                             hide_index=True, use_container_width=True)
+                line = [f"Status: {det.get('status','—')}"]
+                if det.get("amount") is not None:
+                    line.append(f"Amount (less retainage): {money(det['amount'])}")
+                st.caption(" · ".join(line))
 
-    # --- on-demand balance enrichment (slow) ---
-    st.divider()
-    st.markdown("**Live balances & draw activity** (Land Gorilla)")
-    cap = st.slider("How many loans to load (most recent first)", 10, min(len(loans), 300), 50, step=10)
-    if st.button("Load balances for the top N", use_container_width=False):
-        subset = loans.head(cap)
-        prog = st.progress(0.0, text="Pulling loan summaries…")
-        ids = tuple(subset["loan_id"].tolist())
-        # enrich via cached function; show a simple progress estimate
-        en = lg_enrich(cfg["user"], cfg["password"], verify, ids)
-        prog.progress(1.0, text="Done.")
-        merged = subset.merge(en, on="loan_id", how="left")
-        m = st.columns(4)
-        bal = pd.to_numeric(merged.get("loan_balance"), errors="coerce")
-        tofin = pd.to_numeric(merged.get("balance_to_finish"), errors="coerce")
-        m[0].metric("Loans loaded", f"{len(merged):,}")
-        m[1].metric("Outstanding balance", money(bal.sum()))
-        m[2].metric("Remaining to fund", money(tofin.sum()))
-        if "fully_funded" in merged:
-            m[3].metric("Fully funded", f"{int(merged['fully_funded'].sum()):,}")
-        cols = [c for c in ["file_number", "borrower", "property", "loan_balance",
-                            "balance_to_finish", "last_draw_date", "draw_count", "fully_funded"] if c in merged]
-        st.dataframe(merged[cols].rename(columns={
-            "file_number": "Loan #", "borrower": "Borrower", "property": "Property",
-            "loan_balance": "Balance", "balance_to_finish": "To finish",
-            "last_draw_date": "Last draw", "draw_count": "# draws", "fully_funded": "Funded"}),
-            use_container_width=True, height=360)
-        st.download_button("Download (CSV)", merged.to_csv(index=False).encode(),
-                           "rb0_land_gorilla.csv")
-
-    st.info("Per-draw milestone timeline (each draw's inspection → funded dates) needs the "
-            "`GET /draw/{id}` scope enabled on the API user — it's gated right now. This page "
-            "fills that section in automatically once that access lands.", icon="🔒")
+    note = row.get(NOTES_FIELD)
+    if pd.notna(note) and str(note).strip():
+        st.caption(f"📝 {note}")
 
 
 # ───────────────────────────────── main ─────────────────────────────────────
 def main():
-    st.set_page_config(page_title="Construction Draw Dashboard", page_icon="🏗️", layout="wide")
-    st.title("🏗️ Construction Draw Dashboard")
+    st.set_page_config(page_title="Construction Draw Tracker", page_icon="🏗️", layout="wide")
+    st.title("🏗️ Construction Draw Tracker")
 
-    cfg = None
-    setup_error = None
+    cfg = None; err = None
     try:
-        cfg = load_salesforce_oauth_config()
-        maybe_finish_oauth(cfg)
+        cfg = load_sf_oauth(); finish_oauth(cfg)
     except Exception as exc:
-        setup_error = str(exc)
-
-    sf = None if setup_error else get_sf_from_session()
+        err = str(exc)
+    sf = None if err else sf_from_session()
 
     with st.sidebar:
         st.header("Salesforce")
-        if setup_error:
-            st.error(setup_error)
+        if err:
+            st.error(err)
         elif sf is None:
             st.info("Not connected")
         else:
             st.success("Connected")
             st.caption(st.session_state.get("salesforce_auth", {}).get("instance_url", ""))
             if st.button("Log out", use_container_width=True):
-                clear_salesforce_session(); st.rerun()
+                clear_sf_session(); st.rerun()
         st.divider()
-        same_day = 1 if st.radio(
-            "Same-day convention",
-            ["0 business days", "1 business day"],
-            help="Package in and wired the same day counts as this. Confirm with Melanie — it moves the median."
-        ).startswith("1") else 0
+        same_day = 1 if st.radio("Same-day convention", ["0 business days", "1 business day"],
+                                 help="Package in & wired same day counts as this. Confirm with Melanie — "
+                                      "it moves the median.").startswith("1") else 0
+        st.divider()
+        st.caption("Land Gorilla: " + ("configured ✅" if lg_config() else "not set"))
 
-    # login gate
     st.subheader("Step 1 — Log in to Salesforce")
-    if setup_error:
-        st.error(setup_error); st.stop()
+    if err:
+        st.error(err); st.stop()
     if sf is None:
-        st.info("Log in to load the construction draw pipeline.")
-        st.link_button("Log in to Salesforce", build_salesforce_login_url(cfg))
+        st.info("Log in to load the construction draw book.")
+        st.link_button("Log in to Salesforce", login_url(cfg))
         st.caption(f"Callback URL: {cfg['redirect_uri']}")
         st.stop()
 
     inst = st.session_state["salesforce_auth"]["instance_url"]
     tok = st.session_state["salesforce_auth"]["access_token"]
-
-    rt = construction_rt_id(inst, tok)
+    rt = construction_rt(inst, tok)
     if not rt:
-        st.error("Could not find the 'Construction Advance' record type on Advance__c."); st.stop()
-    fields, amt = available(inst, tok)
+        st.error("Could not find the 'Construction Advance' record type."); st.stop()
+    sel = select_fields(inst, tok)
 
-    page = st.sidebar.radio("View", ["Pipeline Pulse", "Draw Lookup", "RB0 Book (Land Gorilla)"])
+    page = st.sidebar.radio("View", ["Pipeline (macro)", "Loan detail (micro)"])
     try:
-        if page == "Pipeline Pulse":
-            render_pulse(inst, tok, rt, fields, amt, same_day)
-        elif page == "Draw Lookup":
-            render_lookup(inst, tok, rt, fields, amt, same_day)
+        if page.startswith("Pipeline"):
+            render_pipeline(inst, tok, rt, sel, same_day)
         else:
-            render_rb0_book(inst, tok, rt, same_day)
+            render_loan_detail(inst, tok, rt, sel, same_day)
     except Exception as exc:
         msg = str(exc)
         if "INVALID_SESSION_ID" in msg or "Session expired" in msg:
-            clear_salesforce_session()
-            st.warning("Your Salesforce session expired. Log in again.")
-            st.stop()
+            clear_sf_session(); st.warning("Your Salesforce session expired. Log in again."); st.stop()
         raise
 
 
