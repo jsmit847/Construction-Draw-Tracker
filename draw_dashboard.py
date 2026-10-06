@@ -81,8 +81,9 @@ CONSTRUCTION_FIELDS = [
     ("Outstanding_Facility_Amount__c",      "Remaining commitment"),
     ("Total_Fees__c",                       "Total fees"),
 ]
-WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name",
-         "Borrower_Name_Text__c", "Lender__c", "Status__c", "Inspection_Method__c",
+WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
+         "Deal__r.Name", "Deal__r.Account.Name", "Borrower_Name__c", "Borrower_Name_Text__c",
+         "Lender__c", "Status__c", "Inspection_Method__c",
          "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name", NOTES_FIELD, CONTAINER_FIELD,
          NET_FIELD, GROSS_FIELD, DAYS_FIELD] + [f for f, _ in CONSTRUCTION_FIELDS] + [m[1] for m in MILESTONES])
 TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
@@ -220,17 +221,17 @@ def soql_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def flatten(rec: dict) -> dict:
+def flatten(rec: dict, prefix: str = "") -> dict:
+    """Recursively flatten SF relationship objects to dotted leaf keys (Deal__r.Account.Name, etc.)."""
     out: dict[str, Any] = {}
     for k, v in rec.items():
         if k == "attributes":
             continue
+        key = f"{prefix}{k}"
         if isinstance(v, dict):
-            for k2, v2 in v.items():
-                if k2 != "attributes":
-                    out[f"{k}.{k2}"] = v2.get("Name") if isinstance(v2, dict) else v2
+            out.update(flatten(v, prefix=key + "."))
         else:
-            out[k] = v
+            out[key] = v
     return out
 
 
@@ -257,7 +258,18 @@ def run_soql(inst: str, tok: str, soql: str) -> pd.DataFrame:
 
 def select_fields(inst: str, tok: str) -> str:
     present = set(describe_fields(inst, tok))
-    cols = [f for f in WISH if f.split(".")[0] in present]
+
+    def ok(f: str) -> bool:
+        seg = f.split(".")[0]                     # first path segment
+        if seg in present:
+            return True
+        if seg.endswith("__r") and (seg[:-3] + "__c") in present:   # custom relationship -> its __c field
+            return True
+        if seg in ("Deal",) and "Deal__c" in present:               # safety alias
+            return True
+        return False
+
+    cols = [f for f in WISH if ok(f)]
     return ",".join(dict.fromkeys(cols))
 
 
@@ -523,7 +535,8 @@ def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
 
 # ───────────────────────────── Pipeline (macro) ─────────────────────────────
 _PRETTY = {
-    "Loan_Number__c": "Loan #", "Deal__r.Name": "Property", "Borrower_Name_Text__c": "Borrower",
+    "Loan_Number__c": "Loan #", "Deal__r.Name": "Deal", "Deal__r.Account.Name": "Account",
+    "Borrower_Name_Text__c": "Borrower", "Borrower_Name__c": "Borrower (raw)",
     "Status__c": "Status", NOTES_FIELD: "Notes", REQ_FIELD: "Requested",
     PKG_FIELD: "Package complete", WIRE_FIELD: "Wired", "turn_bd": "Once-complete (bus. days)",
     "prepkg_bd": "Before-package (days)", DAYS_FIELD: "Days to fund", NET_FIELD: "Funded ($)",
@@ -641,8 +654,9 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     # ---- featured-period detail + Excel ----
     st.markdown(f"**Draws funded in {feat}**")
-    cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
-                        "Status__c", REQ_FIELD, WIRE_FIELD, DAYS_FIELD, NET_FIELD, NOTES_FIELD] if c in fg]
+    cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Deal__r.Account.Name",
+                        "Borrower_Name_Text__c", "Status__c", REQ_FIELD, WIRE_FIELD, DAYS_FIELD,
+                        NET_FIELD, NOTES_FIELD] if c in fg]
     detail = fg[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False)
     st.dataframe(detail, use_container_width=True, height=340)
     xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
@@ -664,7 +678,10 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
             st.line_chart(roll.set_index("_raw")["Avg days to fund"])
         return
 
-    r = roll.rename(columns={"_raw": "Period"})
+    # chart frame: use the raw period key as the x-axis label, drop the duplicate display "Period"
+    r = roll.drop(columns=[c for c in ["Period"] if c in roll.columns]).rename(columns={"_raw": "Period"})
+    r = r.loc[:, ~r.columns.duplicated()]          # belt-and-suspenders: no duplicate column names
+    order = list(r["Period"])
     c1, c2 = st.columns(2)
 
     # 1) days-to-fund distribution (shows the tail), with a mean line
@@ -675,7 +692,7 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
             hist = alt.Chart(pd.DataFrame({"days": capped})).mark_bar(color="#4C78A8").encode(
                 x=alt.X("days:Q", bin=alt.Bin(maxbins=30), title="Calendar days (capped at 45)"),
                 y=alt.Y("count()", title="Draws"))
-            rule = alt.Chart(pd.DataFrame({"m": [d2f.mean()]})).mark_rule(color="#E45756", size=2).encode(x="m:Q")
+            rule = alt.Chart(pd.DataFrame({"m": [float(d2f.mean())]})).mark_rule(color="#E45756", size=2).encode(x="m:Q")
             st.altair_chart(hist + rule, use_container_width=True)
             st.caption(f"Red line = average ({d2f.mean():.0f} days). The long right tail is borrower-driven delay.")
         else:
@@ -684,10 +701,10 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
     # 2) average days-to-fund trend over time
     with c2:
         st.markdown("**Average days to fund over time**")
-        tr = r.dropna(subset=["Avg days to fund"])
+        tr = r[["Period", "Avg days to fund"]].dropna(subset=["Avg days to fund"])
         if not tr.empty:
             line = alt.Chart(tr).mark_line(point=True, color="#E45756").encode(
-                x=alt.X("Period:N", sort=list(tr["Period"]), title=""),
+                x=alt.X("Period:N", sort=order, title=""),
                 y=alt.Y("Avg days to fund:Q", title="Avg days"))
             st.altair_chart(line, use_container_width=True)
         else:
@@ -698,8 +715,8 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
     # 3) funded dollars per period
     with c3:
         st.markdown("**Amount funded per period**")
-        bars = alt.Chart(r).mark_bar(color="#54A24B").encode(
-            x=alt.X("Period:N", sort=list(r["Period"]), title=""),
+        bars = alt.Chart(r[["Period", "Funded ($)"]]).mark_bar(color="#54A24B").encode(
+            x=alt.X("Period:N", sort=order, title=""),
             y=alt.Y("Funded ($):Q", title="Funded ($)"),
             tooltip=["Period", alt.Tooltip("Funded ($):Q", format="$,.0f")])
         st.altair_chart(bars, use_container_width=True)
@@ -707,7 +724,8 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
     # 4) draws + avg days combo (dual axis)
     with c4:
         st.markdown("**Draws funded & average days**")
-        base = alt.Chart(r).encode(x=alt.X("Period:N", sort=list(r["Period"]), title=""))
+        base = alt.Chart(r[["Period", "Draws funded", "Avg days to fund"]]).encode(
+            x=alt.X("Period:N", sort=order, title=""))
         bars = base.mark_bar(color="#B9D7A8").encode(y=alt.Y("Draws funded:Q", title="Draws"))
         line = base.mark_line(color="#E45756", point=True).encode(
             y=alt.Y("Avg days to fund:Q", axis=alt.Axis(title="Avg days", orient="right")))
@@ -751,11 +769,16 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
     if filled:
         st.caption(f"↳ filled **{filled}** missing days-to-fund value(s) from Land Gorilla (the import source).")
     tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
+    def first(colname):
+        return g[colname].dropna().iloc[0] if colname in g and g[colname].notna().any() else ""
+
     for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
-        prop = g["Deal__r.Name"].dropna().iloc[0] if "Deal__r.Name" in g and g["Deal__r.Name"].notna().any() else ""
-        borrower = g["Borrower_Name_Text__c"].dropna().iloc[0] if "Borrower_Name_Text__c" in g and g["Borrower_Name_Text__c"].notna().any() else ""
-        st.markdown(f"### Loan {loan_no} — {prop}")
+        deal = first("Deal__r.Name")
+        account = first("Deal__r.Account.Name")
+        borrower = first("Borrower_Name_Text__c") or first("Borrower_Name__c")
+        st.markdown(f"### Loan {loan_no} — {deal}")
         sub = []
+        if account: sub.append(f"Account: {account}")
         if borrower: sub.append(f"Borrower: {borrower}")
         sub.append(f"{len(g)} draw(s)")
         st.caption("  ·  ".join(sub))
