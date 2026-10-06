@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import re
 import secrets
@@ -52,6 +53,7 @@ REQ_FIELD  = "Date_Advance_Requested__c"
 NOTES_FIELD = "Notes__c"
 CONTAINER_FIELD = "DrawContainerId__c"
 NET_FIELD, GROSS_FIELD = "Net_Funding_Total__c", "Aggregate_Funding__c"
+LG_TEMPLATE_ID_DEFAULT = "437"   # a pipeline template that returns project%/funded/last-draw/risk; override in secrets
 
 MILESTONES = [
     ("Requested",                  REQ_FIELD),
@@ -346,7 +348,7 @@ def get_lg_client(user: str, password: str, verify: bool):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def lg_draw_detail(user: str, password: str, verify: bool, draw_id: str) -> dict | None:
-    """Fetch + parse one draw's detail; returns None if gated/unavailable (degrades gracefully)."""
+    """Fetch + parse one draw's detail; returns an _error dict if gated/unavailable (degrades gracefully)."""
     try:
         cli = get_lg_client(user, password, verify)
         r = cli.get(f"/api/clm/draw/{draw_id}")
@@ -355,6 +357,95 @@ def lg_draw_detail(user: str, password: str, verify: bool, draw_id: str) -> dict
         return parse_draw_detail(r.json())
     except Exception as exc:
         return {"_error": str(exc)[:80]}
+
+
+def items_of(payload: Any) -> list:
+    d = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(d, dict):
+        return d.get("items", [])
+    return d if isinstance(d, list) else []
+
+
+def parse_template_loan(payload: dict) -> dict:
+    """Pull the loan-level construction-progress fields out of a pipeline-template loan payload."""
+    f = {}
+    if isinstance(payload, dict):
+        f = ((payload.get("data") or {}).get("fields")) or payload.get("fields") or {}
+    b = f.get("borrower") or {}
+    return {
+        "project_pct": f.get("projectCompletedPercentage"),
+        "duration_pct": f.get("projectDurationPercentage"),
+        "funded_date": _lg_date(f.get("loanFundedDate")),
+        "last_draw": _lg_date(f.get("lastDrawDate")),
+        "due_date": _lg_date(f.get("currentLoanDueDate")),
+        "program": f.get("loanProgram"),
+        "risk": [x for x in (f.get("riskLabel") or []) if x],
+        "property": f.get("propertyAddress"),
+        "borrower": (b.get("borrower") if isinstance(b, dict) else b),
+        "last_note_at": _lg_date(f.get("dateTimeLastNote")),
+        "status": ((f.get("loanStatus") or [{}])[0].get("status") if f.get("loanStatus") else None),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def lg_loan_overview(user: str, password: str, verify: bool, template_id: str, loan_no: str) -> dict:
+    """Resolve the LG loan by file number (rb0+loan#), then pull template progress + summary balances."""
+    try:
+        cli = get_lg_client(user, password, verify)
+        fn = f"rb0{loan_no}"
+        r = cli.get("/api/clm/loan", fileNumber=fn)
+        items = items_of(r.json()) if r.ok else []
+        if not items:
+            return {"_error": f"no Land Gorilla loan for {fn}"}
+        lid = items[0]["id"]
+        out: dict[str, Any] = {"lg_loan_id": lid, "file_number": fn}
+        t = cli.get(f"/api/clm/pipelineReportTemplates/{template_id}/loans/{lid}")
+        if t.ok:
+            out.update(parse_template_loan(t.json()))
+        s = cli.get(f"/api/clm/loan/{lid}")
+        if s.ok:
+            sd = (s.json() or {}).get("data", {})
+            out["balance"] = sd.get("loanBalance")
+            out["to_finish"] = sd.get("balanceToFinish")
+            out["last_approved_draw"] = _lg_date(sd.get("lastApprovedDrawEffectiveDate"))
+        return out
+    except Exception as exc:
+        return {"_error": str(exc)[:80]}
+
+
+# ───────────────────────────── Excel export ─────────────────────────────────
+def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """Formatted multi-sheet .xlsx (Arial, header band, freeze panes, autofilter) as bytes for download."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    HFONT = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    HFILL = PatternFill("solid", fgColor="1F3864")
+    AR = Font(name="Arial", size=10)
+    wb = Workbook(); wb.remove(wb.active)
+    for name, df in sheets.items():
+        ws = wb.create_sheet(str(name)[:31])
+        for j, col in enumerate(df.columns, 1):
+            c = ws.cell(1, j, str(col))
+            c.font = HFONT; c.fill = HFILL
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for i, (_, row) in enumerate(df.iterrows(), 2):
+            for j, v in enumerate(row, 1):
+                try:
+                    isna = pd.isna(v)
+                except Exception:
+                    isna = False
+                val = None if isna else (v.isoformat() if hasattr(v, "isoformat") else v)
+                ws.cell(i, j, val).font = AR
+        ws.freeze_panes = "A2"
+        if len(df.columns):
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
+        for j, col in enumerate(df.columns, 1):
+            sample = [str(col)] + [str(x) for x in df.iloc[:, j - 1].head(40).tolist()]
+            ws.column_dimensions[get_column_letter(j)].width = max(10, min(42, max(len(s) for s in sample) + 2))
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue()
 
 
 # ───────────────────────────── Pipeline (macro) ─────────────────────────────
@@ -367,67 +458,108 @@ _PRETTY = {
 }
 
 
+def _period_key(w: pd.Series, gran: str) -> pd.Series:
+    if gran == "Monthly":
+        return w.dt.to_period("M").astype(str)
+    if gran == "Quarterly":
+        return w.dt.to_period("Q").astype(str)
+    return w.dt.year.astype(str)
+
+
+def _span_start(gran: str, n: int) -> date:
+    today = date.today()
+    if gran == "Monthly":
+        return (pd.Timestamp(today).to_period("M") - (n - 1)).start_time.date()
+    if gran == "Quarterly":
+        return (pd.Timestamp(today).to_period("Q") - (n - 1)).start_time.date()
+    return date(today.year - (n - 1), 1, 1)
+
+
 def render_pipeline(inst, tok, rt, sel, same_day):
     st.subheader("Pipeline — construction draws")
     c = st.columns([1, 1, 2])
-    period = c[0].selectbox("Completed window",
-                            ["This month", "Last month", "This quarter", "This year", "Last 90 days"], index=0)
-    start, end = period_bounds(period)
-    c[1].caption(f"{start:%m/%d/%Y} → {end:%m/%d/%Y}")
+    gran = c[0].selectbox("Granularity", ["Monthly", "Quarterly", "Yearly"], index=0)
+    opts = {"Monthly": [6, 12, 24], "Quarterly": [4, 8, 12], "Yearly": [3, 5]}[gran]
+    nper = c[1].selectbox("Periods", opts, index=1 if gran != "Yearly" else 0)
+    start = _span_start(gran, nper)
+    c[2].caption(f"Completed draws wired since {start:%m/%d/%Y}, bucketed by {gran.lower()[:-2] if gran!='Yearly' else 'year'}.")
 
+    # ONE pull for the whole span -> every period figure below reconciles to the same rows
     done = add_intervals(run_soql(inst, tok,
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
-        f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d}"), same_day)
+        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d}"), same_day)
     flight = run_soql(inst, tok,
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}=null "
         f"AND Status__c NOT IN ({','.join(chr(39)+s+chr(39) for s in TERMINAL)})")
 
-    # KPIs
-    k = st.columns(5)
-    k[0].metric("Completed (window)", f"{len(done):,}")
-    if "turn_bd" in done and done["turn_bd"].notna().any():
-        k[1].metric("Median turn-time", f"{done['turn_bd'].median():.0f} bd",
-                    f"{(done['turn_bd']<=3).mean()*100:.0f}% ≤3 bd")
-    else:
-        k[1].metric("Median turn-time", "—")
-    k[2].metric("Net funded", money(pd.to_numeric(done.get(NET_FIELD), errors="coerce").sum()) if NET_FIELD in done else "—")
-    k[3].metric("Gross funded", money(pd.to_numeric(done.get(GROSS_FIELD), errors="coerce").sum()) if GROSS_FIELD in done else "—")
-    k[4].metric("In flight", f"{len(flight):,}")
+    if done.empty:
+        st.info("No completed draws in this span.")
+        return
+    done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gran)
 
-    # pre-package context + on hold
+    # ---- period rollup (built row-by-row so counts/$ reconcile exactly to the pull) ----
+    rows = []
+    for p in sorted(done["Period"].unique()):
+        g = done[done["Period"] == p]
+        tt = g["turn_bd"].dropna() if "turn_bd" in g else pd.Series(dtype=float)
+        rows.append({
+            "Period": p,
+            "Draws completed": len(g),
+            "Net $": float(pd.to_numeric(g.get(NET_FIELD), errors="coerce").sum()),
+            "Gross $": float(pd.to_numeric(g.get(GROSS_FIELD), errors="coerce").sum()),
+            "Median turn (bd)": (round(tt.median(), 1) if len(tt) else None),
+            "% ≤3 bd": (round((tt <= 3).mean() * 100) if len(tt) else None),
+            "Pkg-date coverage %": (round(g["turn_bd"].notna().mean() * 100) if "turn_bd" in g else 0),
+        })
+    roll = pd.DataFrame(rows)
+    latest = roll.iloc[-1]
+
+    # ---- KPIs: most-recent period + current pipeline state ----
+    k = st.columns(5)
+    k[0].metric(f"Completed · {latest['Period']}", f"{int(latest['Draws completed']):,}",
+                help="Draws wired in the most recent period in range.")
+    k[1].metric("Median turn-time", f"{latest['Median turn (bd)']:.0f} bd" if pd.notna(latest["Median turn (bd)"]) else "—",
+                f"{latest['% ≤3 bd']:.0f}% ≤3 bd" if pd.notna(latest["% ≤3 bd"]) else None)
+    k[2].metric(f"Net funded · {latest['Period']}", money(latest["Net $"]))
+    k[3].metric(f"Gross funded · {latest['Period']}", money(latest["Gross $"]))
+    k[4].metric("In flight (now)", f"{len(flight):,}")
+
     cc = st.columns(2)
-    if "prepkg_bd" in done and done["prepkg_bd"].notna().any():
-        pp = done["prepkg_bd"].dropna()
-        cc[0].caption(f"Pre-package (borrower/inspection/title): median {pp.median():.0f} bd · "
-                      f"90th pct {pp.quantile(.9):.0f} bd — this is where the long timelines live, not funding.")
+    total_done = int(roll["Draws completed"].sum())
+    cc[0].caption(f"Span total: **{total_done:,}** draws completed across {len(roll)} periods "
+                  f"(the rollup below sums to this).")
     if not flight.empty and "Status__c" in flight:
         holds = flight[flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False)]
         cc[1].caption(f"On hold / needs attention: **{len(holds)}** of {len(flight)} in flight.")
 
-    # by-month rollup
-    if not done.empty and "turn_bd" in done:
-        d = done.copy(); d["Month"] = pd.to_datetime(d[WIRE_FIELD]).dt.to_period("M").astype(str)
-        roll = (d.groupby("Month")["turn_bd"]
-                .agg(draws="size", median_bd="median", pct_le3=lambda s: round((s <= 3).mean()*100))
-                .reset_index())
-        st.markdown("**By month**")
-        st.dataframe(roll, hide_index=True, use_container_width=True)
+    # ---- the rollup table (this is the monthly/quarterly/yearly 'completed' view) ----
+    st.markdown(f"**{gran} rollup**")
+    disp = roll.copy()
+    disp["Net $"] = disp["Net $"].map(money); disp["Gross $"] = disp["Gross $"].map(money)
+    st.dataframe(disp.iloc[::-1], hide_index=True, use_container_width=True)
+    st.bar_chart(roll.set_index("Period")["Draws completed"])
 
-    # detail table
-    st.markdown("**Completed draws (window)**")
+    # ---- drill into one period's draws + Excel export ----
+    st.markdown("**Draw detail**")
+    pick = st.selectbox("Period to list", sorted(done["Period"].unique(), reverse=True))
+    sub = done[done["Period"] == pick]
     cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
                         "Status__c", REQ_FIELD, PKG_FIELD, WIRE_FIELD, "turn_bd", "prepkg_bd",
-                        NET_FIELD, GROSS_FIELD, NOTES_FIELD] if c in done]
-    if not done.empty:
-        st.dataframe(done[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False),
-                     use_container_width=True, height=380)
-        st.download_button("Download (CSV)", done[cols].rename(columns=_PRETTY).to_csv(index=False).encode(),
-                           f"draws_{start}_{end}.csv")
-    else:
-        st.info("No completed draws in this window.")
-    st.caption("Queried from the Advance object (not the pipeline report), so paid-off draws are retained. "
-               "Turn-time = business days from full draw package received to wire; only draws with a package "
-               "date are measured.")
+                        NET_FIELD, GROSS_FIELD, NOTES_FIELD] if c in sub]
+    detail = sub[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False)
+    st.dataframe(detail, use_container_width=True, height=360)
+
+    xlsx = build_excel({f"{gran} rollup": roll, f"Draws {pick}": detail})
+    st.download_button("⬇️ Download Excel (rollup + detail)", xlsx,
+                       file_name=f"construction_draws_{gran.lower()}_{pick}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    if "prepkg_bd" in done and done["prepkg_bd"].notna().any():
+        pp = done["prepkg_bd"].dropna()
+        st.caption(f"Pre-package (borrower/inspection/title): median {pp.median():.0f} bd · "
+                   f"90th pct {pp.quantile(.9):.0f} bd — the long timelines live here, not in funding.")
+    st.caption("Queried from the Advance object (not the pipeline report), so paid-off draws stay in. "
+               "Turn-time = business days from full draw package received to wire; the coverage column shows "
+               "what share of each period's draws carry a package date.")
 
 
 # ───────────────────────────── Loan detail (micro) ──────────────────────────
@@ -451,12 +583,39 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
         st.warning("No matching construction draws."); return
 
     cfg = lg_config()
+    tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
     for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
         prop = g["Deal__r.Name"].dropna().iloc[0] if "Deal__r.Name" in g and g["Deal__r.Name"].notna().any() else ""
         borrower = g["Borrower_Name_Text__c"].dropna().iloc[0] if "Borrower_Name_Text__c" in g and g["Borrower_Name_Text__c"].notna().any() else ""
         st.markdown(f"### Loan {loan_no} — {prop}")
         if borrower:
             st.caption(f"Borrower: {borrower}  ·  Land Gorilla file: rb0{loan_no}")
+
+        # Land Gorilla loan-level overview (project progress, funded/last-draw dates, balances, risk)
+        if cfg and pd.notna(loan_no) and str(loan_no).strip():
+            ov = lg_loan_overview(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(tmpl), str(loan_no))
+            if ov and not ov.get("_error"):
+                m = st.columns(4)
+                if ov.get("project_pct") is not None:
+                    pct = float(ov["project_pct"])
+                    m[0].metric("Project complete", f"{pct:.0f}%")
+                    m[0].progress(min(max(pct / 100, 0), 1.0))
+                if ov.get("to_finish") is not None:
+                    m[1].metric("Remaining to fund", money(ov["to_finish"]))
+                if ov.get("balance") is not None:
+                    m[2].metric("Loan balance", money(ov["balance"]))
+                if ov.get("last_draw"):
+                    m[3].metric("Last draw", f"{ov['last_draw']}")
+                meta = []
+                if ov.get("program"): meta.append(f"**Program:** {ov['program']}")
+                if ov.get("funded_date"): meta.append(f"**Funded:** {ov['funded_date']}")
+                if ov.get("due_date"): meta.append(f"**Due:** {ov['due_date']}")
+                if ov.get("risk"): meta.append("**Risk:** " + ", ".join(ov["risk"]))
+                if meta:
+                    st.caption("  ·  ".join(meta))
+            elif ov and ov.get("_error"):
+                st.caption(f"Land Gorilla loan overview unavailable ({ov['_error']}).")
+
         for _, row in g.iterrows():
             _render_draw(row, cfg)
         st.divider()
