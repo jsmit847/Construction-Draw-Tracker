@@ -183,6 +183,23 @@ def sf_from_session() -> Salesforce | None:
     return Salesforce(instance_url=a["instance_url"], session_id=a["access_token"])
 
 
+@st.cache_resource(show_spinner=False)
+def sf_login_credentials(username: str, password: str, token: str, domain: str) -> Salesforce:
+    """Username/password SOAP login — needs NO connected-app callback URL. Cached so it logs in once."""
+    install_truststore()
+    return Salesforce(username=username, password=password,
+                      security_token=token or "", domain=domain or "login")
+
+
+def sf_from_credentials() -> Salesforce | None:
+    """Use [salesforce] username/password from secrets if present (the no-callback path)."""
+    sec = dict(st.secrets.get("salesforce", {}))
+    if sec.get("username") and sec.get("password"):
+        return sf_login_credentials(sec["username"], sec["password"],
+                                    sec.get("security_token", ""), sec.get("domain", "login"))
+    return None
+
+
 # ───────────────────────────── SF query helpers ─────────────────────────────
 def soql_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "\\'")
@@ -327,17 +344,28 @@ def _lg_date(v):
 
 
 def parse_draw_detail(payload: dict) -> dict:
-    """Pull the per-draw timeline + amount out of GET /api/clm/draw/{id}."""
+    """Pull the per-draw timeline, amount, and payee breakdown out of GET /api/clm/draw/{id}."""
     d = payload.get("data", payload) if isinstance(payload, dict) else {}
-    total = (((d.get("lineItems") or {}).get("total")) or {})
+    li = d.get("lineItems") or {}
+    total = (li.get("total")) or {}
+    payees = []
+    for name, blk in (li.get("payee") or {}).items():
+        amt = ((blk or {}).get("payeeDetail") or {}).get("loan")
+        payees.append({"payee": name, "amount": amt})
+    rb = d.get("requestedBy") or ""
     return {
         "name": d.get("name"),
+        "type": d.get("type"),
+        "container_number": d.get("containerNumber"),
+        "requested_by": str(rb).split(" - ")[0].strip() if rb else None,
         "status": d.get("status"),
         "created": _lg_date(d.get("createdDate")),
         "submitted": _lg_date(d.get("submittedDate")),
         "approved": _lg_date(d.get("approvedDate")),
         "funded": _lg_date(d.get("effectiveDate")),
         "amount": total.get("totalLessRetainage"),
+        "requested_total": total.get("requested"),
+        "payees": payees,
     }
 
 
@@ -378,12 +406,16 @@ def parse_template_loan(payload: dict) -> dict:
         "funded_date": _lg_date(f.get("loanFundedDate")),
         "last_draw": _lg_date(f.get("lastDrawDate")),
         "due_date": _lg_date(f.get("currentLoanDueDate")),
+        "original_due": _lg_date(f.get("originalLoanDueDate")),
         "program": f.get("loanProgram"),
         "risk": [x for x in (f.get("riskLabel") or []) if x],
         "property": f.get("propertyAddress"),
+        "city": f.get("city"),
+        "state": f.get("state"),
         "borrower": (b.get("borrower") if isinstance(b, dict) else b),
         "last_note_at": _lg_date(f.get("dateTimeLastNote")),
         "status": ((f.get("loanStatus") or [{}])[0].get("status") if f.get("loanStatus") else None),
+        "users": [u.strip() for u in (f.get("systemUsers") or []) if str(u).strip()],
     }
 
 
@@ -452,8 +484,8 @@ def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
 _PRETTY = {
     "Loan_Number__c": "Loan #", "Deal__r.Name": "Property", "Borrower_Name_Text__c": "Borrower",
     "Status__c": "Status", NOTES_FIELD: "Notes", REQ_FIELD: "Requested",
-    PKG_FIELD: "Package received", WIRE_FIELD: "Wired", "turn_bd": "Turn-time (bd)",
-    "prepkg_bd": "Pre-package (bd)", NET_FIELD: "Net $", GROSS_FIELD: "Gross $",
+    PKG_FIELD: "Package complete", WIRE_FIELD: "Wired", "turn_bd": "Funding time (days)",
+    "prepkg_bd": "Before-package (days)", NET_FIELD: "Funded ($)", GROSS_FIELD: "Loan size ($)",
     "Advance_Coordinator__r.Name": "Coordinator", "Loan_Advance_Number__c": "Draw #",
 }
 
@@ -476,90 +508,92 @@ def _span_start(gran: str, n: int) -> date:
 
 
 def render_pipeline(inst, tok, rt, sel, same_day):
-    st.subheader("Pipeline — construction draws")
+    st.subheader("Overview — all draws")
+    GMAP = {"Month": "Monthly", "Quarter": "Quarterly", "Year": "Yearly"}
     c = st.columns([1, 1, 2])
-    gran = c[0].selectbox("Granularity", ["Monthly", "Quarterly", "Yearly"], index=0)
-    opts = {"Monthly": [6, 12, 24], "Quarterly": [4, 8, 12], "Yearly": [3, 5]}[gran]
-    nper = c[1].selectbox("Periods", opts, index=1 if gran != "Yearly" else 0)
-    start = _span_start(gran, nper)
-    c[2].caption(f"Completed draws wired since {start:%m/%d/%Y}, bucketed by {gran.lower()[:-2] if gran!='Yearly' else 'year'}.")
+    gran = c[0].selectbox("View by", ["Month", "Quarter", "Year"], index=1)
+    gi = GMAP[gran]
+    opts = {"Month": [6, 12, 24], "Quarter": [4, 8, 12], "Year": [3, 5]}[gran]
+    nper = c[1].selectbox("How many to show", opts, index=1 if gran != "Year" else 0)
+    start = _span_start(gi, nper)
+    c[2].caption(f"Draws wired since {start:%b %-d, %Y}, grouped by {gran.lower()}." if hasattr(start, "day")
+                 else f"Draws grouped by {gran.lower()}.")
 
-    # ONE pull for the whole span -> every period figure below reconciles to the same rows
     done = add_intervals(run_soql(inst, tok,
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d}"), same_day)
     flight = run_soql(inst, tok,
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}=null "
         f"AND Status__c NOT IN ({','.join(chr(39)+s+chr(39) for s in TERMINAL)})")
-
     if done.empty:
-        st.info("No completed draws in this span.")
-        return
-    done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gran)
+        st.info("No completed draws in this range."); return
 
-    # ---- period rollup (built row-by-row so counts/$ reconcile exactly to the pull) ----
+    done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gi)
+    AMT = NET_FIELD if NET_FIELD in done else None
+    periods = sorted(done["Period"].unique())
+    cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
+
+    # rollup (row-by-row so every figure reconciles to the same pull)
     rows = []
-    for p in sorted(done["Period"].unique()):
+    for p in periods:
         g = done[done["Period"] == p]
         tt = g["turn_bd"].dropna() if "turn_bd" in g else pd.Series(dtype=float)
         rows.append({
-            "Period": p,
-            "Draws completed": len(g),
-            "Net $": float(pd.to_numeric(g.get(NET_FIELD), errors="coerce").sum()),
-            "Gross $": float(pd.to_numeric(g.get(GROSS_FIELD), errors="coerce").sum()),
-            "Median turn (bd)": (round(tt.median(), 1) if len(tt) else None),
-            "% ≤3 bd": (round((tt <= 3).mean() * 100) if len(tt) else None),
-            "Pkg-date coverage %": (round(g["turn_bd"].notna().mean() * 100) if "turn_bd" in g else 0),
+            "_raw": p,
+            "Period": p + ("  (in progress)" if p == cur_key else ""),
+            "Draws funded": len(g),
+            "Funded ($)": (float(pd.to_numeric(g.get(AMT), errors="coerce").sum()) if AMT else None),
+            "Funding time (days)": (round(tt.median(), 1) if len(tt) else None),
+            "% within 3 days": (round((tt <= 3).mean() * 100) if len(tt) else None),
+            "% with package date": (round(g["turn_bd"].notna().mean() * 100) if "turn_bd" in g else 0),
         })
     roll = pd.DataFrame(rows)
-    latest = roll.iloc[-1]
 
-    # ---- KPIs: most-recent period + current pipeline state ----
-    k = st.columns(5)
-    k[0].metric(f"Completed · {latest['Period']}", f"{int(latest['Draws completed']):,}",
-                help="Draws wired in the most recent period in range.")
-    k[1].metric("Median turn-time", f"{latest['Median turn (bd)']:.0f} bd" if pd.notna(latest["Median turn (bd)"]) else "—",
-                f"{latest['% ≤3 bd']:.0f}% ≤3 bd" if pd.notna(latest["% ≤3 bd"]) else None)
-    k[2].metric(f"Net funded · {latest['Period']}", money(latest["Net $"]))
-    k[3].metric(f"Gross funded · {latest['Period']}", money(latest["Gross $"]))
-    k[4].metric("In flight (now)", f"{len(flight):,}")
+    # feature the most recent COMPLETE period (not the 6-day-old current one)
+    complete = [p for p in periods if p != cur_key]
+    default_feat = complete[-1] if complete else periods[-1]
+    rev = list(reversed(periods))
+    feat = st.selectbox("Summary for", rev, index=rev.index(default_feat),
+                        format_func=lambda p: p + ("  (in progress)" if p == cur_key else ""))
+    fg = done[done["Period"] == feat]
+    ftt = fg["turn_bd"].dropna() if "turn_bd" in fg else pd.Series(dtype=float)
 
-    cc = st.columns(2)
-    total_done = int(roll["Draws completed"].sum())
-    cc[0].caption(f"Span total: **{total_done:,}** draws completed across {len(roll)} periods "
-                  f"(the rollup below sums to this).")
+    k = st.columns(4)
+    k[0].metric(f"Draws funded · {feat}", f"{len(fg):,}")
+    k[1].metric("Amount funded", money(pd.to_numeric(fg.get(AMT), errors="coerce").sum()) if AMT else "—")
+    k[2].metric("Typical funding time", f"{ftt.median():.0f} days" if len(ftt) else "—",
+                f"{(ftt<=3).mean()*100:.0f}% within 3 days" if len(ftt) else None)
+    holds = 0
     if not flight.empty and "Status__c" in flight:
-        holds = flight[flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False)]
-        cc[1].caption(f"On hold / needs attention: **{len(holds)}** of {len(flight)} in flight.")
+        holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False).sum())
+    k[3].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None)
 
-    # ---- the rollup table (this is the monthly/quarterly/yearly 'completed' view) ----
-    st.markdown(f"**{gran} rollup**")
-    disp = roll.copy()
-    disp["Net $"] = disp["Net $"].map(money); disp["Gross $"] = disp["Gross $"].map(money)
+    st.caption(f"Across this range: **{int(roll['Draws funded'].sum()):,}** draws funded over {len(roll)} {gran.lower()}s. "
+               "The newest period is marked *in progress* because it isn't finished yet — that's why its count is small.")
+
+    st.markdown(f"**By {gran.lower()}**")
+    disp = roll.drop(columns="_raw").copy()
+    disp["Funded ($)"] = disp["Funded ($)"].map(lambda x: money(x) if x is not None else "—")
     st.dataframe(disp.iloc[::-1], hide_index=True, use_container_width=True)
-    st.bar_chart(roll.set_index("Period")["Draws completed"])
+    st.bar_chart(roll.set_index("_raw")["Draws funded"])
 
-    # ---- drill into one period's draws + Excel export ----
-    st.markdown("**Draw detail**")
-    pick = st.selectbox("Period to list", sorted(done["Period"].unique(), reverse=True))
-    sub = done[done["Period"] == pick]
+    st.markdown(f"**Draws funded in {feat}**")
     cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
-                        "Status__c", REQ_FIELD, PKG_FIELD, WIRE_FIELD, "turn_bd", "prepkg_bd",
-                        NET_FIELD, GROSS_FIELD, NOTES_FIELD] if c in sub]
-    detail = sub[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False)
-    st.dataframe(detail, use_container_width=True, height=360)
-
-    xlsx = build_excel({f"{gran} rollup": roll, f"Draws {pick}": detail})
-    st.download_button("⬇️ Download Excel (rollup + detail)", xlsx,
-                       file_name=f"construction_draws_{gran.lower()}_{pick}.xlsx",
+                        "Status__c", REQ_FIELD, PKG_FIELD, WIRE_FIELD, "turn_bd", NET_FIELD, NOTES_FIELD] if c in fg]
+    detail = fg[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False)
+    st.dataframe(detail, use_container_width=True, height=340)
+    xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
+    st.download_button("⬇️ Download Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     if "prepkg_bd" in done and done["prepkg_bd"].notna().any():
         pp = done["prepkg_bd"].dropna()
-        st.caption(f"Pre-package (borrower/inspection/title): median {pp.median():.0f} bd · "
-                   f"90th pct {pp.quantile(.9):.0f} bd — the long timelines live here, not in funding.")
-    st.caption("Queried from the Advance object (not the pipeline report), so paid-off draws stay in. "
-               "Turn-time = business days from full draw package received to wire; the coverage column shows "
-               "what share of each period's draws carry a package date.")
+        st.caption(f"Once the draw package is complete, funding is fast — typically about a day. The longer waits "
+                   f"happen *before* the package is complete (borrower, inspection, title): a median of "
+                   f"{pp.median():.0f} business days.")
+    st.caption('"Funding time" is business days from a complete draw package to the wire. Some recent draws read 0 '
+               'because the package date was entered the same day it was wired — the "% with package date" column '
+               "shows how fully each period is captured. Paid-off draws are included (pulled from the Advance object, "
+               "not the pipeline report).")
 
 
 # ───────────────────────────── Loan detail (micro) ──────────────────────────
@@ -595,24 +629,35 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
         if cfg and pd.notna(loan_no) and str(loan_no).strip():
             ov = lg_loan_overview(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(tmpl), str(loan_no))
             if ov and not ov.get("_error"):
+                st.markdown("**Land Gorilla — loan status**")
                 m = st.columns(4)
                 if ov.get("project_pct") is not None:
                     pct = float(ov["project_pct"])
                     m[0].metric("Project complete", f"{pct:.0f}%")
                     m[0].progress(min(max(pct / 100, 0), 1.0))
+                    if ov.get("duration_pct") is not None:
+                        m[0].caption(f"{float(ov['duration_pct']):.0f}% of loan term elapsed")
                 if ov.get("to_finish") is not None:
                     m[1].metric("Remaining to fund", money(ov["to_finish"]))
                 if ov.get("balance") is not None:
                     m[2].metric("Loan balance", money(ov["balance"]))
                 if ov.get("last_draw"):
                     m[3].metric("Last draw", f"{ov['last_draw']}")
-                meta = []
-                if ov.get("program"): meta.append(f"**Program:** {ov['program']}")
-                if ov.get("funded_date"): meta.append(f"**Funded:** {ov['funded_date']}")
-                if ov.get("due_date"): meta.append(f"**Due:** {ov['due_date']}")
-                if ov.get("risk"): meta.append("**Risk:** " + ", ".join(ov["risk"]))
-                if meta:
-                    st.caption("  ·  ".join(meta))
+                # status line
+                bits = []
+                if ov.get("status"): bits.append(f"**Status:** {ov['status']}")
+                if ov.get("program"): bits.append(f"**Program:** {ov['program']}")
+                loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
+                if loc: bits.append(f"**Location:** {loc}")
+                if ov.get("funded_date"): bits.append(f"**Funded:** {ov['funded_date']}")
+                if ov.get("due_date"): bits.append(f"**Due:** {ov['due_date']}")
+                if ov.get("last_note_at"): bits.append(f"**Last note:** {ov['last_note_at']}")
+                if bits:
+                    st.caption("  ·  ".join(bits))
+                if ov.get("risk"):
+                    st.caption("**Risk labels:** " + " · ".join(ov["risk"]))
+                if ov.get("users"):
+                    st.caption("**LG team:** " + ", ".join(ov["users"]))
             elif ov and ov.get("_error"):
                 st.caption(f"Land Gorilla loan overview unavailable ({ov['_error']}).")
 
@@ -660,9 +705,18 @@ def _render_draw(row: pd.Series, cfg: dict | None):
                 st.dataframe(pd.DataFrame([{"Stage": s, "Date": d} for s, d in lg_steps]),
                              hide_index=True, use_container_width=True)
                 line = [f"Status: {det.get('status','—')}"]
+                if det.get("type"):
+                    line.append(det["type"])
                 if det.get("amount") is not None:
-                    line.append(f"Amount (less retainage): {money(det['amount'])}")
+                    line.append(f"Amount: {money(det['amount'])}")
                 st.caption(" · ".join(line))
+                payees = det.get("payees") or []
+                if payees:
+                    with st.expander(f"Payees ({len(payees)})"):
+                        st.dataframe(pd.DataFrame([{"Payee": p["payee"],
+                                                    "Amount": money(p["amount"]) if p.get("amount") is not None else "—"}
+                                                   for p in payees]),
+                                     hide_index=True, use_container_width=True)
 
     note = row.get(NOTES_FIELD)
     if pd.notna(note) and str(note).strip():
@@ -674,12 +728,22 @@ def main():
     st.set_page_config(page_title="Construction Draw Tracker", page_icon="🏗️", layout="wide")
     st.title("🏗️ Construction Draw Tracker")
 
-    cfg = None; err = None
+    # --- Auth: prefer username/password (NO callback URL); fall back to OAuth redirect ---
+    cfg = None; err = None; sf = None; mode = None
     try:
-        cfg = load_sf_oauth(); finish_oauth(cfg)
+        sf = sf_from_credentials()
+        if sf is not None:
+            mode = "username/password"
+            st.session_state["salesforce_auth"] = {
+                "instance_url": f"https://{sf.sf_instance}", "access_token": sf.session_id}
     except Exception as exc:
-        err = str(exc)
-    sf = None if err else sf_from_session()
+        err = f"Salesforce username/password login failed: {exc}"
+    if sf is None and err is None:                      # no creds -> OAuth redirect fallback
+        try:
+            cfg = load_sf_oauth(); finish_oauth(cfg)
+            sf = sf_from_session(); mode = "oauth"
+        except Exception as exc:
+            err = str(exc)
 
     with st.sidebar:
         st.header("Salesforce")
@@ -688,9 +752,9 @@ def main():
         elif sf is None:
             st.info("Not connected")
         else:
-            st.success("Connected")
+            st.success(f"Connected · {mode}")
             st.caption(st.session_state.get("salesforce_auth", {}).get("instance_url", ""))
-            if st.button("Log out", use_container_width=True):
+            if mode == "oauth" and st.button("Log out", use_container_width=True):
                 clear_sf_session(); st.rerun()
         st.divider()
         same_day = 1 if st.radio("Same-day convention", ["0 business days", "1 business day"],
@@ -699,10 +763,13 @@ def main():
         st.divider()
         st.caption("Land Gorilla: " + ("configured ✅" if lg_config() else "not set"))
 
-    st.subheader("Step 1 — Log in to Salesforce")
     if err:
-        st.error(err); st.stop()
-    if sf is None:
+        st.error(err)
+        st.caption("For the no-callback path, put username / password / security_token under "
+                   "[salesforce] in secrets. For OAuth, provide client_id / client_secret / redirect_uri / auth_host.")
+        st.stop()
+    if sf is None:                                       # OAuth path, not yet logged in
+        st.subheader("Step 1 — Log in to Salesforce")
         st.info("Log in to load the construction draw book.")
         st.link_button("Log in to Salesforce", login_url(cfg))
         st.caption(f"Callback URL: {cfg['redirect_uri']}")
@@ -724,7 +791,12 @@ def main():
     except Exception as exc:
         msg = str(exc)
         if "INVALID_SESSION_ID" in msg or "Session expired" in msg:
-            clear_sf_session(); st.warning("Your Salesforce session expired. Log in again."); st.stop()
+            try:
+                sf_login_credentials.clear()          # force a fresh login on the credentials path
+            except Exception:
+                pass
+            clear_sf_session()
+            st.warning("Your Salesforce session expired — reloading."); st.stop()
         raise
 
 
