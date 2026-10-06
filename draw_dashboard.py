@@ -299,25 +299,35 @@ def add_intervals(df: pd.DataFrame, same_day: int) -> pd.DataFrame:
     return df
 
 
-def backfill_days_from_lg(df: pd.DataFrame, cfg: dict | None) -> pd.DataFrame:
-    """Land Gorilla is the source that imports into Salesforce. Where SF's days-to-fund is blank
-       (the import missed it), compute it from LG's draw createdDate -> wire via DrawContainerId__c."""
+def backfill_days_from_lg(df: pd.DataFrame, cfg: dict | None, same_day: int) -> pd.DataFrame:
+    """Land Gorilla is the SOURCE of truth: the draw package is created in LG, then imported to Salesforce.
+       Salesforce frequently collapses the request date to equal the wire date (reads 0). So we take the
+       request date from LG's draw createdDate and compute BUSINESS days to the wire. We use LG whenever
+       the SF value is missing OR looks collapsed (SF request == wire but LG shows the draw started earlier)."""
     if df.empty or not cfg or "_days" not in df:
         return df
     df = df.copy()
-    need = df["_days"].isna() & df.get(CONTAINER_FIELD, pd.Series(index=df.index)).notna() \
-           & df.get(WIRE_FIELD, pd.Series(index=df.index)).notna()
+    has_container = df.get(CONTAINER_FIELD, pd.Series(index=df.index)).notna()
+    has_wire = df.get(WIRE_FIELD, pd.Series(index=df.index)).notna()
+    sf_req = pd.to_datetime(df.get(REQ_FIELD), errors="coerce") if REQ_FIELD in df else pd.Series(pd.NaT, index=df.index)
+    wire_dt = pd.to_datetime(df.get(WIRE_FIELD), errors="coerce")
+    collapsed = (sf_req.dt.normalize() == wire_dt.dt.normalize())          # SF says request == wire (same-day)
+    need = has_container & has_wire & (df["_days"].isna() | (df["_days"] <= 0) | collapsed)
     for idx in df.index[need]:
-        container = df.at[idx, CONTAINER_FIELD]
-        det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
+        det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)),
+                             str(df.at[idx, CONTAINER_FIELD]))
         if not det or det.get("_error") or not det.get("created"):
             continue
         created = pd.to_datetime(det["created"], errors="coerce")
         wire = pd.to_datetime(df.at[idx, WIRE_FIELD], errors="coerce")
-        if pd.notna(created) and pd.notna(wire):
-            d = (wire - created).days
-            if d >= 0:
-                df.at[idx, "_days"] = d
+        if pd.isna(created) or pd.isna(wire):
+            continue
+        bd = bdays(pd.Series([created]), pd.Series([wire]), same_day).iloc[0]   # BUSINESS days, LG request -> wire
+        if pd.notna(bd) and bd >= 0:
+            # only override SF if LG actually gives a longer, truer interval (or SF had nothing)
+            cur = df.at[idx, "_days"]
+            if pd.isna(cur) or bd > cur:
+                df.at[idx, "_days"] = bd
                 df.at[idx, "_days_src"] = "Land Gorilla"
     return df
 
@@ -624,7 +634,8 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     k[1].metric("Amount funded", money(pd.to_numeric(fg.get(AMT), errors="coerce").sum()) if AMT else "—")
     k[2].metric("Avg days to fund", f"{fd2f.mean():.0f} days" if len(fd2f) else "—",
                 f"{fg['_days'].notna().mean()*100:.0f}% measured" if len(fg) else None,
-                help="Calendar days from the borrower's draw request to the wire (Salesforce Days_to_Fund).")
+                help="Business days from the draw-package request to the wire. Request date comes from Land "
+                     "Gorilla's draw createdDate where Salesforce is missing it or collapsed it to the wire date.")
     holds = 0
     if not flight.empty and "Status__c" in flight:
         holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False).sum())
@@ -663,9 +674,11 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     st.download_button("⬇️ Download Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.caption('"Avg days to fund" is calendar days from the borrower\'s draw request to the wire (Salesforce\'s own '
-               'Days_to_Fund). "% measured" shows how many draws in the period carry that value. Paid-off draws are '
-               "included (pulled from the Advance object, not the pipeline report).")
+    st.caption('"Avg days to fund" is business days from the draw-package request to the wire. The request date '
+               "comes from Land Gorilla (the draw's createdDate) — the source that feeds Salesforce — because "
+               "Salesforce often collapses it to the wire date. Paid-off draws are included (pulled from the "
+               "Advance object, not the pipeline report). Macro backfill is applied per searched loan in Loan detail; "
+               "the Overview uses Salesforce values plus any already-corrected ones.")
 
 
 def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
@@ -763,11 +776,13 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
     st.caption(f"Found **{len(df)}** draw(s) across **{nloans}** loan(s).")
 
     cfg = lg_config()
-    # Land Gorilla is the upstream source — backfill days-to-fund where the SF import left it blank
-    df = backfill_days_from_lg(df, cfg)
+    # Land Gorilla is the source of truth — correct days-to-fund from LG's draw createdDate (business days)
+    # wherever Salesforce is missing it or collapsed it to a same-day 0.
+    df = backfill_days_from_lg(df, cfg, same_day)
     filled = (df["_days_src"] == "Land Gorilla").sum() if "_days_src" in df else 0
     if filled:
-        st.caption(f"↳ filled **{filled}** missing days-to-fund value(s) from Land Gorilla (the import source).")
+        st.caption(f"↳ corrected **{filled}** days-to-fund value(s) from Land Gorilla, the source of the "
+                   "request date (Salesforce had collapsed them to the wire date).")
     tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
     def first(colname):
         return g[colname].dropna().iloc[0] if colname in g and g[colname].notna().any() else ""
@@ -804,8 +819,8 @@ def _render_draw_sf(row: pd.Series):
         src = row.get("_days_src", "")
         top[2].metric("Days to fund", f"{float(row['_days']):.0f}",
                       f"via {src}" if src == "Land Gorilla" else None,
-                      help="Calendar days from the borrower's draw request to the wire." +
-                           (" Backfilled from Land Gorilla (the SF import source)." if src == "Land Gorilla" else ""))
+                      help="Business days from the draw-package request to the wire. Request date comes from "
+                           "Land Gorilla's draw createdDate when Salesforce is missing or collapsed it.")
     elif "turn_bd" in row and pd.notna(row.get("turn_bd")):
         top[2].metric("Once-complete", f"{row['turn_bd']:.0f} bd")
 
