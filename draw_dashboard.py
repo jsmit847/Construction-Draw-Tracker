@@ -34,8 +34,10 @@ import base64
 import hashlib
 import json
 import secrets
+import re
+import time
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -46,7 +48,6 @@ import streamlit as st
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from simple_salesforce import Salesforce
 
-import lg_client as LG   # Land Gorilla CLM client (open-endpoint build)
 
 # ───────────────────────────── domain constants ─────────────────────────────
 CONSTRUCTION_DEV_NAME = "Construction_Advance"
@@ -480,6 +481,236 @@ def _render_one_draw(row: pd.Series, amt: str | None):
     st.divider()
 
 
+
+
+# ===================== Land Gorilla client (merged from lg_client.py) =====================
+# ───────────────────────────── helpers ─────────────────────────────
+def items_of(payload: Any) -> list:
+    """Robustly pull the list of records out of LG's {'data': {'items': [...]}} or a bare list."""
+    d = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(d, dict):
+        return d.get("items", [])
+    return d if isinstance(d, list) else []
+
+
+def total_items(payload: Any) -> int | None:
+    if isinstance(payload, dict):
+        d = payload.get("data", payload)
+        if isinstance(d, dict) and "totalItems" in d:
+            return int(d["totalItems"])
+    return None
+
+
+def is_rb0(file_number: Any) -> bool:
+    """Small-balance RTL / fix-and-flip book = file numbers beginning 'rb0' (per M. Cave)."""
+    return str(file_number or "").strip().lower().startswith("rb0")
+
+
+def normalize_loan_no(value: Any) -> str:
+    """Join key: lowercase, strip, drop non-alphanumerics so 'RB0 64541' == 'rb064541'."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def guess_property(loan: dict) -> str:
+    """
+    LG borrower fields smush entity / person / address together, e.g.
+      businessName: 'GOTTSCHEE LLC - Andrew Joseph LoManto - 25 Roslyn Road'
+    Best-effort: pick the ' - '-separated chunk that starts with a street number.
+    """
+    b = loan.get("borrower", {}) or {}
+    for field in ("businessName", "lastName", "firstName"):
+        val = b.get(field)
+        if not val:
+            continue
+        for chunk in str(val).split(" - "):
+            if re.match(r"^\s*\d+\s+\S", chunk):      # starts with a number + a word = address-ish
+                return chunk.strip()
+    return ""
+
+
+def borrower_name(loan: dict) -> str:
+    b = loan.get("borrower", {}) or {}
+    if b.get("businessName"):
+        return str(b["businessName"]).split(" - ")[0].strip()
+    name = f"{b.get('firstName','')} {b.get('lastName','')}".strip()
+    return name
+
+
+def _parse_expiry(value: Any) -> float | None:
+    """LG token 'expired' is a UTC datetime string like '2026-10-06 13:52:43'. Return epoch seconds."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _parse_lg_date(value: Any):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(str(value)[:19], fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+# ───────────────────────────── client ─────────────────────────────
+class LGClient:
+    BASE = "https://clmapi.landgorilla.com"
+    API = "clm"
+
+    def __init__(self, user: str, password: str, *, base: str | None = None,
+                 verify: bool = True, session: Any = None, refresh_margin_s: int = 120):
+        self._user = user
+        self._password = password
+        self.base = (base or self.BASE).rstrip("/")
+        self.verify = verify
+        self._margin = refresh_margin_s
+        self._tok: str | None = None
+        self._exp: float = 0.0
+        if session is not None:
+            self._session = session
+        else:
+            import requests
+            self._session = requests.Session()
+
+    # -- auth --
+    def token(self) -> str:
+        if self._tok and time.time() < self._exp - self._margin:
+            return self._tok
+        r = self._session.get(
+            f"{self.base}/api/token",
+            headers={"USER": self._user, "PASSWORD": self._password},
+            data={"api_name": self.API}, timeout=20, verify=self.verify,
+        )
+        r.raise_for_status()
+        j = r.json()
+        self._tok = j["token"]
+        exp = _parse_expiry(j.get("expired"))
+        self._exp = exp if exp else time.time() + 1800     # fall back to ~30 min
+        return self._tok
+
+    # -- low-level GET with bearer --
+    def get(self, path: str, **params):
+        url = path if path.startswith("http") else f"{self.base}{path}"
+        return self._session.get(
+            url,
+            headers={"Authorization": f"Bearer {self.token()}", "Accept": "application/json"},
+            params=params or None, timeout=60, verify=self.verify,
+        )
+
+    # -- loan list (paged) --
+    def iter_loans(self, *, per_page: int = 50, status: str | None = None,
+                   file_number: str | None = None, max_pages: int | None = None):
+        page = 1
+        seen = 0
+        while True:
+            params: dict[str, Any] = {"page": page, "perPage": per_page}
+            if status:
+                params["status[]"] = status          # NB: the API requires the array form
+            if file_number:
+                params["fileNumber"] = file_number
+            r = self.get("/api/clm/loan", **params)
+            r.raise_for_status()
+            payload = r.json()
+            batch = items_of(payload)
+            if not batch:
+                break
+            for loan in batch:
+                yield loan
+            seen += len(batch)
+            tot = total_items(payload)
+            if tot is not None and seen >= tot:
+                break
+            if max_pages and page >= max_pages:
+                break
+            page += 1
+
+    def all_loans(self, **kw) -> list[dict]:
+        return list(self.iter_loans(**kw))
+
+    # -- per-loan summary & draw count (open endpoints) --
+    def loan_summary(self, loan_id) -> dict:
+        r = self.get(f"/api/clm/loan/{loan_id}")
+        if not r.ok:
+            return {}
+        d = r.json()
+        return d.get("data", d) if isinstance(d, dict) else {}
+
+    def draw_count(self, loan_id) -> int:
+        r = self.get("/api/clm/draw", loanId=loan_id)
+        return len(items_of(r.json())) if r.ok else 0
+
+
+# ───────────────────────────── dataframe builders ─────────────────────────────
+def loans_frame(client: LGClient, *, rb0_only: bool = True, status: str | None = None,
+                limit: int | None = None) -> pd.DataFrame:
+    """Fast identity-level frame from the loan list alone (one call per ~per_page loans)."""
+    rows = []
+    for loan in client.iter_loans(status=status):
+        if rb0_only and not is_rb0(loan.get("fileNumber")):
+            continue
+        rows.append({
+            "loan_id": loan.get("id"),
+            "file_number": loan.get("fileNumber"),
+            "join_key": normalize_loan_no(loan.get("fileNumber")),
+            "borrower": borrower_name(loan),
+            "property": guess_property(loan),
+        })
+        if limit and len(rows) >= limit:
+            break
+    return pd.DataFrame(rows)
+
+
+def enrich_with_summary(client: LGClient, df: pd.DataFrame, *,
+                        with_draw_count: bool = True,
+                        progress: Callable[[int, int], None] | None = None) -> pd.DataFrame:
+    """Add balances / last-draw-date / draw count. One or two calls per loan — call on a filtered subset."""
+    if df.empty:
+        return df
+    df = df.copy()
+    bal, tofin, lastdraw, ndraws = [], [], [], []
+    n = len(df)
+    for i, lid in enumerate(df["loan_id"]):
+        s = client.loan_summary(lid)
+        bal.append(pd.to_numeric(s.get("loanBalance"), errors="coerce"))
+        tofin.append(pd.to_numeric(s.get("balanceToFinish"), errors="coerce"))
+        lastdraw.append(_parse_lg_date(s.get("lastApprovedDrawEffectiveDate")))
+        ndraws.append(client.draw_count(lid) if with_draw_count else None)
+        if progress:
+            progress(i + 1, n)
+    df["loan_balance"] = bal
+    df["balance_to_finish"] = tofin
+    df["last_draw_date"] = lastdraw
+    if with_draw_count:
+        df["draw_count"] = ndraws
+    # "fully funded / nothing left to draw" — balance_to_finish at/near zero
+    df["fully_funded"] = pd.to_numeric(df["balance_to_finish"], errors="coerce").fillna(-1).le(0)
+    return df
+
+
+def join_salesforce(lg_df: pd.DataFrame, sf_df: pd.DataFrame, sf_loan_col: str) -> pd.DataFrame:
+    """
+    Left-join LG (the full RB0 book, incl. paid-off loans SF dropped) to Salesforce
+    turn-time, on the normalized loan number. Adds in_salesforce flag.
+    """
+    if lg_df.empty:
+        return lg_df
+    out = lg_df.copy()
+    if sf_df is None or sf_df.empty or sf_loan_col not in sf_df.columns:
+        out["in_salesforce"] = False
+        return out
+    sf = sf_df.copy()
+    sf["join_key"] = sf[sf_loan_col].map(normalize_loan_no)
+    sf = sf.drop_duplicates("join_key")
+    merged = out.merge(sf, on="join_key", how="left", suffixes=("", "_sf"))
+    merged["in_salesforce"] = merged[sf_loan_col].notna() if sf_loan_col in merged else False
+    return merged
+
+
 # ───────────────────────────── Land Gorilla wiring ──────────────────────────
 def lg_config() -> dict | None:
     """Service credentials live in st.secrets['landgorilla']; the end user never types them."""
@@ -491,20 +722,20 @@ def lg_config() -> dict | None:
 
 @st.cache_resource(show_spinner=False)
 def get_lg_client(user: str, password: str, verify: bool):
-    return LG.LGClient(user, password, verify=verify)
+    return LGClient(user, password, verify=verify)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def lg_loans(user: str, password: str, verify: bool, rb0_only: bool) -> pd.DataFrame:
     client = get_lg_client(user, password, verify)
-    return LG.loans_frame(client, rb0_only=rb0_only)
+    return loans_frame(client, rb0_only=rb0_only)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def lg_enrich(user: str, password: str, verify: bool, loan_ids: tuple) -> pd.DataFrame:
     client = get_lg_client(user, password, verify)
     base = pd.DataFrame({"loan_id": list(loan_ids)})
-    return LG.enrich_with_summary(client, base)
+    return enrich_with_summary(client, base)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -557,7 +788,7 @@ def render_rb0_book(inst: str, tok: str, rt: str, same_day: int):
         help="Field on Advance__c (often via the Deal relationship) that holds the rb0 loan number.")
 
     sf_tt = sf_completed_turntime(inst, tok, rt, sf_loan_field, same_day)
-    joined = LG.join_salesforce(loans, sf_tt, sf_loan_field) if not sf_tt.empty else loans.assign(in_salesforce=False)
+    joined = join_salesforce(loans, sf_tt, sf_loan_field) if not sf_tt.empty else loans.assign(in_salesforce=False)
 
     matched = int(joined["in_salesforce"].sum()) if "in_salesforce" in joined else 0
     k[2].metric("Matched to Salesforce", f"{matched:,}", f"{matched/len(loans)*100:.0f}% of RB0")
