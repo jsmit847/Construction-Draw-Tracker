@@ -664,35 +664,36 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gi)
     AMT = NET_FIELD if NET_FIELD in done else None
-    if "_days" not in done:   # add_intervals sets _days; guard in case of an empty frame
+    if "_days" not in done:
         done["_days"] = pd.to_numeric(done.get(DAYS_FIELD), errors="coerce") if DAYS_FIELD in done else np.nan
     periods = sorted(done["Period"].unique())
     cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
 
-    # ── Days-to-fund ALWAYS comes from Land Gorilla (the source of truth) ──
-    # Salesforce collapses the request date to the wire date (its Days_to_Fund reads ~0), so we never
-    # trust it for this metric. LG's draw createdDate is the real request; we replace the whole range's
-    # values with true business-day intervals automatically. One API call per draw, cached 30 min per
-    # period set, so it's only slow on the first view of a given range.
-    cfg = lg_config()
-    if cfg:
-        with st.spinner("Loading true request dates from Land Gorilla… (first load for this range may take a moment)"):
-            done = apply_lg_correction(done, cfg, same_day)
-        corrected = int((done["_days_src"] == "Land Gorilla").sum()) if "_days_src" in done else 0
-        uncorrected = int(done["_days"].notna().sum() - corrected)
-        note = f"Days-to-fund uses Land Gorilla's true request dates ({corrected:,} draws corrected"
-        note += f"; {uncorrected:,} without an LG match use Salesforce)." if uncorrected else ")."
-        st.caption("✅ " + note)
-    else:
-        st.error("Land Gorilla isn't configured, so days-to-fund falls back to Salesforce's values, which "
-                 "collapse the request date to the wire date and read ~0. Add [landgorilla] secrets to fix this.")
+    # pick the featured period FIRST (most recent complete one), so we only correct what we show
+    complete = [p for p in periods if p != cur_key]
+    default_feat = complete[-1] if complete else periods[-1]
+    rev = list(reversed(periods))
+    feat = st.selectbox("Summary for", rev, index=rev.index(default_feat),
+                        format_func=lambda p: p + ("  (in progress)" if p == cur_key else ""))
 
-    # rollup (row-by-row so every figure reconciles to the same pull)
+    # ── Days-to-fund comes from Land Gorilla, corrected for the SELECTED period only ──
+    # Salesforce collapses the request date to the wire date, so its Days_to_Fund reads ~0. LG's draw
+    # createdDate is the real request. We correct only the chosen period's draws (~hundreds, not the whole
+    # multi-year span of thousands) so it loads in seconds, fetched in parallel and cached 24h.
+    cfg = lg_config()
+    fg = done[done["Period"] == feat].copy()
+    if cfg:
+        with st.spinner(f"Loading true request dates from Land Gorilla for {feat}…"):
+            fg = apply_lg_correction(fg, cfg, same_day)
+        done.loc[fg.index, "_days"] = fg["_days"]
+        done.loc[fg.index, "_days_src"] = fg.get("_days_src", "")
+    fd2f = fg["_days"].dropna()
+
+    # rollup — volume & dollars across all periods (cheap, SF only). Days-to-fund is NOT shown per-period
+    # here because it would require correcting every period; the true number lives in the KPI + chart below.
     rows = []
     for p in periods:
         g = done[done["Period"] == p]
-        d2f = g["_days"].dropna()
-        tt = g["turn_bd"].dropna() if "turn_bd" in g else pd.Series(dtype=float)
         funded = float(pd.to_numeric(g.get(AMT), errors="coerce").sum()) if AMT else None
         n = len(g)
         rows.append({
@@ -702,56 +703,45 @@ def render_pipeline(inst, tok, rt, sel, same_day):
             "Loans": (g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None),
             "Funded ($)": funded,
             "Avg draw ($)": (funded / n if (funded is not None and n) else None),
-            "Avg days to fund": (round(d2f.mean(), 1) if len(d2f) else None),
-            "Once-complete (days)": (round(tt.mean(), 1) if len(tt) else None),
-            "% measured": (round(g["_days"].notna().mean() * 100) if len(g) else 0),
         })
     roll = pd.DataFrame(rows)
-
-    # feature the most recent COMPLETE period (not the 6-day-old current one)
-    complete = [p for p in periods if p != cur_key]
-    default_feat = complete[-1] if complete else periods[-1]
-    rev = list(reversed(periods))
-    feat = st.selectbox("Summary for", rev, index=rev.index(default_feat),
-                        format_func=lambda p: p + ("  (in progress)" if p == cur_key else ""))
-    fg = done[done["Period"] == feat]
-    fd2f = fg["_days"].dropna()
 
     k = st.columns(4)
     k[0].metric(f"Draws funded · {feat}", f"{len(fg):,}")
     k[1].metric("Amount funded", money(pd.to_numeric(fg.get(AMT), errors="coerce").sum()) if AMT else "—")
     k[2].metric("Avg days to fund", f"{fd2f.mean():.0f} days" if len(fd2f) else "—",
                 f"{fg['_days'].notna().mean()*100:.0f}% measured" if len(fg) else None,
-                help="Business days from the draw-package request to the wire. Request date comes from Land "
-                     "Gorilla's draw createdDate where Salesforce is missing it or collapsed it to the wire date.")
+                help="Business days from the draw-package request to the wire, using Land Gorilla's true "
+                     "request date (the draw's createdDate). Salesforce collapses this to the wire date.")
     holds = 0
     if not flight.empty and "Status__c" in flight:
         holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False).sum())
     k[3].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None)
 
-    # support stat: once the package is complete, we fund fast
-    tt_all = done["turn_bd"].dropna() if "turn_bd" in done else pd.Series(dtype=float)
-    if len(tt_all):
-        st.caption(f"**Average {done['_days'].dropna().mean():.0f} days** from request to wire across this range · "
-                   f"but once the draw **package is complete**, we fund in about **{tt_all.mean():.0f} business day(s)** — "
-                   "the wait is upstream (borrower, inspection, title), not in our funding.")
+    if len(fd2f):
+        tt_f = fg["turn_bd"].dropna() if "turn_bd" in fg else pd.Series(dtype=float)
+        msg = f"In **{feat}**, draws took an average of **{fd2f.mean():.0f} business days** from request to wire."
+        if len(tt_f):
+            msg += (f" Once the package is complete we fund in about **{tt_f.mean():.0f} business day(s)** — "
+                    "the wait is upstream (borrower, inspection, title), not in our funding.")
+        st.caption(msg)
+    if not cfg:
+        st.error("Land Gorilla isn't configured — days-to-fund can't be corrected and would show Salesforce's "
+                 "collapsed ~0. Add [landgorilla] secrets.")
 
     st.caption(f"Across this range: **{int(roll['Draws funded'].sum()):,}** draws funded over {len(roll)} {gran.lower()}s. "
                "The newest period is marked *in progress* because it isn't finished yet — that's why its count is small.")
 
-    # ---- rollup table ----
-    st.markdown(f"**By {gran.lower()}**")
+    # ---- rollup table (volume & dollars) ----
+    st.markdown(f"**By {gran.lower()}** — volume & dollars")
     disp = roll.drop(columns="_raw").copy()
-    # Dollars become strings (money or blank). Numeric columns stay numeric so Streamlit/Arrow
-    # renders NaN as an empty cell natively — mixing numbers with a "—" string crashes Arrow.
     for c in ["Funded ($)", "Avg draw ($)"]:
         disp[c] = disp[c].map(lambda x: money(x) if pd.notna(x) else "")
-    for c in ["Loans", "Avg days to fund", "Once-complete (days)", "% measured"]:
-        disp[c] = pd.to_numeric(disp[c], errors="coerce")
+    disp["Loans"] = pd.to_numeric(disp["Loans"], errors="coerce")
     st.dataframe(disp.iloc[::-1], hide_index=True, use_container_width=True)
 
     # ---- charts ----
-    _render_charts(done, roll, gran)
+    _render_charts(done, roll, gran, fg, feat)
 
     # ---- featured-period detail + Excel ----
     st.markdown(f"**Draws funded in {feat}**")
@@ -771,52 +761,36 @@ def render_pipeline(inst, tok, rt, sel, same_day):
                "the Overview uses Salesforce values plus any already-corrected ones.")
 
 
-def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
-    """Four overview charts built on average days-to-fund + funded dollars."""
-    d2f = done["_days"].dropna()
+def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str, fg: pd.DataFrame, feat: str):
+    """Charts: days-to-fund distribution for the corrected featured period, plus volume/dollars per period
+       (which don't need Land Gorilla, so they're instant across the whole range)."""
+    d2f = fg["_days"].dropna()               # corrected, featured period only
     if alt is None:
-        # graceful fallback without altair
         st.bar_chart(roll.set_index("_raw")["Draws funded"])
-        if "Avg days to fund" in roll:
-            st.line_chart(roll.set_index("_raw")["Avg days to fund"])
+        st.bar_chart(roll.set_index("_raw")["Funded ($)"])
         return
 
-    # chart frame: use the raw period key as the x-axis label, drop the duplicate display "Period"
     r = roll.drop(columns=[c for c in ["Period"] if c in roll.columns]).rename(columns={"_raw": "Period"})
-    r = r.loc[:, ~r.columns.duplicated()]          # belt-and-suspenders: no duplicate column names
+    r = r.loc[:, ~r.columns.duplicated()]
     order = list(r["Period"])
     c1, c2 = st.columns(2)
 
-    # 1) days-to-fund distribution (shows the tail), with a mean line
+    # 1) days-to-fund distribution for the featured period (the true numbers)
     with c1:
-        st.markdown("**How long draws take (request → wire)**")
+        st.markdown(f"**How long draws took in {feat}** (request → wire, business days)")
         if len(d2f):
             capped = d2f.clip(upper=45)
             hist = alt.Chart(pd.DataFrame({"days": capped})).mark_bar(color="#4C78A8").encode(
-                x=alt.X("days:Q", bin=alt.Bin(maxbins=30), title="Calendar days (capped at 45)"),
+                x=alt.X("days:Q", bin=alt.Bin(maxbins=30), title="Business days (capped at 45)"),
                 y=alt.Y("count()", title="Draws"))
             rule = alt.Chart(pd.DataFrame({"m": [float(d2f.mean())]})).mark_rule(color="#E45756", size=2).encode(x="m:Q")
             st.altair_chart(hist + rule, use_container_width=True)
-            st.caption(f"Red line = average ({d2f.mean():.0f} days). The long right tail is borrower-driven delay.")
+            st.caption(f"Red line = average ({d2f.mean():.0f} business days). The long right tail is borrower-driven delay.")
         else:
-            st.info("No days-to-fund data in range.")
+            st.info("No days-to-fund data for this period.")
 
-    # 2) average days-to-fund trend over time
+    # 2) funded dollars per period (no LG needed)
     with c2:
-        st.markdown("**Average days to fund over time**")
-        tr = r[["Period", "Avg days to fund"]].dropna(subset=["Avg days to fund"])
-        if not tr.empty:
-            line = alt.Chart(tr).mark_line(point=True, color="#E45756").encode(
-                x=alt.X("Period:N", sort=order, title=""),
-                y=alt.Y("Avg days to fund:Q", title="Avg days"))
-            st.altair_chart(line, use_container_width=True)
-        else:
-            st.info("No trend data.")
-
-    c3, c4 = st.columns(2)
-
-    # 3) funded dollars per period
-    with c3:
         st.markdown("**Amount funded per period**")
         bars = alt.Chart(r[["Period", "Funded ($)"]]).mark_bar(color="#54A24B").encode(
             x=alt.X("Period:N", sort=order, title=""),
@@ -824,15 +798,13 @@ def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str):
             tooltip=["Period", alt.Tooltip("Funded ($):Q", format="$,.0f")])
         st.altair_chart(bars, use_container_width=True)
 
-    # 4) draws + avg days combo (dual axis)
-    with c4:
-        st.markdown("**Draws funded & average days**")
-        base = alt.Chart(r[["Period", "Draws funded", "Avg days to fund"]]).encode(
-            x=alt.X("Period:N", sort=order, title=""))
-        bars = base.mark_bar(color="#B9D7A8").encode(y=alt.Y("Draws funded:Q", title="Draws"))
-        line = base.mark_line(color="#E45756", point=True).encode(
-            y=alt.Y("Avg days to fund:Q", axis=alt.Axis(title="Avg days", orient="right")))
-        st.altair_chart(alt.layer(bars, line).resolve_scale(y="independent"), use_container_width=True)
+    # 3) draws funded per period (no LG needed)
+    st.markdown("**Draws funded per period**")
+    bars = alt.Chart(r[["Period", "Draws funded"]]).mark_bar(color="#B9D7A8").encode(
+        x=alt.X("Period:N", sort=order, title=""),
+        y=alt.Y("Draws funded:Q", title="Draws"),
+        tooltip=["Period", "Draws funded"])
+    st.altair_chart(bars, use_container_width=True)
 
 
 # ───────────────────────────── Loan detail (micro) ──────────────────────────
