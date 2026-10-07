@@ -642,20 +642,33 @@ def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
 # Map Melanie's Excel columns (by letter) to a Salesforce field. Only the ones that map cleanly
 # from Advance__c + its Deal are filled; the rest stay blank (her own file has blanks too).
 # EXTEND THIS as you confirm more fields (property address, RM/LO, asset managers, etc.).
+# From the Advance itself (+ its Deal):
 MELANIE_MAP = {
     "B": "Loan_Number__c",                 # CV Loan #
     "C": "Deal__r.Name",                   # Deal Name
     "D": "Borrower_Name_Text__c",          # Borrower Name
-    "E": "Deal__r.Sponsor_Entity__c",      # Sponsor(s)   (remove if this field errors in your org)
-    "K": "Aggregate_Value_PreAdvance__c",  # As-Is Value at Origination
-    "L": "After_Repair_Value_Total__c",    # As Complete Value at Origination
+    "E": "Deal__r.Sponsor_Entity__c",      # Sponsor(s)   (removed automatically if it errors in your org)
     "M": "Purchase_Funded_Date__c",        # Funded Date
     "O": "LOC_Commitment__c",              # Total Loan Commitment
     "AH": "Warehouse_Line__c",             # Warehouse line
     "AF": "Notes__c",                      # Comments  (SF Notes; Melanie's hand-typed log lives only in her file)
 }
-# Computed columns to re-seed as live Excel formulas — ONLY where both inputs are mapped/filled.
-MELANIE_FORMULAS = {"S": "=O{r}/L{r}"}     # LTV% As Complete = commitment / as-complete value
+# From the Property object (one query per Deal; the draw's Deal has a single property here):
+MELANIE_PROPERTY_MAP = {
+    "I": "Property_Type__c",               # Property Type
+    "G": "City__c",                        # Property City
+    "H": "State__c",                       # ST
+    "K": "Appraised_Value_Amount__c",      # As-Is Value at Origination
+    "L": "After_Repair_Value__c",          # As Complete Value at Origination
+    "Q": "Initial_Disbursement__c",        # Initial Loan Funding
+    "AB": "Current_UPB__c",                # Current UPB (if present on the property)
+}
+# Property Street (F) is Street_Number + Street_Name joined.
+PROPERTY_FIELDS = (["Street_Number__c", "Street_Name__c"]
+                   + list(dict.fromkeys(MELANIE_PROPERTY_MAP.values())))
+# Computed columns to re-seed as live Excel formulas — only where both inputs are mapped/filled.
+MELANIE_FORMULAS = {"S": "=O{r}/L{r}",     # LTV% As Complete = commitment / as-complete value
+                    "R": "=Q{r}/K{r}"}     # LTV% As-is = initial funding / as-is value
 TEMPLATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "melanie_template.xlsx")
 TEMPLATE_HEADER_ROW = 7
 
@@ -665,22 +678,37 @@ def _melanie_rows(inst: str, tok: str, rt: str, loan_tuple: tuple) -> pd.DataFra
     if not loan_tuple:
         return pd.DataFrame()
     present = set(describe_fields(inst, tok))
-    paths = []
+    paths = ["Loan_Number__c", "Deal__c"]
     for p in dict.fromkeys(MELANIE_MAP.values()):
         base = p.split(".")[0]
         if base in present or (base.endswith("__r") and (base[:-3] + "__c") in present):
             paths.append(p)
     loans = "('" + "','".join(soql_escape(str(x)) for x in loan_tuple) + "')"
     try:
-        return run_soql(inst, tok,
-            f"SELECT {','.join(dict.fromkeys(['Loan_Number__c'] + paths))} FROM Advance__c "
-            f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
+        adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(paths))} FROM Advance__c "
+                                  f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
     except Exception:
-        # drop any field that the org rejects (e.g. Sponsor_Entity__c) and retry with the safe core
         safe = [p for p in paths if p.split(".")[0] in present]
-        return run_soql(inst, tok,
-            f"SELECT {','.join(dict.fromkeys(['Loan_Number__c'] + safe))} FROM Advance__c "
-            f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
+        adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(safe))} FROM Advance__c "
+                                  f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
+    if adv.empty or "Deal__c" not in adv:
+        return adv
+
+    # Property lives off the Deal — query it by Deal id (the valid SOQL direction), one row per deal.
+    deal_ids = [d for d in adv["Deal__c"].dropna().unique()]
+    if deal_ids:
+        din = "('" + "','".join(soql_escape(str(d)) for d in deal_ids) + "')"
+        try:
+            prop = run_soql(inst, tok,
+                f"SELECT Deal__c,{','.join(dict.fromkeys(PROPERTY_FIELDS))} FROM Property__c WHERE Deal__c IN {din}")
+            if not prop.empty:
+                prop = prop.drop_duplicates("Deal__c", keep="first")   # one property per deal here
+                prop["_street"] = (prop.get("Street_Number__c", "").astype(str).str.strip() + " "
+                                   + prop.get("Street_Name__c", "").astype(str).str.strip()).str.strip()
+                adv = adv.merge(prop, on="Deal__c", how="left", suffixes=("", "_prop"))
+        except Exception:
+            pass
+    return adv
 
 
 def fill_melanie_template(inst: str, tok: str, rt: str, loan_numbers, submitted_by: str,
@@ -705,6 +733,11 @@ def fill_melanie_template(inst: str, tok: str, rt: str, loan_numbers, submitted_
         for col_letter, field in MELANIE_MAP.items():
             if field in row and pd.notna(row[field]):
                 ws.cell(r, column_index_from_string(col_letter)).value = row[field]
+        for col_letter, field in MELANIE_PROPERTY_MAP.items():      # from Property (via Deal)
+            if field in row and pd.notna(row[field]):
+                ws.cell(r, column_index_from_string(col_letter)).value = row[field]
+        if "_street" in row and pd.notna(row["_street"]) and str(row["_street"]).strip():
+            ws.cell(r, column_index_from_string("F")).value = row["_street"]   # Property Street
         for col_letter, pattern in MELANIE_FORMULAS.items():
             # only write the formula if its referenced input cells have values this row
             inputs_ok = all(ws.cell(r, column_index_from_string(c)).value not in (None, "")
