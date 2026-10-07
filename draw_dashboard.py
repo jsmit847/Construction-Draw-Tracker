@@ -338,7 +338,9 @@ def lg_days_for_containers(user: str, password: str, verify: bool, same_day: int
         if pd.isna(created) or pd.isna(w):
             return (str(container), None)
         bd = bdays(pd.Series([created]), pd.Series([w]), same_day).iloc[0]
-        return (str(container), float(bd) if (pd.notna(bd) and bd >= 0) else None)
+        if pd.isna(bd) or bd < 0:
+            return (str(container), None)
+        return (str(container), {"bdays": float(bd), "created": created.date().isoformat()})
 
     with ThreadPoolExecutor(max_workers=16) as ex:
         for container, val in ex.map(one, pairs):
@@ -361,11 +363,15 @@ def apply_lg_correction(df: pd.DataFrame, cfg: dict, same_day: int,
     lg = lg_days_for_containers(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), same_day, pairs)
     if progress:
         progress(0.9, "Applying correction…")
+    if "_lg_req" not in df.columns:
+        df["_lg_req"] = pd.NaT
     for idx in sub.index:
         c = str(df.at[idx, CONTAINER_FIELD])
-        if c in lg:
-            df.at[idx, "_days"] = lg[c]
+        info = lg.get(c)
+        if info:
+            df.at[idx, "_days"] = info["bdays"]
             df.at[idx, "_days_src"] = "Land Gorilla"
+            df.at[idx, "_lg_req"] = info["created"]
     return df
 
 
@@ -745,20 +751,29 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     # ---- featured-period detail + Excel ----
     st.markdown(f"**Draws funded in {feat}**")
+    d = fg.copy()
+    # Requested = Land Gorilla's true request date (createdDate) where we have it, else Salesforce's.
+    d["Requested"] = d["_lg_req"] if "_lg_req" in d else pd.NaT
+    if REQ_FIELD in d:
+        d["Requested"] = d["Requested"].fillna(d[REQ_FIELD])
+    d["Days to fund"] = pd.to_numeric(d.get("_days"), errors="coerce")   # corrected business days (LG)
+    d["Source"] = d.get("_days_src", "")
+    ren = {"Loan_Number__c": "Loan #", "Loan_Advance_Number__c": "Draw #", "Deal__r.Name": "Deal",
+           "Deal__r.Account.Name": "Account", "Borrower_Name_Text__c": "Borrower", "Status__c": "Status",
+           WIRE_FIELD: "Wired", NET_FIELD: "Funded ($)", NOTES_FIELD: "Notes"}
     cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Deal__r.Account.Name",
-                        "Borrower_Name_Text__c", "Status__c", REQ_FIELD, WIRE_FIELD, DAYS_FIELD,
-                        NET_FIELD, NOTES_FIELD] if c in fg]
-    detail = fg[cols].rename(columns=_PRETTY).sort_values("Wired", ascending=False)
+                        "Borrower_Name_Text__c", "Status__c", "Requested", WIRE_FIELD, "Days to fund",
+                        "Source", NET_FIELD, NOTES_FIELD] if c in d.columns]
+    detail = d[cols].rename(columns=ren).sort_values("Wired", ascending=False)
     st.dataframe(detail, use_container_width=True, height=340)
     xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
     st.download_button("⬇️ Download Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.caption('"Avg days to fund" is business days from the draw-package request to the wire. The request date '
-               "comes from Land Gorilla (the draw's createdDate) — the source that feeds Salesforce — because "
-               "Salesforce often collapses it to the wire date. Paid-off draws are included (pulled from the "
-               "Advance object, not the pipeline report). Macro backfill is applied per searched loan in Loan detail; "
-               "the Overview uses Salesforce values plus any already-corrected ones.")
+    st.caption('"Days to fund" is **business days from the Land Gorilla request date (the draw\'s createdDate) to the '
+               'wire** — Salesforce collapses the request date to the wire date, so we never use it for this number. '
+               '"Requested" shows that true Land Gorilla date. The "Source" column marks which draws were corrected. '
+               "Everything else (notes, dollars, status) comes from Salesforce.")
 
 
 def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str, fg: pd.DataFrame, feat: str):
