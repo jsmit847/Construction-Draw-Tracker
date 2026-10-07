@@ -641,24 +641,23 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     periods = sorted(done["Period"].unique())
     cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
 
-    # ── Correct days-to-fund from Land Gorilla (the source of truth) ──
-    # Salesforce collapses the request date to the wire date, so its Days_to_Fund reads ~0.
-    # LG's draw createdDate is the real request; this replaces the whole range's values with
-    # true business-day intervals. It makes one API call per draw, so it's behind a toggle,
-    # cached 30 min per period set.
+    # ── Days-to-fund ALWAYS comes from Land Gorilla (the source of truth) ──
+    # Salesforce collapses the request date to the wire date (its Days_to_Fund reads ~0), so we never
+    # trust it for this metric. LG's draw createdDate is the real request; we replace the whole range's
+    # values with true business-day intervals automatically. One API call per draw, cached 30 min per
+    # period set, so it's only slow on the first view of a given range.
     cfg = lg_config()
-    st.warning("⚠️ Salesforce often records the request date as the same day it wired, so its "
-               "days-to-fund reads ~0. The real request date lives in Land Gorilla. Correct it for a true number.",
-               icon="⚠️")
-    correct = st.toggle("Use Land Gorilla for days-to-fund (true business days)", value=False,
-                        help="Pulls each draw's real request date (createdDate) from Land Gorilla. "
-                             "Slower on first load for a period; cached after.") if cfg else False
-    if correct and cfg:
-        bar = st.progress(0.0, "Correcting days-to-fund from Land Gorilla…")
-        done = apply_lg_correction(done, cfg, same_day, progress=lambda f, t: bar.progress(f, t))
-        bar.progress(1.0, "Done."); bar.empty()
+    if cfg:
+        with st.spinner("Loading true request dates from Land Gorilla… (first load for this range may take a moment)"):
+            done = apply_lg_correction(done, cfg, same_day)
         corrected = int((done["_days_src"] == "Land Gorilla").sum()) if "_days_src" in done else 0
-        st.success(f"Corrected {corrected} draw(s) using Land Gorilla's true request dates.")
+        uncorrected = int(done["_days"].notna().sum() - corrected)
+        note = f"Days-to-fund uses Land Gorilla's true request dates ({corrected:,} draws corrected"
+        note += f"; {uncorrected:,} without an LG match use Salesforce)." if uncorrected else ")."
+        st.caption("✅ " + note)
+    else:
+        st.error("Land Gorilla isn't configured, so days-to-fund falls back to Salesforce's values, which "
+                 "collapse the request date to the wire date and read ~0. Add [landgorilla] secrets to fix this.")
 
     # rollup (row-by-row so every figure reconciles to the same pull)
     rows = []
