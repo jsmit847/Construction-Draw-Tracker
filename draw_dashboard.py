@@ -334,13 +334,24 @@ def lg_days_for_containers(user: str, password: str, verify: bool, same_day: int
         except Exception:
             return (str(container), None)
         created = pd.to_datetime(det.get("created"), errors="coerce")
+        approved = pd.to_datetime(det.get("approved"), errors="coerce")  # package-complete point
         w = pd.to_datetime(wire, errors="coerce")
         if pd.isna(created) or pd.isna(w):
             return (str(container), None)
+        # total request -> wire
         bd = bdays(pd.Series([created]), pd.Series([w]), same_day).iloc[0]
         if pd.isna(bd) or bd < 0:
             return (str(container), None)
-        return (str(container), {"bdays": float(bd), "created": created.date().isoformat()})
+        # split: request -> package (the borrower wait) and package -> wire (funding)
+        wait = bdays(pd.Series([created]), pd.Series([approved]), same_day).iloc[0] if pd.notna(approved) else np.nan
+        fund = bdays(pd.Series([approved]), pd.Series([w]), same_day).iloc[0] if pd.notna(approved) else np.nan
+        return (str(container), {
+            "bdays": float(bd),
+            "created": created.date().isoformat(),
+            "approved": approved.date().isoformat() if pd.notna(approved) else None,
+            "wait_bd": float(wait) if (pd.notna(wait) and wait >= 0) else None,
+            "fund_bd": float(fund) if (pd.notna(fund) and fund >= 0) else None,
+        })
 
     with ThreadPoolExecutor(max_workers=16) as ex:
         for container, val in ex.map(one, pairs):
@@ -363,8 +374,12 @@ def apply_lg_correction(df: pd.DataFrame, cfg: dict, same_day: int,
     lg = lg_days_for_containers(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), same_day, pairs)
     if progress:
         progress(0.9, "Applying correction…")
-    if "_lg_req" not in df.columns:
-        df["_lg_req"] = pd.NaT
+    for col in ("_lg_req", "_lg_pkg"):
+        if col not in df.columns:
+            df[col] = pd.NaT
+    for col in ("_wait_bd", "_fund_bd"):
+        if col not in df.columns:
+            df[col] = np.nan
     for idx in sub.index:
         c = str(df.at[idx, CONTAINER_FIELD])
         info = lg.get(c)
@@ -372,6 +387,9 @@ def apply_lg_correction(df: pd.DataFrame, cfg: dict, same_day: int,
             df.at[idx, "_days"] = info["bdays"]
             df.at[idx, "_days_src"] = "Land Gorilla"
             df.at[idx, "_lg_req"] = info["created"]
+            df.at[idx, "_lg_pkg"] = info.get("approved")
+            df.at[idx, "_wait_bd"] = info.get("wait_bd")
+            df.at[idx, "_fund_bd"] = info.get("fund_bd")
     return df
 
 
@@ -712,28 +730,42 @@ def render_pipeline(inst, tok, rt, sel, same_day):
         })
     roll = pd.DataFrame(rows)
 
+    wait = fg["_wait_bd"].dropna() if "_wait_bd" in fg else pd.Series(dtype=float)   # request -> package (borrower)
+    fund = fg["_fund_bd"].dropna() if "_fund_bd" in fg else pd.Series(dtype=float)   # package -> wire (us)
+
     k = st.columns(4)
     k[0].metric(f"Draws funded · {feat}", f"{len(fg):,}")
     k[1].metric("Amount funded", money(pd.to_numeric(fg.get(AMT), errors="coerce").sum()) if AMT else "—")
-    k[2].metric("Avg days to fund", f"{fd2f.mean():.0f} days" if len(fd2f) else "—",
-                f"{fg['_days'].notna().mean()*100:.0f}% measured" if len(fg) else None,
-                help="Business days from the draw-package request to the wire, using Land Gorilla's true "
-                     "request date (the draw's createdDate). Salesforce collapses this to the wire date.")
+    k[2].metric("Borrower wait", f"{wait.mean():.0f} bd" if len(wait) else "—",
+                help="Business days from the borrower's draw request to a complete package "
+                     "(Land Gorilla createdDate → approvedDate). The borrower / inspection / title side.")
+    k[3].metric("Our funding", f"{fund.mean():.1f} bd" if len(fund) else "—",
+                f"{(fund==0).mean()*100:.0f}% same-day" if len(fund) else None,
+                help="Business days from a complete package to the wire (Land Gorilla approvedDate → wire). "
+                     "This is CoreVest's own funding speed once the package is in.")
+
     holds = 0
     if not flight.empty and "Status__c" in flight:
         holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False).sum())
-    k[3].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None)
-
+    k2 = st.columns(2)
+    k2[0].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None)
     if len(fd2f):
-        tt_f = fg["turn_bd"].dropna() if "turn_bd" in fg else pd.Series(dtype=float)
-        msg = f"In **{feat}**, draws took an average of **{fd2f.mean():.0f} business days** from request to wire."
-        if len(tt_f):
-            msg += (f" Once the package is complete we fund in about **{tt_f.mean():.0f} business day(s)** — "
-                    "the wait is upstream (borrower, inspection, title), not in our funding.")
-        st.caption(msg)
+        k2[1].metric("Total: request → wire", f"{fd2f.mean():.0f} bd",
+                     f"{fg['_days'].notna().mean()*100:.0f}% measured")
+
+    if len(wait) or len(fund):
+        parts = []
+        if len(wait):
+            parts.append(f"borrowers take an average of **{wait.mean():.0f} business days** to get a complete package in")
+        if len(fund):
+            sd = (fund == 0).mean() * 100
+            parts.append(f"CoreVest then funds in **{fund.mean():.1f} business day(s)**"
+                         + (f" (**{sd:.0f}% same-day**)" if sd >= 50 else ""))
+        st.caption(f"In **{feat}**, " + ", and ".join(parts) +
+                   " — the wait is the borrower/inspection/title side, not our funding.")
     if not cfg:
-        st.error("Land Gorilla isn't configured — days-to-fund can't be corrected and would show Salesforce's "
-                 "collapsed ~0. Add [landgorilla] secrets.")
+        st.error("Land Gorilla isn't configured — the request and package dates can't be corrected (Salesforce "
+                 "collapses them to the wire date). Add [landgorilla] secrets.")
 
     st.caption(f"Across this range: **{int(roll['Draws funded'].sum()):,}** draws funded over {len(roll)} {gran.lower()}s. "
                "The newest period is marked *in progress* because it isn't finished yet — that's why its count is small.")
