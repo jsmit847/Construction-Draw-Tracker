@@ -299,6 +299,48 @@ def add_intervals(df: pd.DataFrame, same_day: int) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def lg_days_for_containers(user: str, password: str, verify: bool, same_day: int,
+                           pairs: tuple) -> dict:
+    """Given ((container_id, wire_date), ...) return {container_id: business_days from LG createdDate -> wire}.
+       Cached hard (30 min) and keyed on the exact set, so a period is only fetched once."""
+    out: dict[str, float] = {}
+    for container, wire in pairs:
+        det = lg_draw_detail(user, password, verify, str(container))
+        if not det or det.get("_error") or not det.get("created"):
+            continue
+        created = pd.to_datetime(det["created"], errors="coerce")
+        w = pd.to_datetime(wire, errors="coerce")
+        if pd.isna(created) or pd.isna(w):
+            continue
+        bd = bdays(pd.Series([created]), pd.Series([w]), same_day).iloc[0]
+        if pd.notna(bd) and bd >= 0:
+            out[str(container)] = float(bd)
+    return out
+
+
+def apply_lg_correction(df: pd.DataFrame, cfg: dict, same_day: int,
+                        progress=None) -> pd.DataFrame:
+    """Correct _days for EVERY draw in df using Land Gorilla (business days, request->wire).
+       Replaces Salesforce's collapsed values with the true LG interval."""
+    if df.empty or not cfg or CONTAINER_FIELD not in df:
+        return df
+    df = df.copy()
+    sub = df[df[CONTAINER_FIELD].notna() & df[WIRE_FIELD].notna()]
+    pairs = tuple((str(c), str(w)) for c, w in zip(sub[CONTAINER_FIELD], sub[WIRE_FIELD]))
+    if progress:
+        progress(0.3, f"Fetching {len(pairs)} draw dates from Land Gorilla…")
+    lg = lg_days_for_containers(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), same_day, pairs)
+    if progress:
+        progress(0.9, "Applying correction…")
+    for idx in sub.index:
+        c = str(df.at[idx, CONTAINER_FIELD])
+        if c in lg:
+            df.at[idx, "_days"] = lg[c]
+            df.at[idx, "_days_src"] = "Land Gorilla"
+    return df
+
+
 def backfill_days_from_lg(df: pd.DataFrame, cfg: dict | None, same_day: int) -> pd.DataFrame:
     """Land Gorilla is the SOURCE of truth: the draw package is created in LG, then imported to Salesforce.
        Salesforce frequently collapses the request date to equal the wire date (reads 0). So we take the
@@ -598,6 +640,25 @@ def render_pipeline(inst, tok, rt, sel, same_day):
         done["_days"] = pd.to_numeric(done.get(DAYS_FIELD), errors="coerce") if DAYS_FIELD in done else np.nan
     periods = sorted(done["Period"].unique())
     cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
+
+    # ── Correct days-to-fund from Land Gorilla (the source of truth) ──
+    # Salesforce collapses the request date to the wire date, so its Days_to_Fund reads ~0.
+    # LG's draw createdDate is the real request; this replaces the whole range's values with
+    # true business-day intervals. It makes one API call per draw, so it's behind a toggle,
+    # cached 30 min per period set.
+    cfg = lg_config()
+    st.warning("⚠️ Salesforce often records the request date as the same day it wired, so its "
+               "days-to-fund reads ~0. The real request date lives in Land Gorilla. Correct it for a true number.",
+               icon="⚠️")
+    correct = st.toggle("Use Land Gorilla for days-to-fund (true business days)", value=False,
+                        help="Pulls each draw's real request date (createdDate) from Land Gorilla. "
+                             "Slower on first load for a period; cached after.") if cfg else False
+    if correct and cfg:
+        bar = st.progress(0.0, "Correcting days-to-fund from Land Gorilla…")
+        done = apply_lg_correction(done, cfg, same_day, progress=lambda f, t: bar.progress(f, t))
+        bar.progress(1.0, "Done."); bar.empty()
+        corrected = int((done["_days_src"] == "Land Gorilla").sum()) if "_days_src" in done else 0
+        st.success(f"Corrected {corrected} draw(s) using Land Gorilla's true request dates.")
 
     # rollup (row-by-row so every figure reconciles to the same pull)
     rows = []
