@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
 import json
 import re
 import secrets
@@ -637,6 +638,90 @@ def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
     return buf.getvalue()
 
 
+# ───────────────── Melanie's funding-request format (template fill) ──────────
+# Map Melanie's Excel columns (by letter) to a Salesforce field. Only the ones that map cleanly
+# from Advance__c + its Deal are filled; the rest stay blank (her own file has blanks too).
+# EXTEND THIS as you confirm more fields (property address, RM/LO, asset managers, etc.).
+MELANIE_MAP = {
+    "B": "Loan_Number__c",                 # CV Loan #
+    "C": "Deal__r.Name",                   # Deal Name
+    "D": "Borrower_Name_Text__c",          # Borrower Name
+    "E": "Deal__r.Sponsor_Entity__c",      # Sponsor(s)   (remove if this field errors in your org)
+    "K": "Aggregate_Value_PreAdvance__c",  # As-Is Value at Origination
+    "L": "After_Repair_Value_Total__c",    # As Complete Value at Origination
+    "M": "Purchase_Funded_Date__c",        # Funded Date
+    "O": "LOC_Commitment__c",              # Total Loan Commitment
+    "AH": "Warehouse_Line__c",             # Warehouse line
+    "AF": "Notes__c",                      # Comments  (SF Notes; Melanie's hand-typed log lives only in her file)
+}
+# Computed columns to re-seed as live Excel formulas — ONLY where both inputs are mapped/filled.
+MELANIE_FORMULAS = {"S": "=O{r}/L{r}"}     # LTV% As Complete = commitment / as-complete value
+TEMPLATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "melanie_template.xlsx")
+TEMPLATE_HEADER_ROW = 7
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _melanie_rows(inst: str, tok: str, rt: str, loan_tuple: tuple) -> pd.DataFrame:
+    if not loan_tuple:
+        return pd.DataFrame()
+    present = set(describe_fields(inst, tok))
+    paths = []
+    for p in dict.fromkeys(MELANIE_MAP.values()):
+        base = p.split(".")[0]
+        if base in present or (base.endswith("__r") and (base[:-3] + "__c") in present):
+            paths.append(p)
+    loans = "('" + "','".join(soql_escape(str(x)) for x in loan_tuple) + "')"
+    try:
+        return run_soql(inst, tok,
+            f"SELECT {','.join(dict.fromkeys(['Loan_Number__c'] + paths))} FROM Advance__c "
+            f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
+    except Exception:
+        # drop any field that the org rejects (e.g. Sponsor_Entity__c) and retry with the safe core
+        safe = [p for p in paths if p.split(".")[0] in present]
+        return run_soql(inst, tok,
+            f"SELECT {','.join(dict.fromkeys(['Loan_Number__c'] + safe))} FROM Advance__c "
+            f"WHERE RecordTypeId='{rt}' AND Loan_Number__c IN {loans}")
+
+
+def fill_melanie_template(inst: str, tok: str, rt: str, loan_numbers, submitted_by: str,
+                          funding_date: str) -> bytes | None:
+    """Open the committed template, swap placeholders, and write one row per loan from Salesforce."""
+    import openpyxl
+    from openpyxl.utils import column_index_from_string
+    if not os.path.exists(TEMPLATE_FILE):
+        return None
+    df = _melanie_rows(inst, tok, rt, tuple(dict.fromkeys(str(x) for x in loan_numbers)))
+    wb = openpyxl.load_workbook(TEMPLATE_FILE)
+    ws = wb["Combined Funding Request"]
+
+    # placeholders -> real values
+    for cell, val in {"E3": submitted_by, "E4": datetime.now().strftime("%m/%d/%Y"),
+                      "E5": funding_date}.items():
+        ws[cell] = val
+
+    # one row per loan, in the template's own column order
+    r = TEMPLATE_HEADER_ROW + 1
+    for _, row in df.iterrows():
+        for col_letter, field in MELANIE_MAP.items():
+            if field in row and pd.notna(row[field]):
+                ws.cell(r, column_index_from_string(col_letter)).value = row[field]
+        for col_letter, pattern in MELANIE_FORMULAS.items():
+            # only write the formula if its referenced input cells have values this row
+            inputs_ok = all(ws.cell(r, column_index_from_string(c)).value not in (None, "")
+                            for c in _formula_input_cols(pattern))
+            if inputs_ok:
+                ws.cell(r, column_index_from_string(col_letter)).value = pattern.format(r=r)
+        r += 1
+
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue()
+
+
+def _formula_input_cols(pattern: str) -> list:
+    import re as _re
+    return _re.findall(r"([A-Z]+)\{r\}", pattern)
+
+
 # ───────────────────────────── Pipeline (macro) ─────────────────────────────
 _PRETTY = {
     "Loan_Number__c": "Loan #", "Deal__r.Name": "Deal", "Deal__r.Account.Name": "Account",
@@ -784,28 +869,56 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     # ---- featured-period detail + Excel ----
     st.markdown(f"**Draws funded in {feat}**")
     d = fg.copy()
-    # Requested = Land Gorilla's true request date (createdDate) where we have it, else Salesforce's.
+    # All timing dates from Land Gorilla (don't collapse); wire from Salesforce.
     d["Requested"] = d["_lg_req"] if "_lg_req" in d else pd.NaT
     if REQ_FIELD in d:
         d["Requested"] = d["Requested"].fillna(d[REQ_FIELD])
-    d["Days to fund"] = pd.to_numeric(d.get("_days"), errors="coerce")   # corrected business days (LG)
+    d["Package complete"] = d["_lg_pkg"] if "_lg_pkg" in d else pd.NaT
+    d["Borrower wait (bd)"] = pd.to_numeric(d.get("_wait_bd"), errors="coerce")
+    d["Our funding (bd)"] = pd.to_numeric(d.get("_fund_bd"), errors="coerce")
+    d["Total (bd)"] = pd.to_numeric(d.get("_days"), errors="coerce")
     d["Source"] = d.get("_days_src", "")
     ren = {"Loan_Number__c": "Loan #", "Loan_Advance_Number__c": "Draw #", "Deal__r.Name": "Deal",
            "Deal__r.Account.Name": "Account", "Borrower_Name_Text__c": "Borrower", "Status__c": "Status",
            WIRE_FIELD: "Wired", NET_FIELD: "Funded ($)", NOTES_FIELD: "Notes"}
     cols = [c for c in ["Loan_Number__c", "Loan_Advance_Number__c", "Deal__r.Name", "Deal__r.Account.Name",
-                        "Borrower_Name_Text__c", "Status__c", "Requested", WIRE_FIELD, "Days to fund",
-                        "Source", NET_FIELD, NOTES_FIELD] if c in d.columns]
+                        "Borrower_Name_Text__c", "Status__c", "Requested", "Package complete", WIRE_FIELD,
+                        "Borrower wait (bd)", "Our funding (bd)", "Total (bd)", "Source",
+                        NET_FIELD, NOTES_FIELD] if c in d.columns]
     detail = d[cols].rename(columns=ren).sort_values("Wired", ascending=False)
     st.dataframe(detail, use_container_width=True, height=340)
-    xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
-    st.download_button("⬇️ Download Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.caption('"Days to fund" is **business days from the Land Gorilla request date (the draw\'s createdDate) to the '
-               'wire** — Salesforce collapses the request date to the wire date, so we never use it for this number. '
-               '"Requested" shows that true Land Gorilla date. The "Source" column marks which draws were corrected. '
-               "Everything else (notes, dollars, status) comes from Salesforce.")
+    # Build the Excel only when the user asks for it (keeps every page render fast).
+    bcols = st.columns(2)
+    with bcols[0]:
+        if st.button("⬇️ Build turn-time Excel", key=f"xls_{feat}"):
+            with st.spinner("Building workbook…"):
+                xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
+            st.download_button("Download turn-time Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key=f"dl_{feat}")
+    with bcols[1]:
+        if os.path.exists(TEMPLATE_FILE):
+            if st.button("⬇️ Build funding-request (Melanie's format)", key=f"mel_{feat}"):
+                loans = fg["Loan_Number__c"].dropna().unique().tolist() if "Loan_Number__c" in fg else []
+                with st.spinner("Filling Melanie's template…"):
+                    me = fill_melanie_template(inst, tok, rt, loans,
+                                               submitted_by="Jonathan Smith", funding_date=f"{feat}")
+                if me:
+                    st.download_button("Download funding-request file", me,
+                                       file_name=f"Funding_Request_{feat}.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       key=f"meldl_{feat}")
+                    st.caption("Columns we can source from Salesforce are filled; property address, RM/LO, "
+                               "asset managers and hand-typed comments stay blank (use the SF *Generate File* "
+                               "button for a fully-complete file).")
+        else:
+            st.caption("Add `melanie_template.xlsx` to the repo to enable the funding-request export.")
+
+    st.caption("All timing dates come from **Land Gorilla** (request = createdDate, package complete = approvedDate) — "
+               "Salesforce collapses these to the wire date, so we never use its dates for timing. The wire date, "
+               "notes, dollars and names come from Salesforce. **Borrower wait** = request→package; **Our funding** = "
+               "package→wire; **Total** = request→wire.")
 
 
 def _render_charts(done: pd.DataFrame, roll: pd.DataFrame, gran: str, fg: pd.DataFrame, feat: str):
