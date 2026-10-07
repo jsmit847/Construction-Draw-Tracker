@@ -299,23 +299,51 @@ def add_intervals(df: pd.DataFrame, same_day: int) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def lg_days_for_containers(user: str, password: str, verify: bool, same_day: int,
                            pairs: tuple) -> dict:
     """Given ((container_id, wire_date), ...) return {container_id: business_days from LG createdDate -> wire}.
-       Cached hard (30 min) and keyed on the exact set, so a period is only fetched once."""
+       Fetches Land Gorilla draws CONCURRENTLY — ~635 serial calls took ~80s; parallel takes a few seconds.
+       Cached 24h, keyed on the exact set, so a period is only fetched once (survives until data changes)."""
+    from concurrent.futures import ThreadPoolExecutor
+    import requests, threading
+
     out: dict[str, float] = {}
-    for container, wire in pairs:
-        det = lg_draw_detail(user, password, verify, str(container))
-        if not det or det.get("_error") or not det.get("created"):
-            continue
-        created = pd.to_datetime(det["created"], errors="coerce")
+    if not pairs:
+        return out
+
+    client = LGClient(user, password, verify=verify)   # dedicated client for this batch
+    token = client.token()                              # pre-warm the token so threads don't race refreshing it
+    tl = threading.local()                              # one requests.Session per worker thread (thread-safe)
+
+    def session() -> "requests.Session":
+        s = getattr(tl, "s", None)
+        if s is None:
+            s = requests.Session(); tl.s = s
+        return s
+
+    def one(pair):
+        container, wire = pair
+        try:
+            r = session().get(f"{client.BASE}/api/clm/draw/{container}",
+                              headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                              timeout=30, verify=verify)
+            if not r.ok:
+                return (str(container), None)
+            det = parse_draw_detail(r.json())
+        except Exception:
+            return (str(container), None)
+        created = pd.to_datetime(det.get("created"), errors="coerce")
         w = pd.to_datetime(wire, errors="coerce")
         if pd.isna(created) or pd.isna(w):
-            continue
+            return (str(container), None)
         bd = bdays(pd.Series([created]), pd.Series([w]), same_day).iloc[0]
-        if pd.notna(bd) and bd >= 0:
-            out[str(container)] = float(bd)
+        return (str(container), float(bd) if (pd.notna(bd) and bd >= 0) else None)
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for container, val in ex.map(one, pairs):
+            if val is not None:
+                out[container] = val
     return out
 
 
@@ -714,10 +742,12 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     # ---- rollup table ----
     st.markdown(f"**By {gran.lower()}**")
     disp = roll.drop(columns="_raw").copy()
+    # Dollars become strings (money or blank). Numeric columns stay numeric so Streamlit/Arrow
+    # renders NaN as an empty cell natively — mixing numbers with a "—" string crashes Arrow.
     for c in ["Funded ($)", "Avg draw ($)"]:
-        disp[c] = disp[c].map(lambda x: money(x) if pd.notna(x) else "—")
+        disp[c] = disp[c].map(lambda x: money(x) if pd.notna(x) else "")
     for c in ["Loans", "Avg days to fund", "Once-complete (days)", "% measured"]:
-        disp[c] = disp[c].map(lambda x: x if pd.notna(x) else "—")
+        disp[c] = pd.to_numeric(disp[c], errors="coerce")
     st.dataframe(disp.iloc[::-1], hide_index=True, use_container_width=True)
 
     # ---- charts ----
