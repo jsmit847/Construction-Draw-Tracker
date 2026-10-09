@@ -1,7 +1,8 @@
-streamlit>=1.50
-simple-salesforce>=1.12
-pandas>=2.2
-numpy>=1.26
-openpyxl>=3.1
+streamlit>=1.50,<2
+simple-salesforce>=1.12,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+openpyxl>=3.1,<4
 truststore>=0.9
-altair>=5
+altair>=5,<7
+requests>=2.31
