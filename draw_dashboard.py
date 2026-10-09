@@ -620,30 +620,36 @@ def build_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
 # ───────────────── Melanie's funding-request format (template fill) ──────────
 # The weekly "CoreVest Construction/Renovation Funding Request" — the file Salesforce's Generate File button
 # builds for the logged-in user. Its grain is ONE ROW PER ADVANCE (a property's draw): a portfolio loan gets a
-# row per property. Map each template column (by letter) to a SOQL path from Advance__c; paths that don't
-# resolve in the org drop out one by one (resolve_path), so a wrong guess blanks one column, not the file.
+# row per property. Each template column maps to a SOQL path from Advance__c, or to candidates tried in order
+# (from the org's field glossary). Paths that don't resolve in the org, or that resolve to a raw lookup Id, drop
+# out one by one (resolve_path), so a wrong guess blanks one column, not the file.
 MELANIE_MAP = {
-    "B": "Loan_Number__c",                 # CV Loan #
-    "C": "Deal__r.Name",                   # Deal Name
-    "D": "Borrower_Name_Text__c",          # Borrower Name
-    "E": "Deal__r.Sponsor_Entity__c",      # Sponsor(s)
-    "M": "Purchase_Funded_Date__c",        # Funded Date
-    "O": "LOC_Commitment__c",              # Total Loan Commitment
-    "U": NET_FIELD,                        # Current Draw Amount — feeds the E6 total (confirm vs Aggregate_Funding__c)
-    "AD": "Remaining_Interest_Reserve__c", # IR Balance
-    "AF": NOTES_FIELD,                     # Comments
-    "AH": "Warehouse_Line__c",             # Warehouse line
+    "B": "Loan_Number__c",                                          # CV Loan #
+    "C": "Deal__r.Name",                                            # Deal Name
+    "D": "Borrower_Name_Text__c",                                   # Borrower Name
+    "E": ("Deal__r.Contact__r.Name", "Deal__r.Sponsor_Entity__c"),  # Sponsor(s) — a person in her file (Primary Contact)
+    "J": "Deal__r.Project_Strategy__c",                             # Project Type (Ground Up / Fix and Flip / …)
+    "M": ("Purchase_Funded_Date__c", "Deal__r.CloseDate"),          # Funded Date
+    "N": ("Deal__r.Updated_Loan_Maturity_Date__c",                  # Maturity Date (current, after extensions)
+          "Deal__r.Current_Line_Maturity_Date__c"),
+    "O": ("Deal__r.LOC_Commitment__c", "LOC_Commitment__c"),        # Total Loan Commitment (a Deal field)
+    "U": NET_FIELD,                                                 # Current Draw Amount — the net wire; feeds E6
+    "AC": "Deal__r.Next_Payment_Date__c",                           # Next Due Date
+    "AD": "Remaining_Interest_Reserve__c",                          # IR Balance
+    "AF": NOTES_FIELD,                                              # Comments
+    "AH": ("Deal__r.Warehouse_Line__c", "Warehouse_Line__c"),       # Warehouse line (a Deal field)
+    "AJ": "Deal__r.Owner.Name",                                     # RM/LO — the Deal owner ("CAF Originator" here)
 }
-# From the advance's Property__c — its own lookup when Advance__c has one, else the Deal's property when the
-# Deal has exactly one (a multi-property deal can't be split without the lookup, so those rows stay blank).
+# From the advance's Property__c: Advance__c's own Property lookup if it has one; else the Deal's property when the
+# Deal has just one, or the single property whose Advance__c points at this draw. Otherwise blank — never a guess.
 MELANIE_PROPERTY_MAP = {
-    "G": "City__c",                        # Property City
-    "H": "State__c",                       # ST
-    "I": "Property_Type__c",               # Property Type
-    "K": "Appraised_Value_Amount__c",      # As-Is Value at Origination
-    "L": "After_Repair_Value__c",          # As Complete Value at Origination
-    "Q": "Initial_Disbursement__c",        # Initial Loan Funding
-    "AB": "Current_UPB__c",                # Current UPB
+    "G": "City__c",                                                       # Property City
+    "H": "State__c",                                                      # ST
+    "I": "Property_Type__c",                                              # Property Type
+    "K": ("Origination_Date_Value__c", "Appraised_Value_Amount__c"),       # As-Is Value at Origination
+    "L": ("Origination_After_Repair_Value__c", "After_Repair_Value__c"),  # As Complete Value at Origination
+    "Q": "Initial_Disbursement__c",                                       # Initial Loan Funding
+    "AB": "Current_UPB__c",                                               # Current UPB
 }
 STREET_PARTS = ("Street_Number__c", "Street_Name__c")   # F Property Street = number + name
 # Computed columns written as live Excel formulas — only where every input cell is filled.
@@ -672,18 +678,27 @@ def _soql_in(inst: str, tok: str, select: str, obj: str, key: str, values) -> pd
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
+def _cands(v) -> tuple:
+    return (v,) if isinstance(v, str) else tuple(v)
+
+
+def _usable(meta: dict | None) -> bool:
+    return bool(meta) and meta["type"] not in ("reference", "id")      # never write a raw record Id
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.DataFrame, dict, list]:
     """Advances in scope, one row each, keyed by template column letter (plus the filter fields).
        Returns (rows, {column letter: Salesforce type}, [template columns this org can't fill])."""
     adv_meta = describe_object(inst, tok, "Advance__c")
-    cols, ftypes, unavailable = {}, {}, []
-    for col, path in MELANIE_MAP.items():
-        meta = resolve_path(inst, tok, "Advance__c", path)
-        if meta:
-            cols[col], ftypes[col] = path, meta["type"]
-        else:
-            unavailable.append(col)
+    cols, ftypes = {}, {}
+    for col, cands in MELANIE_MAP.items():
+        for path in _cands(cands):
+            meta = resolve_path(inst, tok, "Advance__c", path)
+            if _usable(meta):
+                cols[col], ftypes[col] = path, meta["type"]
+                break
+    unavailable = [col for col in MELANIE_MAP if col not in cols]
     prop_ref = next((f for f, m in adv_meta.items() if m["ref"] == ["Property__c"]), None)  # Advance -> Property
     extra = [p for p in ("Id", "Deal__c", "Status__c", "Loan_Advance_Number__c") + PERSON_FIELDS
              if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
@@ -701,31 +716,35 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
         pmeta = describe_object(inst, tok, "Property__c")
     except Exception:
         pmeta = {}
-    pcols = {col: f for col, f in MELANIE_PROPERTY_MAP.items() if f in pmeta}
+    pcols = {col: f for col, cands in MELANIE_PROPERTY_MAP.items()
+             for f in [next((f for f in _cands(cands) if _usable(pmeta.get(f))), None)] if f}
     street = [f for f in STREET_PARTS if f in pmeta]
     unavailable += [col for col in MELANIE_PROPERTY_MAP if col not in pcols] + ([] if street else ["F"])
     pfields = list(dict.fromkeys(list(pcols.values()) + street))
-    prop, key = pd.DataFrame(), None
-    if pfields and prop_ref and prop_ref in adv:              # each advance names its own property
-        prop = _soql_in(inst, tok, ",".join(["Id"] + pfields), "Property__c", "Id", adv[prop_ref])
-        key = prop_ref
-    elif pfields and "Deal__c" in pmeta and "Deal__c" in adv:  # else the deal's property, if it has only one
-        prop = _soql_in(inst, tok, ",".join(["Id", "Deal__c"] + pfields), "Property__c", "Deal__c", adv["Deal__c"])
-        if not prop.empty:
-            n = prop.groupby("Deal__c")["Id"].count()
-            out["_multi_property"] = adv["Deal__c"].map(n).fillna(0).gt(1).to_numpy()
-            prop = prop[prop["Deal__c"].map(n) == 1].drop(columns="Id").rename(columns={"Deal__c": "Id"})
-        key = "Deal__c"
-    if not prop.empty:
-        p = prop.set_index("Id")
-        ids = adv[key]
-        for col, f in pcols.items():
-            if f in p:
-                out[col] = ids.map(p[f]).to_numpy()
-                ftypes[col] = pmeta[f]["type"]
-        parts = [ids.map(p[f]).fillna("").astype(str).str.strip().to_numpy() for f in street if f in p]
-        if parts:                                              # "123" + "Main St" -> "123 Main St"; blanks skipped
-            out["F"] = [" ".join(s for s in bits if s) or None for bits in zip(*parts)]
+    link = "Advance__c" if (pmeta.get("Advance__c") or {}).get("ref") == ["Advance__c"] else None  # Property -> draw
+    match = [None] * len(adv)                                   # each advance's property record, when known
+    if pfields and prop_ref and prop_ref in adv:                # the advance names its own property
+        by_id = {r["Id"]: r for r in _soql_in(inst, tok, ",".join(["Id"] + pfields), "Property__c", "Id",
+                                              adv[prop_ref]).to_dict("records")}
+        match = [by_id.get(p) for p in adv[prop_ref]]
+    elif pfields and "Deal__c" in pmeta and "Deal__c" in adv:  # else via the Deal
+        sel = ",".join(dict.fromkeys(["Id", "Deal__c"] + ([link] if link else []) + pfields))
+        per_deal, per_draw = {}, {}
+        for r in _soql_in(inst, tok, sel, "Property__c", "Deal__c", adv["Deal__c"]).to_dict("records"):
+            per_deal.setdefault(r["Deal__c"], []).append(r)
+            if link and pd.notna(r.get(link)):
+                per_draw.setdefault(r[link], []).append(r)
+        ids = adv["Id"] if "Id" in adv else pd.Series([None] * len(adv))
+        for i, (aid, deal) in enumerate(zip(ids, adv["Deal__c"])):
+            props, hits = per_deal.get(deal, []), per_draw.get(aid, [])
+            match[i] = props[0] if len(props) == 1 else (hits[0] if len(hits) == 1 else None)
+        out["_multi_property"] = [len(per_deal.get(d, [])) > 1 and m is None for d, m in zip(adv["Deal__c"], match)]
+    for col, f in pcols.items():
+        out[col] = [m.get(f) if m else None for m in match]
+        ftypes[col] = pmeta[f]["type"]
+    if street:                                                  # "123" + "Main St" -> "123 Main St"; blanks skipped
+        out["F"] = [" ".join(str(m[f]).strip() for f in street if pd.notna(m.get(f)) and str(m[f]).strip()) or None
+                    if m else None for m in match]
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
 
