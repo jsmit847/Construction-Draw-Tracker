@@ -861,10 +861,14 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     start = _span_start(gi, nper)
     c[2].caption(f"Draws wired since {start:%b} {start.day}, {start:%Y}, grouped by {gran.lower()}.")
 
-    done = add_intervals(run_soql(inst, tok,               # <= today: a scheduled / typo'd future wire isn't funded
-        f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d} "
-        f"AND {WIRE_FIELD}<={_today():%Y-%m-%d}"))
-    flight = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
+    # The multi-period rollup only needs four fields; full detail is fetched below for the chosen period alone
+    # (pulling every field for two years of draws is what made this page slow). <= today: a scheduled or
+    # typo'd future wire isn't funded.
+    span = ",".join(f for f in ("Id", "Loan_Number__c", WIRE_FIELD, NET_FIELD) if f in sel.split(","))
+    with st.spinner("Loading draws from Salesforce…"):
+        done = run_soql(inst, tok, f"SELECT {span} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                                   f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={_today():%Y-%m-%d}")
+        flight = run_soql(inst, tok, f"SELECT Id,Status__c FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
     if done.empty:
         st.info("No completed draws in this range."); return
 
@@ -885,7 +889,14 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     # createdDate is the real request. We correct only the chosen period's draws (~hundreds, not the whole
     # multi-year span of thousands) so it loads in seconds, fetched in parallel and cached 24h.
     cfg = lg_config()
-    fg = done[done["Period"] == feat].copy()
+    per = pd.Period(feat, freq={"Monthly": "M", "Quarterly": "Q", "Yearly": "Y"}[gi])
+    p_start, p_end = per.start_time.date(), min(per.end_time.date(), _today())
+    period_where = f"{WIRE_FIELD}>={p_start:%Y-%m-%d} AND {WIRE_FIELD}<={p_end:%Y-%m-%d}"
+    with st.spinner(f"Loading {feat} draws…"):
+        fg = add_intervals(run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                                               f"AND {period_where}"))
+    if fg.empty:
+        st.info(f"No draws wired in {feat}."); return
     if cfg:
         with st.spinner(f"Loading true request dates from Land Gorilla for {feat}…"):
             fg = apply_lg_correction(fg, cfg, same_day)
@@ -980,12 +991,31 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     detail = d[cols].rename(columns=ren).sort_values("Wired", ascending=False)
     st.dataframe(detail, width="stretch", height=340)
 
-    # Build the Excel only when the user asks for it (keeps every page render fast).
-    if st.button("⬇️ Build turn-time Excel", key=f"xls_{feat}"):
-        with st.spinner("Building workbook…"):
-            xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
-        st.download_button("Download turn-time Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
-                           mime=XLSX_MIME, key=f"dl_{feat}", on_click="ignore")   # stays put after a click
+    # ---- the download: Melanie's funding-request template, filled with this period's draws ----
+    st.markdown(f"**Funding-request file — {feat}**")
+    tpl = _find_template()
+    if not tpl:
+        st.error("Template not found — commit `Advance_template.xlsx` next to draw_dashboard.py.")
+    else:
+        e = st.columns([1.4, 1])
+        who = e[0].text_input("Submitted by", key=f"pby_{feat}", placeholder="Your name")
+        fdate = e[1].date_input("Scheduled funding date", value=p_end, key=f"pdate_{feat}")
+        if st.button("⬇️ Build funding-request file", type="primary", key=f"mel_{feat}", disabled=not who.strip()):
+            with st.spinner("Filling the template…"):
+                rows, ftypes, _ = funding_request_rows(inst, tok, rt, period_where)
+                xlsx = fill_melanie_template(tpl, rows, ftypes, who.strip(), fdate)
+            st.download_button(f"Download funding-request file ({len(rows)} draws)", xlsx, mime=XLSX_MIME,
+                               file_name=f"Construction-Renovation Funding Request {feat}.xlsx",
+                               key=f"meldl_{feat}", on_click="ignore")   # stays put after a click
+        st.caption(f"Fills `{os.path.basename(tpl)}` — Melanie's workbook: same sheets, title block and 39 columns, "
+                   f"one row per draw wired in {feat}." + ("" if who.strip() else " Enter your name to build it."))
+
+    with st.expander("Turn-time analysis table (the app's own workbook — not the funding-request template)"):
+        if st.button("Build turn-time workbook", key=f"xls_{feat}"):
+            with st.spinner("Building workbook…"):
+                xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
+            st.download_button("Download turn-time workbook", xlsx, file_name=f"turn_time_analysis_{feat}.xlsx",
+                               mime=XLSX_MIME, key=f"dl_{feat}", on_click="ignore")
 
     st.caption("All timing dates come from **Land Gorilla** (request = createdDate, package complete = approvedDate) — "
                "Salesforce collapses these to the wire date, so we never use its dates for timing. The wire date, "
