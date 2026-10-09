@@ -98,6 +98,24 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _HOLS = USFederalHolidayCalendar().holidays("2018-01-01", "2032-12-31").values.astype("datetime64[D]")
 
 
+def _today() -> date:
+    """Today in the ops time zone — Streamlit Cloud's clock is UTC, a day ahead every US evening."""
+    return pd.Timestamp.now(tz="America/New_York").date()
+
+
+def _secrets(name: str) -> dict:
+    """One [section] of Streamlit secrets, or {} when there's no secrets.toml (e.g. a fresh local checkout)."""
+    try:
+        return dict(st.secrets.get(name, {}))
+    except Exception:
+        return {}
+
+
+def _txt(v) -> str:
+    """Display text for a Salesforce value: blank for None / NaN (pandas 3 strings use NaN, which is truthy)."""
+    return "" if v is None or (not isinstance(v, str) and pd.isna(v)) else str(v).strip()
+
+
 # ───────────────────────────── Salesforce OAuth ─────────────────────────────
 def install_truststore() -> None:
     try:
@@ -108,7 +126,7 @@ def install_truststore() -> None:
 
 
 def load_sf_oauth() -> dict[str, str]:
-    sec = dict(st.secrets.get("salesforce", {}))
+    sec = _secrets("salesforce")
     missing = [k for k in ("client_id", "client_secret", "redirect_uri", "auth_host") if not sec.get(k)]
     if missing:
         raise RuntimeError("Missing Salesforce OAuth secrets: " + ", ".join(missing)
@@ -223,7 +241,7 @@ def _login_failures() -> dict:
 def sf_from_credentials() -> Salesforce | None:
     """Use [salesforce] username/password from secrets if present (the no-callback path). A failed login is
        remembered for 15 minutes so every rerun doesn't retry it and lock the account; new secrets retry at once."""
-    sec = dict(st.secrets.get("salesforce", {}))
+    sec = _secrets("salesforce")
     if sec.get("username") and sec.get("password"):
         key = hashlib.sha256("\0".join(str(sec.get(k, "")) for k in
                                        ("username", "password", "security_token", "domain")).encode()).hexdigest()
@@ -429,7 +447,7 @@ def money(x) -> str:
 
 # ───────────────────────────── Land Gorilla (draw detail only) ──────────────
 def lg_config() -> dict | None:
-    sec = dict(st.secrets.get("landgorilla", {}))
+    sec = _secrets("landgorilla")
     return sec if sec.get("user") and sec.get("password") else None
 
 
@@ -797,7 +815,7 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
     wb = openpyxl.load_workbook(template)
     ws = wb[TEMPLATE_SHEET]
     _put(ws, 3, 5, _xl_text(submitted_by))                                    # E3
-    ws["E4"] = _mdy(pd.Timestamp.now(tz="America/New_York"))                 # submitted today (ET, not server UTC)
+    ws["E4"] = _mdy(_today())                                               # submitted today (ET, not server UTC)
     ws["E5"] = _mdy(funding_date)
     letters = list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"]
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
@@ -824,7 +842,7 @@ def _period_key(w: pd.Series, gran: str) -> pd.Series:
 
 
 def _span_start(gran: str, n: int) -> date:
-    today = date.today()
+    today = _today()
     if gran == "Monthly":
         return (pd.Timestamp(today).to_period("M") - (n - 1)).start_time.date()
     if gran == "Quarterly":
@@ -845,7 +863,7 @@ def render_pipeline(inst, tok, rt, sel, same_day):
 
     done = add_intervals(run_soql(inst, tok,               # <= today: a scheduled / typo'd future wire isn't funded
         f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d} "
-        f"AND {WIRE_FIELD}<={date.today():%Y-%m-%d}"))
+        f"AND {WIRE_FIELD}<={_today():%Y-%m-%d}"))
     flight = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
     if done.empty:
         st.info("No completed draws in this range."); return
@@ -853,7 +871,7 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gi)
     AMT = NET_FIELD if NET_FIELD in done else None
     periods = sorted(done["Period"].unique())
-    cur_key = _period_key(pd.Series([pd.Timestamp(date.today())]), gi).iloc[0]
+    cur_key = _period_key(pd.Series([pd.Timestamp(_today())]), gi).iloc[0]
 
     # pick the featured period FIRST (most recent complete one), so we only correct what we show
     complete = [p for p in periods if p < cur_key]
@@ -901,7 +919,7 @@ def render_pipeline(inst, tok, rt, sel, same_day):
                 help="Business days from the borrower's draw request to a complete package "
                      "(Land Gorilla createdDate → approvedDate). The borrower / inspection / title side.")
     k[3].metric("Our funding", f"{fund.mean():.1f} bd" if len(fund) else "—",
-                f"{same:.0f}% same-day" if len(fund) else None,
+                f"{same:.0f}% same-day" if len(fund) else None, delta_color="off", delta_arrow="off",
                 help="Business days from a complete package to the wire (Land Gorilla approvedDate → wire). "
                      "This is CoreVest's own funding speed once the package is in.")
 
@@ -909,10 +927,11 @@ def render_pipeline(inst, tok, rt, sel, same_day):
     if not flight.empty and "Status__c" in flight:
         holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False, na=False).sum())
     k2 = st.columns(2)
-    k2[0].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None)
+    k2[0].metric("Open draws now", f"{len(flight):,}", f"{holds} need attention" if holds else None,
+                 delta_color="off", delta_arrow="off")      # qualifiers, not trends — no green "improvement" arrow
     if len(fd2f):
         k2[1].metric("Total: request → wire", f"{fd2f.mean():.0f} bd",
-                     f"{fg['_days'].notna().mean()*100:.0f}% measured",
+                     f"{fg['_days'].notna().mean()*100:.0f}% measured", delta_color="off", delta_arrow="off",
                      help="Business days from the Land Gorilla request date to the wire. '% measured' = share of "
                           "this period's draws Land Gorilla could date; the rest are left out, not guessed.")
 
@@ -966,7 +985,7 @@ def render_pipeline(inst, tok, rt, sel, same_day):
         with st.spinner("Building workbook…"):
             xlsx = build_excel({f"By {gran.lower()}": roll.drop(columns="_raw"), f"Draws {feat}": detail})
         st.download_button("Download turn-time Excel", xlsx, file_name=f"construction_draws_{feat}.xlsx",
-                           mime=XLSX_MIME, key=f"dl_{feat}")
+                           mime=XLSX_MIME, key=f"dl_{feat}", on_click="ignore")   # stays put after a click
 
     st.caption("All timing dates come from **Land Gorilla** (request = createdDate, package complete = approvedDate) — "
                "Salesforce collapses these to the wire date, so we never use its dates for timing. The wire date, "
@@ -1089,10 +1108,9 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
 
 
 def _render_draw_sf(row: pd.Series):
-    draw_no = next((v for v in (row.get("Loan_Advance_Number__c"), row.get("Name")) if pd.notna(v) and v != ""),
-                   "draw")
+    draw_no = _txt(row.get("Loan_Advance_Number__c")) or _txt(row.get("Name")) or "draw"
     top = st.columns([2, 1, 1, 1, 1])
-    top[0].markdown(f"**Draw {draw_no}** — {row.get('Status__c','')}")
+    top[0].markdown(f"**Draw {draw_no}** — {_txt(row.get('Status__c'))}")
     if NET_FIELD in row and pd.notna(row.get(NET_FIELD)):
         top[1].metric("Funded", money(row[NET_FIELD]))
     if pd.notna(row.get("_days")):
@@ -1170,7 +1188,7 @@ def _render_lg_for_loan(cfg: dict, tmpl: str, loan_no, g: pd.DataFrame):
         if pd.isna(container) or not container:
             continue
         det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
-        sf_draw = row.get("Loan_Advance_Number__c") or row.get("Name", "")
+        sf_draw = _txt(row.get("Loan_Advance_Number__c")) or _txt(row.get("Name"))
         if not det or det.get("_error"):
             draw_rows.append({"Draw": sf_draw, "LG draw": "—", "Type": "—",
                               "Status": (det or {}).get("_error", "unavailable"),
@@ -1232,12 +1250,12 @@ def render_funding_request(inst, tok, rt):
                "draw, like the Generate File button on the Construction Advance IC Approvals page.")
     c = st.columns([1.2, 1, 1.6])
     who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name")
-    fdate = c[1].date_input("Scheduled funding date", value=date.today(), key="fr_date")
+    fdate = c[1].date_input("Scheduled funding date", value=_today(), key="fr_date")
     mode = c[2].radio("Draws", ["Open (not yet wired)", "Wired in a date range"], key="fr_mode", horizontal=True)
     if mode.startswith("Open"):
         where = OPEN_WHERE
     else:
-        rng = st.date_input("Wire dates", value=(date.today() - timedelta(days=7), date.today()), key="fr_rng")
+        rng = st.date_input("Wire dates", value=(_today() - timedelta(days=7), _today()), key="fr_rng")
         if len(rng) != 2:
             st.info("Pick a start and an end date."); return
         where = f"{WIRE_FIELD}>={rng[0]:%Y-%m-%d} AND {WIRE_FIELD}<={rng[1]:%Y-%m-%d}"
@@ -1267,7 +1285,7 @@ def render_funding_request(inst, tok, rt):
     if st.button("Build funding-request file", type="primary", disabled=rows.empty or not who.strip()):
         with st.spinner("Filling the template…"):
             xlsx = fill_melanie_template(tpl, rows, ftypes, who.strip(), fdate)
-        st.download_button("⬇️ Download funding-request file", xlsx, mime=XLSX_MIME,
+        st.download_button("⬇️ Download funding-request file", xlsx, mime=XLSX_MIME, on_click="ignore",
                            file_name=f"Construction-Renovation Funding Request "
                                      f"{fdate.month}_{fdate.day}_{fdate.year}.xlsx")
     if not who.strip():
