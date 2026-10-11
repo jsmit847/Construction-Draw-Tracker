@@ -373,88 +373,138 @@ def add_intervals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-LG_DATES_TTL = 86400   # a wired draw's LG created/approved dates don't change — keep them a day
+LG_TTL_DONE, LG_TTL_OPEN, LG_TTL_LOAN = 86400, 1800, 6 * 3600   # funded draws are settled; open ones move
 
 
 @st.cache_resource(show_spinner=False)
-def _lg_dates_store() -> dict:
-    """Process-wide {container: (fetched_at, created_iso, approved_iso)}. Only successful fetches are stored,
-       so a draw that failed (rate limit / timeout) is fetched again next time instead of staying blank."""
+def _lg_store() -> dict:
+    """Process-wide cache of successful Land Gorilla reads: {(kind, key): (fetched_at, value)}. Failures aren't
+       stored, so a draw that hit a rate limit or timeout is simply fetched again next time."""
     return {}
 
 
-def lg_draw_dates(user: str, password: str, verify: bool, containers) -> dict:
-    """{container: (created_iso, approved_iso | None)} from GET /api/clm/draw/{id}, fetched CONCURRENTLY —
-       ~635 serial calls took ~80s; parallel takes a few seconds. Repeats come from the store (no refetch)."""
+def _lg_batch(client: "LGClient", paths: dict) -> dict:
+    """GET many Land Gorilla paths CONCURRENTLY — {key: path} -> {key: json or None}. One token, one session per
+       worker thread. ~635 serial calls took ~80s; in parallel it's a few seconds."""
     from concurrent.futures import ThreadPoolExecutor
     import requests, threading
+    if not paths:
+        return {}
+    token = client.token()                              # pre-warm so threads don't race to refresh it
+    tl = threading.local()
 
-    store, now = _lg_dates_store(), time.time()
-    want = [str(c) for c in dict.fromkeys(containers) if c]
-    need = [c for c in want if not (c in store and now - store[c][0] < LG_DATES_TTL)]
+    def one(item):
+        key, path = item
+        s = getattr(tl, "s", None)
+        if s is None:
+            s = tl.s = requests.Session()
+        try:
+            r = s.get(f"{client.BASE}{path}", timeout=30, verify=client.verify,
+                      headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+            return key, (r.json() if r.ok else None)
+        except Exception:
+            return key, None
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return dict(ex.map(one, paths.items()))
+
+
+def _iso(d) -> str | None:
+    return d.isoformat() if isinstance(d, date) else None
+
+
+def lg_draws(user: str, password: str, verify: bool, containers) -> dict:
+    """{container: draw} from GET /api/clm/draw/{id}: every date on the draw (ISO), amount, requested amount,
+       payee names, status and type. Fetched in parallel; cached per draw."""
+    store, now = _lg_store(), time.time()
+    want = [str(c) for c in dict.fromkeys(containers) if isinstance(c, str) and c]
+
+    def fresh(c):
+        hit = store.get(("draw", c))
+        return hit and now - hit[0] < (LG_TTL_DONE if hit[1].get("effective") else LG_TTL_OPEN)
+
+    need = {c: f"/api/clm/draw/{c}" for c in want if not fresh(c)}
     if need:
-        client = LGClient(user, password, verify=verify)   # dedicated client for this batch
-        token = client.token()                              # pre-warm the token so threads don't race refreshing it
-        tl = threading.local()                              # one requests.Session per worker thread (thread-safe)
+        for c, payload in _lg_batch(LGClient(user, password, verify=verify), need).items():
+            det = parse_draw_detail(payload) if payload else {}
+            if det.get("created"):
+                store[("draw", c)] = (time.time(), {
+                    "created": _iso(det["created"]), "submitted": _iso(det.get("submitted")),
+                    "approved": _iso(det.get("approved")), "effective": _iso(det.get("funded")),
+                    "amount": det.get("amount"), "requested": det.get("requested_total"),
+                    "payees": [p["payee"] for p in det.get("payees") or [] if p.get("payee")],
+                    "status": det.get("status"), "type": det.get("type"), "name": det.get("name"),
+                    "dates": det.get("dates") or {}})
+    return {c: store[("draw", c)][1] for c in want if ("draw", c) in store}
 
-        def one(container):
-            s = getattr(tl, "s", None)
-            if s is None:
-                s = tl.s = requests.Session()
-            try:
-                r = s.get(f"{client.BASE}/api/clm/draw/{container}",
-                          headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                          timeout=30, verify=verify)
-                det = parse_draw_detail(r.json()) if r.ok else {}
-            except Exception:
-                det = {}
-            if not det.get("created"):
-                return container, None
-            approved = det.get("approved")                  # the complete-package point
-            return container, (time.time(), det["created"].isoformat(), approved.isoformat() if approved else None)
 
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            for container, val in ex.map(one, need):
-                if val is not None:
-                    store[container] = val
-    return {c: store[c][1:] for c in want if c in store}
+def lg_loans(user: str, password: str, verify: bool, template_id: str, loan_numbers) -> dict:
+    """{loan #: overview} for many loans at once (Land Gorilla file number rb0 + loan #): project completion,
+       funded / due dates, balance, remaining to fund, team, risk. Fetched in parallel; cached per loan."""
+    store, now = _lg_store(), time.time()
+    want = [str(n).strip() for n in dict.fromkeys(loan_numbers) if lg_filenumber(n)]
+    need = [n for n in want if not (("loan", n) in store and now - store[("loan", n)][0] < LG_TTL_LOAN)]
+    if need:
+        client = LGClient(user, password, verify=verify)
+        found = _lg_batch(client, {n: "/api/clm/loan?" + urlencode({"fileNumber": f"rb0{n}"}) for n in need})
+        ids = {n: items_of(p)[0].get("id") for n, p in found.items() if p and items_of(p)}
+        ids = {n: i for n, i in ids.items() if i}
+        tmpl = _lg_batch(client, {n: f"/api/clm/pipelineReportTemplates/{template_id}/loans/{i}" for n, i in ids.items()})
+        summ = _lg_batch(client, {n: f"/api/clm/loan/{i}" for n, i in ids.items()})
+        for n, i in ids.items():
+            ov = {"lg_loan_id": i, **(parse_template_loan(tmpl[n]) if tmpl.get(n) else {})}
+            sd = (summ.get(n) or {}).get("data", {}) if isinstance(summ.get(n), dict) else {}
+            ov.update(balance=sd.get("loanBalance"), to_finish=sd.get("balanceToFinish"),
+                      last_approved_draw=_lg_date(sd.get("lastApprovedDrawEffectiveDate")))
+            store[("loan", n)] = (time.time(), ov)
+    return {n: store[("loan", n)][1] for n in want if ("loan", n) in store}
+
+
+PKG_LAUNCH = pd.Timestamp("2026-08-03")   # Salesforce's "Date Full Draw Package Received" went live this day
+CHECK_EXCLUDED = ("Package date is after the wire date", "Package date is before the draw was requested")
 
 
 def apply_lg_correction(df: pd.DataFrame, cfg: dict | None, same_day: int) -> pd.DataFrame:
-    """Each draw's timeline, in business days:
-         request          = Land Gorilla createdDate (Salesforce's request date is collapsed onto the wire)
-         package received = Salesforce "Date Full Draw Package Received" when recorded, else LG approvedDate
-         wire             = Salesforce Wire_Date__c
-       Turn-time (package -> wire) is the official measure and needs no Land Gorilla link. Out-of-order dates
-       are left out of the averages and noted in _check instead of being guessed."""
-    if df.empty or WIRE_FIELD not in df:
+    """Each draw's timeline in business days, Land Gorilla first:
+         requested    = LG createdDate
+         wired        = LG effectiveDate (its funding date); Salesforce's wire date only when there's no LG link.
+                        Only draws Salesforce shows as wired count, so an approved-but-unfunded draw isn't "wired".
+         full package = Salesforce "Date Full Draw Package Received" — Land Gorilla has no such date (its approval
+                        is stamped on funding day). Tracked from Aug 3, 2026, and used only when requested <=
+                        package <= wired. Never filled in from the approval date.
+       Turn-time = full package -> wired. Draws whose dates don't line up are left out and named in _check."""
+    if df.empty:
         return df
     df = df.copy()
     lg = {}
     if cfg and CONTAINER_FIELD in df:
-        live = df.loc[df[CONTAINER_FIELD].notna() & df[WIRE_FIELD].notna(), CONTAINER_FIELD]
         try:
-            lg = lg_draw_dates(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), live.tolist())
+            lg = lg_draws(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), df[CONTAINER_FIELD].tolist())
         except Exception as exc:      # no exception text: a malformed secret would be echoed to every viewer
-            st.warning(f"Land Gorilla is unavailable right now ({type(exc).__name__}) — request dates are blank.")
-    cont = df[CONTAINER_FIELD] if CONTAINER_FIELD in df else pd.Series(None, index=df.index)
-    got = cont.map(lambda c: lg.get(str(c)) if pd.notna(c) else None)
-    created = got.map(lambda t: t[0] if t else None)
-    approved = got.map(lambda t: t[1] if t else None)
-    wire = df[WIRE_FIELD]
-    sf_pkg = pd.to_datetime(df[PKG_FIELD], errors="coerce") if PKG_FIELD in df else pd.Series(pd.NaT, index=df.index)
-    pkg = sf_pkg.dt.strftime("%Y-%m-%d").where(sf_pkg.notna(), approved)
-    c, p, w = (pd.to_datetime(s, errors="coerce").dt.normalize() for s in (created, pkg, wire))
+            st.warning(f"Land Gorilla is unavailable right now ({type(exc).__name__}) — timing is incomplete.")
+    info = _col(df, CONTAINER_FIELD).map(lambda c: lg.get(c) if isinstance(c, str) else None)
+    created, approved, effective = (info.map(lambda d, k=k: d.get(k) if d else None)
+                                    for k in ("created", "approved", "effective"))
+    sf_wire = _col(df, WIRE_FIELD)
+    lg_wire = effective.where(effective.notna(), approved)
+    wire = lg_wire.where(lg_wire.notna(), sf_wire).where(sf_wire.notna())
+    c, w = (pd.to_datetime(s, errors="coerce").dt.normalize() for s in (created, wire))
+    raw = pd.to_datetime(_col(df, PKG_FIELD), errors="coerce").dt.normalize()
+    ok = raw.notna() & (raw >= PKG_LAUNCH) & (raw <= w) & (c.isna() | (c <= raw))
+    pkg = raw.where(ok)
 
-    df["_lg_req"], df["_lg_pkg"], df["_pkg"] = created, approved, pkg
-    df["_days"] = bdays(created, wire, same_day)                       # request -> wire
-    df["_days_src"] = np.where(df["_days"].notna(), "Land Gorilla", "")
-    df["_fund_bd"] = bdays(pkg, wire, same_day).where(p <= w)          # turn-time: package received -> wire
-    df["_wait_bd"] = bdays(created, pkg, 0).where((c <= p) & (p <= w))  # request -> package (borrower side)
+    df["_lg_req"], df["_lg_appr"], df["_wire"], df["_pkg"] = created, approved, w, pkg
+    df["_lg_pkg"] = approved                                           # kept for older callers
+    df["_days"] = bdays(created, w, same_day)                          # request -> wired (per draw / account)
+    df["_days_src"] = np.where(c.notna(), "Land Gorilla", "")
+    df["_fund_bd"] = bdays(pkg, w, same_day)                           # turn-time: full package -> wired
+    df["_wait_bd"] = bdays(created, pkg, 0)                            # getting to a full package (account view)
     check = pd.Series(None, index=df.index, dtype=object)
-    check[p.notna() & w.notna() & (p > w)] = "Package date is after the wire date"
-    check[c.notna() & p.notna() & (c > p)] = "Package date is before the draw was requested"
-    check[w.notna() & p.isna()] = "No package-received date"
+    live = raw.notna() & (raw >= PKG_LAUNCH)                          # order checks only apply to real values
+    check[raw.notna() & (raw < PKG_LAUNCH)] = "Package date predates the field (before Aug 3, 2026) — ignored"
+    check[live & w.notna() & (raw > w)] = CHECK_EXCLUDED[0]
+    check[live & c.notna() & (raw < c)] = CHECK_EXCLUDED[1]
+    check[w.notna() & (w >= PKG_LAUNCH) & raw.isna()] = "No package-received date"
     df["_check"] = check
     return df
 
@@ -543,24 +593,6 @@ def parse_draw_detail(payload: dict) -> dict:
     }
 
 
-@st.cache_resource(show_spinner=False)
-def get_lg_client(user: str, password: str, verify: bool):
-    return LGClient(user, password, verify=verify)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def lg_draw_detail(user: str, password: str, verify: bool, draw_id: str) -> dict | None:
-    """Fetch + parse one draw's detail; returns an _error dict if gated/unavailable (degrades gracefully)."""
-    try:
-        cli = get_lg_client(user, password, verify)
-        r = cli.get(f"/api/clm/draw/{draw_id}")
-        if not r.ok:
-            return {"_error": f"HTTP {r.status_code}"}
-        return parse_draw_detail(r.json())
-    except Exception as exc:
-        return {"_error": f"unavailable ({type(exc).__name__})"}
-
-
 def items_of(payload: Any) -> list:
     d = payload.get("data", payload) if isinstance(payload, dict) else payload
     if isinstance(d, dict):
@@ -591,32 +623,6 @@ def parse_template_loan(payload: dict) -> dict:
         "status": ((f.get("loanStatus") or [{}])[0].get("status") if f.get("loanStatus") else None),
         "users": [u.strip() for u in (f.get("systemUsers") or []) if str(u).strip()],
     }
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def lg_loan_overview(user: str, password: str, verify: bool, template_id: str, loan_no: str) -> dict:
-    """Resolve the LG loan by file number (rb0+loan#), then pull template progress + summary balances."""
-    try:
-        cli = get_lg_client(user, password, verify)
-        fn = f"rb0{loan_no}"
-        r = cli.get("/api/clm/loan", fileNumber=fn)
-        items = items_of(r.json()) if r.ok else []
-        if not items:
-            return {"_error": f"no Land Gorilla loan for {fn}"}
-        lid = items[0]["id"]
-        out: dict[str, Any] = {"lg_loan_id": lid, "file_number": fn}
-        t = cli.get(f"/api/clm/pipelineReportTemplates/{template_id}/loans/{lid}")
-        if t.ok:
-            out.update(parse_template_loan(t.json()))
-        s = cli.get(f"/api/clm/loan/{lid}")
-        if s.ok:
-            sd = (s.json() or {}).get("data", {})
-            out["balance"] = sd.get("loanBalance")
-            out["to_finish"] = sd.get("balanceToFinish")
-            out["last_approved_draw"] = _lg_date(sd.get("lastApprovedDrawEffectiveDate"))
-        return out
-    except Exception as exc:
-        return {"_error": type(exc).__name__}
 
 
 # ───────────────────────────── Excel export ─────────────────────────────────
@@ -742,24 +748,25 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     """Advances in scope, one row each, keyed by template column letter (plus the filter fields).
        Returns (rows, {column letter: Salesforce type}, [template columns this org can't fill])."""
     adv_meta = describe_object(inst, tok, "Advance__c")
-    cols, ftypes = {}, {}
+    cols, ftypes = {}, {}                  # every candidate that exists; each row takes the first that has a value
     for col, cands in MELANIE_MAP.items():
         for path in _cands(cands):
             meta = resolve_path(inst, tok, "Advance__c", path)
             if _usable(meta):
-                cols[col], ftypes[col] = path, meta["type"]
-                break
+                cols.setdefault(col, []).append(path)
+                ftypes.setdefault(col, meta["type"])
     unavailable = [col for col in MELANIE_MAP if col not in cols]
     prop_ref = next((f for f, m in adv_meta.items() if m["ref"] == ["Property__c"]), None)  # Advance -> Property
-    extra = [p for p in ("Id", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD) + PERSON_FIELDS
-             if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
-    adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(extra + list(cols.values())))} FROM Advance__c "
+    extra = [p for p in ("Id", "Name", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD, CONTAINER_FIELD)
+             + PERSON_FIELDS if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
+    paths = [p for ps in cols.values() for p in ps]
+    adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(extra + paths))} FROM Advance__c "
                               f"WHERE RecordTypeId='{rt}' AND {where} ORDER BY Loan_Number__c")
     if adv.empty:
         return adv, ftypes, unavailable
     out = adv[[c for c in extra if c in adv]].copy()
-    for col, path in cols.items():
-        out[col] = adv[path] if path in adv else None
+    for col, ps in cols.items():
+        out[col] = _first_filled(adv, ps)
     out["_multi_property"] = False
 
     # Property columns — validated field by field, so one missing field can't blank the rest.
@@ -767,11 +774,11 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
         pmeta = describe_object(inst, tok, "Property__c")
     except Exception:
         pmeta = {}
-    pcols = {col: f for col, cands in MELANIE_PROPERTY_MAP.items()
-             for f in [next((f for f in _cands(cands) if _usable(pmeta.get(f))), None)] if f}
+    pcols = {col: [f for f in _cands(cands) if _usable(pmeta.get(f))] for col, cands in MELANIE_PROPERTY_MAP.items()}
+    pcols = {col: fs for col, fs in pcols.items() if fs}
     street = [f for f in STREET_PARTS if f in pmeta]
     unavailable += [col for col in MELANIE_PROPERTY_MAP if col not in pcols] + ([] if street else ["F"])
-    pfields = list(dict.fromkeys(list(pcols.values()) + street))
+    pfields = list(dict.fromkeys([f for fs in pcols.values() for f in fs] + street + (["Name"] if "Name" in pmeta else [])))
     link = "Advance__c" if (pmeta.get("Advance__c") or {}).get("ref") == ["Advance__c"] else None  # Property -> draw
     match = [None] * len(adv)                                   # each advance's property record, when known
     if pfields and prop_ref and prop_ref in adv:                # the advance names its own property
@@ -785,18 +792,45 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
             per_deal.setdefault(r["Deal__c"], []).append(r)
             if link and pd.notna(r.get(link)):
                 per_draw.setdefault(r[link], []).append(r)
-        ids = adv["Id"] if "Id" in adv else pd.Series([None] * len(adv))
-        for i, (aid, deal) in enumerate(zip(ids, adv["Deal__c"])):
+        ids, names = _col(adv, "Id"), _col(adv, "Name")
+        for i, (aid, deal, name) in enumerate(zip(ids, adv["Deal__c"], names)):
             props, hits = per_deal.get(deal, []), per_draw.get(aid, [])
-            match[i] = props[0] if len(props) == 1 else (hits[0] if len(hits) == 1 else None)
+            if len(props) == 1:
+                match[i] = props[0]
+            elif len(hits) == 1:                                # the one property pointing at this draw
+                match[i] = hits[0]
+            else:                                               # the draw is named for its property's address
+                key = _addr_key(name)
+                same = [p for p in props if key and key in (_addr_key(p.get("Name")), _addr_key(
+                    " ".join(_txt(p.get(f)) for f in street)))]
+                match[i] = same[0] if len(same) == 1 else None
         out["_multi_property"] = [len(per_deal.get(d, [])) > 1 and m is None for d, m in zip(adv["Deal__c"], match)]
-    for col, f in pcols.items():
-        out[col] = [m.get(f) if m else None for m in match]
-        ftypes[col] = pmeta[f]["type"]
-    if street:                                                  # "123" + "Main St" -> "123 Main St"; blanks skipped
-        out["F"] = [" ".join(str(m[f]).strip() for f in street if pd.notna(m.get(f)) and str(m[f]).strip()) or None
-                    if m else None for m in match]
+    for col, fs in pcols.items():
+        out[col] = [next((m.get(f) for f in fs if m and _txt(m.get(f))), None) for m in match]
+        ftypes[col] = pmeta[fs[0]]["type"]
+    street_txt = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) if m else "" for m in match]
+    names = _col(adv, "Name")                                   # unmatched portfolio rows still get their street
+    out["F"] = [s or (_txt(n) if _addr_key(n) else None) for s, n in zip(street_txt, names)]
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
+
+
+def _first_filled(df: pd.DataFrame, paths: list) -> list:
+    """Per row, the first of these columns that has a value (blank strings don't count)."""
+    cols = [df[p] for p in paths if p in df]
+    return [next((v for v in vals if _txt(v)), None) for vals in zip(*cols)] if cols else [None] * len(df)
+
+
+_DIRECTIONS = {"n", "s", "e", "w", "north", "south", "east", "west", "ne", "nw", "se", "sw"}
+
+
+def _addr_key(s) -> tuple | None:
+    """'2902 East McLoughlin Blvd, Vancouver' -> ('2902', 'mcloughlin'): street number + first street word, so a
+       draw named for its property's address can be matched to that property."""
+    words = re.findall(r"[a-z0-9]+", _txt(s).lower())
+    if len(words) < 2 or not re.fullmatch(r"\d+[a-z]?", words[0]):
+        return None
+    rest = [w for w in words[1:] if w not in _DIRECTIONS] or words[1:]
+    return words[0], rest[0]
 
 
 def _mdy(d) -> str:
@@ -816,7 +850,7 @@ def _xl(v, sftype: str | None):
             return None
     if sftype in ("date", "datetime"):
         d = pd.to_datetime(v, errors="coerce")
-        return _mdy(d) if pd.notna(d) else v
+        return d.date() if pd.notna(d) else v              # a real Excel date (shown m/d/yyyy)
     if sftype == "percent":
         return float(v) / 100
     if sftype == "boolean":
@@ -908,11 +942,83 @@ def _write_total_summary(wb, summary: dict) -> None:
         r += 8
 
 
+LG_COLUMNS = ("U", "AG", "M", "N", "Y", "AB", "W")       # columns Land Gorilla fills first
+
+
+def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
+               loans: bool = True) -> tuple[pd.DataFrame, dict, dict]:
+    """Land Gorilla first: each draw's amount and payees, and each loan's funded date, current due date, project
+       completion, balance and remaining to fund. Salesforce stays only where Land Gorilla has nothing.
+       Returns (rows, ftypes, {"draws": {...}, "loans": {...}}) — the raw LG data feeds the prep worksheet."""
+    lg = {"draws": {}, "loans": {}}
+    if rows.empty or not cfg:
+        return rows, ftypes, lg
+    rows, ftypes = rows.copy(), dict(ftypes)
+    u, p, v = cfg["user"], cfg["password"], bool(cfg.get("verify", True))
+    try:
+        lg["draws"] = lg_draws(u, p, v, _col(rows, CONTAINER_FIELD).tolist())
+        if loans:
+            lg["loans"] = lg_loans(u, p, v, str(cfg.get("template_id", LG_TEMPLATE_ID_DEFAULT)),
+                                   _col(rows, "B").tolist())
+    except Exception as exc:          # no exception text: a malformed secret would be echoed to every viewer
+        st.warning(f"Land Gorilla is unavailable right now ({type(exc).__name__}) — using Salesforce values only.")
+        return rows, ftypes, lg
+    dr = _col(rows, CONTAINER_FIELD).map(lambda c: lg["draws"].get(c) if isinstance(c, str) else None)
+    lo = _col(rows, "B").map(lambda n: lg["loans"].get(_txt(n)) if _txt(n) else None)
+    payees = dr.map(lambda d: "; ".join(d["payees"]) if d and d.get("payees") else None)
+    for col, src, key, ftype in (("U", dr, "amount", "currency"), ("M", lo, "funded_date", "date"),
+                                 ("N", lo, "due_date", "date"), ("Y", lo, "project_pct", "percent"),
+                                 ("AB", lo, "balance", "currency"), ("W", lo, "to_finish", "currency")):
+        got = src.map(lambda d: d.get(key) if d else None)
+        rows[col] = [a if _txt(a) else b for a, b in zip(got, _col(rows, col))]
+        if got.map(lambda x: _txt(x) != "").any():
+            ftypes[col] = ftype
+    rows["AG"] = payees.tolist()
+    ftypes["AG"] = "string"
+    return rows, ftypes, lg
+
+
+def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None) -> pd.DataFrame:
+    """One line per row of the request with everything at hand for finishing it by hand: Land Gorilla's draw and
+       loan details, the team on the loan, approvals and notes."""
+    dr = _col(rows, CONTAINER_FIELD).map(lambda c: lg["draws"].get(c) if isinstance(c, str) else None)
+    lo = _col(rows, "B").map(lambda n: lg["loans"].get(_txt(n)) if _txt(n) else None)
+    g = lambda s, k: s.map(lambda d: d.get(k) if d else None)            # noqa: E731
+    ids = _col(rows, "Id")
+    t = pd.DataFrame({
+        "Row": range(TEMPLATE_HEADER_ROW + 1, TEMPLATE_HEADER_ROW + 1 + len(rows)),
+        "CV Loan #": _col(rows, "B").values, "Draw #": _col(rows, "Loan_Advance_Number__c").values,
+        "Draw / property": _col(rows, "Name").values, "Deal": _col(rows, "C").values,
+        "Status": _col(rows, "Status__c").values, "Coordinator": _col(rows, "Advance_Coordinator__r.Name").values,
+        "Draw amount ($)": pd.to_numeric(g(dr, "amount"), errors="coerce").values,
+        "Requested amount ($)": pd.to_numeric(g(dr, "requested"), errors="coerce").values,
+        "Paid to": dr.map(lambda d: "; ".join(d["payees"]) if d and d.get("payees") else None).values,
+        "Draw type": g(dr, "type").values, "Requested": _dates(g(dr, "created")).values,
+        "Approved / funded": _dates(g(dr, "effective")).values,
+        "Project complete %": (pd.to_numeric(g(lo, "project_pct"), errors="coerce") / 100).values,
+        "Term elapsed %": (pd.to_numeric(g(lo, "duration_pct"), errors="coerce") / 100).values,
+        "Remaining to fund ($)": pd.to_numeric(g(lo, "to_finish"), errors="coerce").values,
+        "Loan balance ($)": pd.to_numeric(g(lo, "balance"), errors="coerce").values,
+        "Loan funded": _dates(g(lo, "funded_date")).values, "Current due date": _dates(g(lo, "due_date")).values,
+        "Original due date": _dates(g(lo, "original_due")).values, "Program": g(lo, "program").values,
+        "Team on the loan": lo.map(lambda d: ", ".join(d.get("users") or []) if d else None).values,
+        "Risk flags": lo.map(lambda d: ", ".join(d.get("risk") or []) if d else None).values,
+        "Property matched": ["No — portfolio loan" if bool(m) else "" for m in _col(rows, "_multi_property")],
+    })
+    if ap is not None and not ap.empty:
+        for c in ("Approved by", "Approved on", "Approval comments"):
+            t[c] = ids.map(ap[c]).values if c in ap else None
+        t["Approved on"] = _dates(t["Approved on"])
+    t["Notes"] = _col(rows, "AF").values
+    return t
+
+
 def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submitted_by: str,
-                          funding_date: date, summary: dict | None = None) -> bytes:
+                          funding_date: date, summary: dict | None = None, prep: pd.DataFrame | None = None) -> bytes:
     """Open the committed template, fill the title block, and write one row per draw in its own column order.
        The other sheets are brought up to date too: Total Summary from Salesforce, the Cap Partners title
-       blocks from this request, and the template's stale hidden reference sheet removed."""
+       blocks from this request, the template's stale hidden reference sheet removed, and a Prep worksheet
+       added with everything needed to finish the columns no system holds."""
     import openpyxl
     from openpyxl.utils import column_index_from_string as ci
     wb = openpyxl.load_workbook(template)
@@ -922,25 +1028,82 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         if name in wb.sheetnames:
             wb[name]["D4"] = f"='{TEMPLATE_SHEET}'!E4"
             wb[name]["D5"] = f"='{TEMPLATE_SHEET}'!E5"
+            wb[name]["D4"].number_format = wb[name]["D5"].number_format = "m/d/yyyy"
     if "Sheet1" in wb.sheetnames:                                            # March-2024 servicer data, unused
         del wb["Sheet1"]
     if summary:
         _write_total_summary(wb, summary)
-    ws["E4"] = _mdy(_today())                                               # submitted today (ET, not server UTC)
-    ws["E5"] = _mdy(funding_date)
-    letters = list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"]
+    ws["E4"], ws["E5"] = _today(), funding_date                              # real dates (today in ET)
+    ws["E4"].number_format = ws["E5"].number_format = "m/d/yyyy"
+    letters = list(dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS)))
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
         for col in letters:
             v = _xl(row.get(col), ftypes.get(col))
             if v is not None:
                 _put(ws, r, ci(col), v)
+                if isinstance(v, date):
+                    ws.cell(r, ci(col)).number_format = "m/d/yyyy"
+        ws.cell(r, ci("Z")).value = 1                                        # Borrower EC % — 100%, as Salesforce's file
         if bool(row.get("_multi_property", False)):
-            ws.cell(r, ci("A")).value = "Multi-property deal: property columns left blank, see Salesforce"
+            ws.cell(r, ci("A")).value = "Portfolio loan — couldn't match this draw to one property"
         for col, pattern in MELANIE_FORMULAS.items():     # every input filled and non-zero (no #DIV/0!)
             if all(ws.cell(r, ci(c)).value not in (None, "", 0) for c in re.findall(r"([A-Z]+)\{r\}", pattern)):
                 ws.cell(r, ci(col)).value = pattern.format(r=r)
+    if prep is not None and not prep.empty:
+        _write_prep_sheet(wb, prep)
     buf = io.BytesIO(); wb.save(buf)
     return buf.getvalue()
+
+
+def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
+    """Append the Prep worksheet: a formatted helper table (header band, filters, frozen header)."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet("Prep worksheet")
+    head, band = Font(name="Calibri", size=10, bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F3864")
+    for j, col in enumerate(prep.columns, 1):
+        c = ws.cell(1, j, col)
+        c.font, c.fill = head, band
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for i, (_, row) in enumerate(prep.iterrows(), 2):
+        for j, (col, v) in enumerate(row.items(), 1):
+            try:
+                if v is None or pd.isna(v):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            if isinstance(v, datetime):
+                v = v.date()
+            if isinstance(v, np.generic):
+                v = v.item()
+            _put(ws, i, j, _xl_text(v) if isinstance(v, str) else v)
+            cell = ws.cell(i, j)
+            cell.font = Font(name="Calibri", size=10)
+            if isinstance(v, date):
+                cell.number_format = "m/d/yyyy"
+            elif col.endswith("($)"):
+                cell.number_format = '"$"#,##0'
+            elif col.endswith("%"):
+                cell.number_format = "0%"
+            if col in ("Notes", "Approval comments"):
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for j, col in enumerate(prep.columns, 1):
+        width = 48 if col in ("Notes", "Approval comments") else max(10, min(32, len(col) + 4))
+        ws.column_dimensions[get_column_letter(j)].width = width
+    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = "C2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(prep.columns))}{len(prep) + 1}"
+
+
+def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFrame, ftypes: dict,
+                       submitted_by: str, funding_date: date) -> tuple[bytes, int]:
+    """Everything that goes into one funding-request workbook: Land Gorilla first, Salesforce to fill gaps,
+       the summary sheet, and the prep worksheet. Returns (xlsx bytes, number of draws)."""
+    rows, ftypes, lg = lg_overlay(rows, ftypes, lg_config())
+    ap = approvals_for(inst, tok, tuple(_col(rows, "Id").dropna()))
+    xlsx = fill_melanie_template(tpl, rows, ftypes, submitted_by, funding_date,
+                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap))
+    return xlsx, len(rows)
 
 
 # ───────────────────────────── approvals ────────────────────────────────────
@@ -1019,6 +1182,19 @@ def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
     return pd.DataFrame.from_dict(out, orient="index").reindex(columns=APPROVAL_COLS)
 
 
+# ───────────────────────────── delay reasons ────────────────────────────────
+# What the notes (and approval comments) say held a draw up. Plain-English label -> pattern; matched with
+# re.IGNORECASE. A draw can have several. Patterns are conservative: a missed reason beats a wrong one.
+DELAY_REASONS: dict = {}   # label -> regex; empty until the note rules are validated on real notes
+_DELAY_RX = {label: re.compile(rx, re.IGNORECASE) for label, rx in DELAY_REASONS.items()}
+
+
+def delay_labels(*texts) -> list:
+    """The delay reasons mentioned in a draw's notes / approval comments, in DELAY_REASONS order."""
+    blob = "\n".join(_txt(t) for t in texts if _txt(t))
+    return [label for label, rx in _DELAY_RX.items() if blob and rx.search(blob)]
+
+
 # ───────────────────────────── display helpers ──────────────────────────────
 def _bd(x) -> str:
     """Business days for display: a decimal only where it says something (0.4 bd), whole numbers from 10 up."""
@@ -1050,19 +1226,18 @@ def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> p
     ids = _col(d, "Id")
     t = pd.DataFrame({
         "Loan #": _col(d, "Loan_Number__c"), "Draw #": _col(d, "Loan_Advance_Number__c"),
-        "Deal": _col(d, "Deal__r.Name"), "Borrower": _col(d, "Borrower_Name_Text__c"), "Status": _col(d, "Status__c"),
-        "Requested": _dates(_col(d, "_lg_req")), "Package received": _dates(_col(d, "_pkg")),
-        "Wired": _dates(_col(d, WIRE_FIELD)),
+        "Property": _col(d, "Name"), "Deal": _col(d, "Deal__r.Name"), "Borrower": _col(d, "Borrower_Name_Text__c"),
+        "Status": _col(d, "Status__c"), "Requested": _dates(_col(d, "_lg_req")),
+        "Package received": _dates(_col(d, "_pkg")), "Wired": _dates(_col(d, "_wire")),
         "Turn-time (bd)": pd.to_numeric(_col(d, "_fund_bd"), errors="coerce"),
-        "Borrower side (bd)": pd.to_numeric(_col(d, "_wait_bd"), errors="coerce"),
-        "Request → wire (bd)": pd.to_numeric(_col(d, "_days"), errors="coerce"),
         "Funded ($)": pd.to_numeric(_col(d, NET_FIELD), errors="coerce"),
     })
     for c in ("Approved by", "Approved on", "Approval comments"):
         t[c] = ids.map(ap[c]) if ap is not None and c in ap else None
     t["Approved on"] = _dates(t["Approved on"])
+    if DELAY_REASONS:
+        t["Delay reasons"] = [delay_labels(n, a) for n, a in zip(_col(d, NOTES_FIELD), t["Approval comments"])]
     t["Coordinator"] = _col(d, "Advance_Coordinator__r.Name")
-    t["Last updated by"] = _col(d, "LastModifiedBy.Name")
     t["Notes"] = _col(d, NOTES_FIELD)
     t["Salesforce"] = ids.map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None)
     return t
@@ -1077,11 +1252,12 @@ def _table_config() -> dict:
         "Wired": C.DateColumn(format="M/D/YYYY"),
         "Turn-time (bd)": C.NumberColumn("Turn-time", format="%d bd",
                                          help="Business days from full draw package received to wire"),
-        "Borrower side (bd)": C.NumberColumn("Borrower side", format="%d bd",
-                                             help="Business days from the request to a full package"),
+        "Days to a full package (bd)": C.NumberColumn("Days to a full package", format="%d bd",
+                                                      help="Business days from the request to a full package"),
         "Request → wire (bd)": C.NumberColumn("Request → wire", format="%d bd"),
         "Funded ($)": C.NumberColumn("Funded", format="dollar", step=1),
         "Approved on": C.DateColumn(format="M/D/YYYY"),
+        "Delay reasons": C.ListColumn(help="What the notes and approval comments say held the draw up"),
         "Approval comments": C.TextColumn(width="large"),
         "Notes": C.TextColumn(width="large"),
         "Salesforce": C.LinkColumn(display_text="Open", width="small"),
@@ -1089,11 +1265,19 @@ def _table_config() -> dict:
 
 
 def _excel_table(fg: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
-    """The turn-time data dump: every column in the table plus the Salesforce milestone dates in between."""
+    """The turn-time data dump: every column in the table plus the milestone dates and the borrower-side numbers
+       (kept out of the overview, but useful in a pivot by account)."""
     x = table.drop(columns=["Salesforce"]).copy()
+    if "Delay reasons" in x:
+        x["Delay reasons"] = x["Delay reasons"].map(lambda r: ", ".join(r) if r else None)
     pos = x.columns.get_loc("Package received")
     for i, (label, field) in enumerate(MILESTONES[1:-2]):    # inspection ordered … internal review complete
         x.insert(pos + i, label, _dates(_col(fg, field)))
+    x.insert(x.columns.get_loc("Turn-time (bd)") + 1, "Days to a full package (bd)",
+             pd.to_numeric(_col(fg, "_wait_bd"), errors="coerce"))
+    x.insert(x.columns.get_loc("Days to a full package (bd)") + 1, "Request → wire (bd)",
+             pd.to_numeric(_col(fg, "_days"), errors="coerce"))
+    x.insert(x.columns.get_loc("Borrower") + 1, "Account", _col(fg, "Deal__r.Account.Name"))
     return x
 
 
@@ -1115,16 +1299,26 @@ def _span_start(gran: str, n: int) -> date:
     return date(today.year - (n - 1), 1, 1)
 
 
+def _turn_stats(fg: pd.DataFrame, same_day: int) -> dict:
+    """The package-received -> wire numbers for a set of draws, plus how many could be measured."""
+    turn = fg["_fund_bd"].dropna()
+    eligible = int((pd.to_datetime(fg["_wire"], errors="coerce") >= PKG_LAUNCH).sum())
+    return {"turn": turn, "n": len(turn), "eligible": eligible,
+            "coverage": len(turn) / eligible * 100 if eligible else None,
+            "same": (turn == same_day).mean() * 100 if len(turn) else None,
+            "fast": (turn <= 3 + same_day).mean() * 100 if len(turn) else None}
+
+
 def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     st.header("Draw turn-time")
-    st.caption("How long construction draws take, and where the time goes. All figures are business days.")
+    st.caption("How fast a draw is wired once the borrower's full draw package is in. All figures are business days.")
     if links:                                   # the other two pages, one click away
         lk = st.columns([1, 1, 4])
         lk[0].page_link(links[0], label="Find a draw", icon=":material/search:")
         lk[1].page_link(links[1], label="Funding request", icon=":material/request_quote:")
     c = st.columns([2, 1.3, 1.4])
-    gran = c[0].segmented_control("View by", ["Month", "Quarter", "Year", "Date range"], default="Quarter",
-                                  key="ov_gran") or "Quarter"
+    gran = c[0].segmented_control("View by", ["Month", "Quarter", "Year", "Date range"], default="Month",
+                                  key="ov_gran") or "Month"
     if gran == "Date range":
         rng = c[1].date_input("Wire dates", value=(_today() - timedelta(days=30), _today()), key="ov_rng")
         if len(rng) != 2:
@@ -1133,7 +1327,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     else:
         gi = {"Month": "Monthly", "Quarter": "Quarterly", "Year": "Yearly"}[gran]
         opts = {"Month": [6, 12, 24], "Quarter": [4, 8, 12], "Year": [3, 5]}[gran]
-        nper = c[1].selectbox("How many", opts, index=1 if gran != "Year" else 0, key=f"ov_n_{gran}")
+        nper = c[1].selectbox("How many", opts, index=0 if gran == "Month" else 1 if gran == "Quarter" else 0,
+                              key=f"ov_n_{gran}")
         start, end = _span_start(gi, nper), _today()
 
     # The rollup only needs four fields; full detail is fetched for the period being summarised alone.
@@ -1167,43 +1362,37 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     if fg.empty:
         st.info(f"No draws were wired in {feat}."); return
 
-    turn, wait, total = fg["_fund_bd"].dropna(), fg["_wait_bd"].dropna(), fg["_days"].dropna()
+    s = _turn_stats(fg, same_day)
     funded = pd.to_numeric(fg.get(AMT), errors="coerce").sum() if AMT else None
-    same = (turn == same_day).mean() * 100 if len(turn) else None
-    fast = (turn <= 3 + same_day).mean() * 100 if len(turn) else None
-    issues = int(fg["_check"].isin(["Package date is after the wire date",
-                                    "Package date is before the draw was requested"]).sum())
     holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False,
                                                               na=False).sum()) if "Status__c" in flight else 0
-
     k = st.columns(4)
-    k[0].metric("Turn-time · package → wire", _bd(turn.mean()) if len(turn) else "—",
-                f"{same:.0f}% same day" if same is not None else None, delta_color="off", delta_arrow="off",
-                border=True, help="Average business days from a full draw package received to the wire — "
-                                  "the official turn-time.")
-    k[1].metric("Borrower side · request → package", _bd(wait.mean()) if len(wait) else "—", border=True,
-                help="Average business days from the borrower's request to a full package: inspections, "
-                     "title, missing documents and other conditions.")
-    k[2].metric("Request → wire", _bd(total.mean()) if len(total) else "—", border=True,
-                help="Average business days from the borrower's request to the wire.")
-    k[3].metric(f"Draws funded · {feat}", f"{len(fg):,}", money(funded) if funded is not None else None,
-                delta_color="off", delta_arrow="off", border=True)
+    if s["eligible"]:
+        k[0].metric("Turn-time · full package → wire", _bd(s["turn"].mean()) if s["n"] else "—",
+                    f"{s['same']:.0f}% same day" if s["same"] is not None else None, delta_color="off",
+                    delta_arrow="off", border=True,
+                    help="Average business days from the full draw package being received to the wire.")
+        k[1].metric("Funded within 3 days of a full package", f"{s['fast']:.0f}%" if s["fast"] is not None else "—",
+                    border=True)
+        k[2].metric("Median turn-time", _bd(s["turn"].median()) if s["n"] else "—", border=True)
+        k[3].metric("Measured on", f"{s['n']:,} of {s['eligible']:,} draws",
+                    f"{s['coverage']:.0f}% have a package date" if s["coverage"] is not None else None,
+                    delta_color="off", delta_arrow="off", border=True,
+                    help="Draws wired since Aug 3, 2026 that have a full-package date in the right order. "
+                         "See the Package date check tab.")
+    else:
+        st.info("Turn-time starts with draws wired on or after **Aug 3, 2026**, when the *Full Draw Package "
+                "Received* date began being recorded. Pick a period from August 2026 on.", icon=":material/info:")
     k2 = st.columns(4)
-    k2[0].metric("Funded within 3 days of a full package", f"{fast:.0f}%" if fast is not None else "—",
-                 border=True, help="Share of draws wired within 3 business days of the full package.")
-    k2[1].metric("Package received on file", f"{fg['_pkg'].notna().mean() * 100:.0f}%",
-                 f"{issues} to check" if issues else None, delta_color="off", delta_arrow="off", border=True,
-                 help="Share of these draws with a full-draw-package-received date — what turn-time is measured "
-                      "from. 'To check' = dates out of order, left out of the averages.")
-    k2[2].metric("Median turn-time", _bd(turn.median()) if len(turn) else "—", border=True)
-    k2[3].metric("Open draws now", f"{len(flight):,}", f"{holds} on hold or waiting" if holds else None,
+    k2[0].metric(f"Draws funded · {feat}", f"{len(fg):,}", money(funded) if funded is not None else None,
                  delta_color="off", delta_arrow="off", border=True)
-    if len(turn) and len(wait):
-        st.caption(f"In **{feat}**, a full package was wired in **{_bd(turn.mean())}** on average"
-                   + (f" ({same:.0f}% the same day)" if same else "") + f"; getting to a full package took "
-                   f"borrowers **{_bd(wait.mean())}**.")
-    if not cfg:
-        st.info("Request dates aren't available right now, so only package → wire timing is shown.")
+    k2[1].metric("Open draws now", f"{len(flight):,}", f"{holds} on hold or waiting" if holds else None,
+                 delta_color="off", delta_arrow="off", border=True)
+    if s["n"]:
+        st.caption(f"In **{feat}**, once a full draw package was in, draws were wired in **{_bd(s['turn'].mean())}** "
+                   f"on average" + (f" — **{s['same']:.0f}% the same day**" if s["same"] else "") + ".")
+
+    _period_funding_file(inst, tok, rt, feat, period_where, p_end)      # the template, right where it's needed
 
     rows = []
     for p in periods:
@@ -1216,8 +1405,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     ap = approvals_for(inst, tok, tuple(_col(fg, "Id").dropna()))
     table = _draw_table(fg, inst, ap)
 
-    t_sum, t_draws, t_dl = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
-                                    ":material/download: Download"])
+    t_sum, t_draws, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
+                                       ":material/fact_check: Package date check"])
     with t_sum:
         left, right = st.columns([1, 1.3])
         with left:
@@ -1230,62 +1419,124 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
             _render_charts(roll, fg, feat, same_day)
         with st.expander("How these numbers work"):
             st.markdown(
-                "- **Requested** — when the borrower submitted the draw (Land Gorilla).\n"
-                "- **Package received** — the *Full Draw Package Received* date in Salesforce; when it's blank, the "
-                "date the draw was approved in Land Gorilla.\n"
-                "- **Wired** — the Salesforce wire date.\n"
-                "- **Turn-time** = package received → wired. **Borrower side** = requested → package received.\n"
-                "- Business days skip weekends and federal holidays. Draws whose dates are out of order are left out "
-                "of the averages and listed under *Data checks* on the Draws tab.")
+                "- **Package received** — the *Full Draw Package Received* date in Salesforce: the day the borrower's "
+                "package was complete. It started being recorded on **Aug 3, 2026**, so turn-time begins there.\n"
+                "- **Wired** — the draw's funding date in Land Gorilla.\n"
+                "- **Turn-time** = package received → wired, in business days (weekends and federal holidays skipped).\n"
+                "- How long borrowers take to get to a full package is their responsibility, so it isn't an overview "
+                "number — see it by account or deal under **Find a draw**.\n"
+                "- Draws without a package date, or with dates out of order, are left out of turn-time and listed on "
+                "the Package date check tab.")
     with t_draws:
         st.dataframe(table, hide_index=True, width="stretch", height=460, column_config=_table_config())
-        flagged = table.assign(Issue=fg["_check"].values)
-        flagged = flagged[flagged["Issue"].isin(["Package date is after the wire date",
-                                                 "Package date is before the draw was requested"])]
-        missing = int((fg["_check"] == "No package-received date").sum())
-        if len(flagged) or missing:
-            with st.expander(f"Data checks ({len(flagged) + missing})", icon=":material/fact_check:"):
-                if missing:
-                    st.caption(f"{missing} draw(s) have no package-received date yet, so they have no turn-time.")
-                if len(flagged):
-                    st.dataframe(flagged[["Loan #", "Draw #", "Deal", "Requested", "Package received", "Wired",
-                                          "Issue", "Salesforce"]], hide_index=True, width="stretch",
-                                 column_config=_table_config())
-    with t_dl:
-        _period_downloads(inst, tok, rt, feat, period_where, p_end, _excel_table(fg, table),
-                          roll.drop(columns="_raw").rename(columns={"Period": "Period", "Draws": "Draws funded"}))
+        _period_workbook(feat, _excel_table(fg, table),
+                         roll.drop(columns="_raw").rename(columns={"Draws": "Draws funded"}))
+    with t_check:
+        _package_check(fg, table, same_day)
+
+
+def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int):
+    """Is the full-package date trustworthy for this period? Checked live, in plain English."""
+    s = _turn_stats(fg, same_day)
+    st.markdown("The *Full Draw Package Received* date is new (Aug 3, 2026), so these checks show whether it's "
+                "being recorded well enough to measure turn-time.")
+    if not s["eligible"]:
+        st.info("No draws in this period were wired after Aug 3, 2026."); return
+    wire = pd.to_datetime(fg["_wire"], errors="coerce")
+    pkg = pd.to_datetime(fg["_pkg"], errors="coerce")
+    req = pd.to_datetime(fg["_lg_req"], errors="coerce")
+    after = wire >= PKG_LAUNCH
+    measured = pkg.notna()
+    on_wire_day = (pkg[measured] == wire[measured]).mean() * 100 if measured.any() else None
+    total = pd.to_numeric(fg["_days"], errors="coerce")
+    med_with = total[after & measured].median()
+    med_without = total[after & ~measured].median()
+    n_without = int((after & ~measured & total.notna()).sum())
+    excluded = int(fg["_check"].isin(CHECK_EXCLUDED).sum())
+    old = int(fg["_check"].astype(str).str.startswith("Package date predates").sum())
+
+    rows = []
+    cov = s["coverage"]
+    rows.append(("Draws with a package date", f"{cov:.0f}%  ({s['n']} of {s['eligible']})",
+                 "Too few draws to judge" if s["eligible"] < 30 else
+                 "Good — nearly every draw has one" if cov >= 90 else
+                 "Fair — some draws are missing it, so treat turn-time as indicative" if cov >= 75 else
+                 "Low — too many draws are missing it for turn-time to speak for the period"))
+    if on_wire_day is not None:
+        rows.append(("Package date on the wire day", f"{on_wire_day:.0f}%",
+                     "Looks filled in on funding day — the date may be entered when the draw is wired"
+                     if on_wire_day >= 90 else "Watch — close to being entered on funding day" if on_wire_day >= 85
+                     else "Normal — complete packages are often wired the same day (September notes: 74%)"))
+    if n_without >= 10 and pd.notna(med_with) and pd.notna(med_without):
+        gap = med_without - med_with
+        rows.append(("Do missing dates hide slow draws?", f"request → wire median {med_with:.0f} bd with a date, "
+                     f"{med_without:.0f} bd without",
+                     "No — draws without a package date look like the rest" if abs(gap) <= 1 else
+                     f"Yes — the draws missing a date took {gap:.0f} more business days end to end, so turn-time "
+                     "may look better than it is" if gap > 1 else
+                     "The draws missing a date were the quicker ones, so turn-time may look slower than it is"))
+    share_bad = excluded / s["eligible"] * 100
+    rows.append(("Dates out of order", f"{excluded}  ({share_bad:.0f}%)",
+                 "Fine — listed below" if share_bad <= 2 else "Data-entry problem — review the list below"))
+    if old:
+        rows.append(("Old values ignored", str(old), "Dates from before Aug 3, 2026 belong to the field's old use"))
+    st.dataframe(pd.DataFrame(rows, columns=["Check", "Result", "What it means"]), hide_index=True, width="stretch",
+                 column_config={"What it means": st.column_config.TextColumn(width="large")})
+
+    months = fg.assign(_m=wire.dt.to_period("M").astype(str))[after]
+    if months["_m"].nunique() > 1:
+        by = []
+        for month, g in months.groupby("_m"):
+            t = g["_fund_bd"].dropna()
+            by.append({"Month": month, "Draws": len(g), "With a package date": f"{g['_pkg'].notna().mean() * 100:.0f}%",
+                       "Same day": f"{(t == same_day).mean() * 100:.0f}%" if len(t) else "—",
+                       "Median turn-time": _bd(t.median()) if len(t) else "—"})
+        st.markdown("**By month**")
+        st.dataframe(pd.DataFrame(by), hide_index=True, width="stretch")
+    flagged = table.assign(Issue=fg["_check"].values)
+    flagged = flagged[flagged["Issue"].isin(CHECK_EXCLUDED) | (flagged["Issue"] == "No package-received date")]
+    if len(flagged):
+        with st.expander(f"Draws to check ({len(flagged)})", icon=":material/rule:"):
+            st.dataframe(flagged[["Loan #", "Draw #", "Property", "Requested", "Package received", "Wired", "Issue",
+                                  "Salesforce"]], hide_index=True, width="stretch", column_config=_table_config())
 
 
 @st.fragment
-def _period_downloads(inst, tok, rt, feat, period_where, p_end, xtable, roll):
-    """Both downloads for the period. A fragment, so building a file doesn't reload the whole page."""
+def _period_funding_file(inst, tok, rt, feat, period_where, p_end):
+    """Melanie's funding-request workbook for the period's wired draws. A fragment, so building it doesn't
+       reload the whole page."""
     tpl = _find_template()
     with st.container(border=True):
-        st.markdown(f"**Funding-request file** · Melanie's workbook, one row per draw wired in {feat}")
-        e = st.columns([1.4, 1])
+        st.markdown(f"**:material/description: Funding-request file** · Melanie's workbook, one row per draw wired "
+                    f"in {feat}")
+        if not tpl:
+            st.error("The funding-request template is missing from the app."); return
+        e = st.columns([1.3, 1, 1.1])
         who = e[0].text_input("Submitted by (optional)", key=f"pby_{feat}")
         fdate = e[1].date_input("Scheduled funding date", value=p_end, key=f"pdate_{feat}")
-        if not tpl:
-            st.error("The funding-request template is missing from the app.")
-        elif st.button("Build funding-request file", type="primary", icon=":material/description:", key=f"mel_{feat}"):
-            with st.spinner("Filling the template…"):
+        e[2].markdown("&nbsp;")
+        if e[2].button("Build funding-request file", type="primary", icon=":material/build:", key=f"mel_{feat}",
+                       width="stretch"):
+            with st.spinner("Filling the template from Land Gorilla and Salesforce…"):
                 rows, ftypes, _ = funding_request_rows(inst, tok, rt, period_where)
-                xlsx = fill_melanie_template(tpl, rows, ftypes, who, fdate, file_summary(inst, tok, rt, rows))
-            st.download_button(f"Download funding-request file ({len(rows):,} draws)", xlsx, mime=XLSX_MIME,
+                xlsx, n = build_funding_file(inst, tok, rt, tpl, rows, ftypes, who, fdate)
+            st.download_button(f"Download funding-request file ({n:,} draws)", xlsx, mime=XLSX_MIME, type="primary",
                                file_name=f"Construction-Renovation Funding Request {feat}.xlsx",
                                icon=":material/download:", key=f"meldl_{feat}", on_click="ignore")
             st.toast("Funding-request file is ready.", icon="✅")
-    with st.container(border=True):
-        st.markdown("**Turn-time data** · every draw with its milestone dates, business days, approvals and notes")
-        if st.button("Build turn-time workbook", icon=":material/table_view:", key=f"xls_{feat}"):
-            with st.spinner("Building the workbook…"):
-                xlsx = build_excel({"Summary": roll, "Draws": xtable})
-            st.download_button("Download turn-time workbook", xlsx, mime=XLSX_MIME, icon=":material/download:",
-                               file_name=f"Draw turn-time {feat}.xlsx", key=f"dl_{feat}", on_click="ignore")
+
+
+@st.fragment
+def _period_workbook(feat, xtable, roll):
+    if st.button("Build turn-time workbook (Excel)", icon=":material/table_view:", key=f"xls_{feat}"):
+        with st.spinner("Building the workbook…"):
+            xlsx = build_excel({"Summary": roll, "Draws": xtable})
+        st.download_button("Download turn-time workbook", xlsx, mime=XLSX_MIME, icon=":material/download:",
+                           file_name=f"Draw turn-time {feat}.xlsx", key=f"dl_{feat}", on_click="ignore")
 
 
 def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: int):
-    """Turn-time distribution for the period, plus dollars and draws per period."""
+    """Turn-time distribution for the period, plus dollars per period."""
     if alt is None:
         st.bar_chart(roll.set_index("_raw")["Funded ($)"])
         return
@@ -1296,7 +1547,7 @@ def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: in
         dist = days.value_counts().reindex(range(same_day, top + 1), fill_value=0).rename_axis("d").reset_index(
             name="Draws")
         dist["Business days"] = dist["d"].map(lambda d: f"{d}+" if d == top else str(d))
-        st.markdown(f"**Package → wire, {feat}**")
+        st.markdown(f"**Full package → wire, {feat}**")
         st.altair_chart(alt.Chart(dist).mark_bar(color="#4C78A8").encode(
             x=alt.X("Business days:N", sort=list(dist["Business days"]), axis=alt.Axis(labelAngle=0)),
             y=alt.Y("Draws:Q"), tooltip=["Business days", "Draws"]), width="stretch")
@@ -1317,15 +1568,23 @@ def lg_filenumber(loan_no) -> str | None:
 
 def render_loan_detail(inst, tok, rt, sel, same_day):
     st.header("Find a draw")
+    t_search, t_accounts = st.tabs([":material/search: Search", ":material/groups: Who's falling short"])
+    with t_search:
+        _draw_search(inst, tok, rt, sel, same_day)
+    with t_accounts:
+        _accounts_view(inst, tok, rt, sel, same_day)
+
+
+def _draw_search(inst, tok, rt, sel, same_day):
     text = st.text_input("Search", key="ld_q", placeholder="Loan #, property or deal name, borrower, or draw #",
                          help="Type any part of it.")
     if not text:
         st.info("Search by loan number, property / deal name, borrower or draw number to see each draw's full "
-                "cycle.", icon=":material/search:")
+                "cycle and the borrower's track record.", icon=":material/search:")
         return
     q = soql_escape(text)
-    searchable = [f for f in ["Loan_Number__c", "Deal__r.Name", "Borrower_Name_Text__c",
-                              "Loan_Advance_Number__c"] if f in sel]
+    searchable = [f for f in ["Loan_Number__c", "Deal__r.Name", "Borrower_Name_Text__c", "Name",
+                              "Loan_Advance_Number__c", "Deal__r.Account.Name"] if f in sel.split(",")]
     ors = " OR ".join(f"{f} LIKE '%{q}%'" for f in searchable) or "Id != null"
     with st.spinner("Searching…"):
         df = add_intervals(run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
@@ -1342,7 +1601,14 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
         ap = approvals_for(inst, tok, tuple(_col(df, "Id").dropna()))
     nloans = df["Loan_Number__c"].nunique() if "Loan_Number__c" in df else len(df)
     st.caption(f"{len(df)} draw(s) on {nloans} loan(s)")
-    tmpl = (cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT)
+    tmpl = str((cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT))
+    loans = {}
+    if cfg:
+        try:
+            loans = lg_loans(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), tmpl,
+                             _col(df, "Loan_Number__c").tolist())
+        except Exception:
+            loans = {}
 
     for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
         def first(col):
@@ -1351,11 +1617,27 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
             st.subheader(f"Loan {loan_no} · {first('Deal__r.Name')}")
             sub = [x for x in (first("Deal__r.Account.Name"), first("Borrower_Name_Text__c")) if x]
             st.caption("  ·  ".join(sub + [f"{len(g)} draw(s)"]))
+            _track_record(g, ap)
             for _, row in g.iterrows():
                 _render_draw(row, ap, inst)
-            if cfg:
+            ov = loans.get(_txt(loan_no))
+            if cfg and ov:
                 with st.expander("Construction progress", icon=":material/construction:"):
-                    _render_lg_for_loan(cfg, tmpl, loan_no, g)
+                    _render_lg_for_loan(cfg, ov, g)
+
+
+def _track_record(g: pd.DataFrame, ap: pd.DataFrame):
+    """How this loan's borrower does at getting to a full package — and what holds them up."""
+    wait = pd.to_numeric(g["_wait_bd"], errors="coerce").dropna()
+    reasons = pd.Series([r for n, a in zip(_col(g, NOTES_FIELD), _col(g, "Id").map(
+        lambda i: ap["Approval comments"].get(i) if i in ap.index else None)) for r in delay_labels(n, a)])
+    m = st.columns(3 if DELAY_REASONS else 2)
+    m[0].metric("Days to a full package", _bd(wait.mean()) if len(wait) else "—", border=True,
+                help="Average business days from the borrower's request to a complete package, for this loan's draws "
+                     "with a package date.")
+    m[1].metric("Draws measured", f"{len(wait)} of {len(g)}", border=True)
+    if DELAY_REASONS:
+        m[2].metric("Most common hold-up", reasons.value_counts().index[0] if len(reasons) else "—", border=True)
 
 
 def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
@@ -1363,21 +1645,28 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
     rid = _txt(row.get("Id"))
     head = st.columns([4, 1])
     status = _txt(row.get("Status__c"))
-    head[0].markdown(f"**Draw {draw_no}**" + (f" &nbsp; :blue-badge[{status}]" if status else ""))
+    prop = _txt(row.get("Name"))
+    head[0].markdown(f"**Draw {draw_no}**" + (f" · {prop}" if prop and prop != draw_no else "")
+                     + (f" &nbsp; :blue-badge[{status}]" if status else ""))
     if rid:
         head[1].link_button("Open in Salesforce", f"{inst.rstrip('/')}/{rid}", icon=":material/open_in_new:",
                             width="stretch")
+    a = ap.loc[rid] if rid and rid in ap.index else None
+    reasons = delay_labels(row.get(NOTES_FIELD), a.get("Approval comments") if a is not None else None)
     m = st.columns(4)
     m[0].metric("Funded", money(row.get(NET_FIELD)) if pd.notna(row.get(NET_FIELD)) else "—", border=True)
     m[1].metric("Turn-time", _bd(row.get("_fund_bd")), border=True,
                 help="Business days from full draw package received to wire")
-    m[2].metric("Borrower side", _bd(row.get("_wait_bd")), border=True,
-                help="Business days from the request to a full package")
+    m[2].metric("Days to a full package", _bd(row.get("_wait_bd")), border=True,
+                help="Business days from the request to a full package — the borrower's part")
     m[3].metric("Request → wire", _bd(row.get("_days")), border=True)
+    if reasons:
+        st.markdown("**Held up by:** " + " ".join(f":orange-badge[{r}]" for r in reasons))
 
     dates = {label: _d(row.get(field)) for label, field in MILESTONES}
-    dates["Requested"] = _d(row.get("_lg_req"))                 # the real request date
-    dates["Full draw package received"] = _d(row.get("_pkg"))   # Salesforce's date, or the LG approval
+    dates["Requested"] = _d(row.get("_lg_req"))                 # Land Gorilla's request date
+    dates["Full draw package received"] = _d(row.get("_pkg"))
+    dates["Wired"] = _d(row.get("_wire"))                       # Land Gorilla's funding date
     steps = pd.DataFrame({"Milestone": list(dates), "Date": pd.to_datetime(list(dates.values()))})
     steps["Done"] = steps["Date"].notna()
     st.dataframe(steps, hide_index=True, width="stretch",
@@ -1385,15 +1674,14 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
                                 "Done": st.column_config.CheckboxColumn(width="small")})
     if _txt(row.get("_check")):
         st.caption(f":material/error: {row['_check']}")
-    a = ap.loc[rid] if rid and rid in ap.index else None
     if a is not None and _txt(a.get("Approved by")):
         when = f" on {_mdy(a['Approved on'])}" if pd.notna(a.get("Approved on")) else ""
         st.markdown(f":material/verified: **Approved by {a['Approved by']}**{when}")
         if _txt(a.get("Approval comments")):
             st.caption(_txt(a["Approval comments"]).replace("\n", "  \n"))
     elif _txt(row.get("LastModifiedBy.Name")):
-        st.caption(f"Last updated by {row['LastModifiedBy.Name']} on {_mdy(_d(row.get('LastModifiedDate')))}"
-                   if _d(row.get("LastModifiedDate")) else f"Last updated by {row['LastModifiedBy.Name']}")
+        when = _d(row.get("LastModifiedDate"))
+        st.caption(f"Last updated by {row['LastModifiedBy.Name']}" + (f" on {_mdy(when)}" if when else ""))
     vals = pd.to_numeric(pd.Series([row.get(f) for f, _ in CONSTRUCTION_FIELDS]), errors="coerce")
     money_bits = [f"{lbl}: {money(v)}" for (_, lbl), v in zip(CONSTRUCTION_FIELDS, vals) if pd.notna(v) and v]
     if money_bits:
@@ -1404,88 +1692,136 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
             st.text(note)
 
 
-def _render_lg_for_loan(cfg: dict, tmpl: str, loan_no, g: pd.DataFrame):
-    fn = lg_filenumber(loan_no)
-    if fn:
-        ov = lg_loan_overview(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(tmpl), str(loan_no))
-        if ov and not ov.get("_error"):
-            m = st.columns(4)
-            if ov.get("project_pct") is not None:
-                pct = float(ov["project_pct"])
-                m[0].metric("Project complete", f"{pct:.0f}%", border=True)
-                m[0].progress(min(max(pct / 100, 0), 1.0))
-            if ov.get("to_finish") is not None:
-                m[1].metric("Remaining to fund", money(ov["to_finish"]), border=True)
-            if ov.get("balance") is not None:
-                m[2].metric("Loan balance", money(ov["balance"]), border=True)
-            if ov.get("last_draw"):
-                m[3].metric("Last draw", _mdy(ov["last_draw"]), border=True)
-            bits = [f"**{lbl}:** {_mdy(ov[key]) if isinstance(ov[key], date) else ov[key]}"
-                    for lbl, key in [("Status", "status"), ("Program", "program"), ("Funded", "funded_date"),
-                                     ("Due", "due_date")] if ov.get(key)]
-            loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
-            if loc:
-                bits.append(f"**Location:** {loc}")
-            if bits:
-                st.caption("  ·  ".join(bits))
-            if ov.get("risk"):
-                st.caption("**Risk:** " + " · ".join(ov["risk"]))
-        else:
-            st.caption("No construction file found for this loan.")
-    draw_rows, payees = [], []
+def _accounts_view(inst, tok, rt, sel, same_day):
+    """Which borrowers keep taking longest to get to a full package — a relationship view, not a KPI."""
+    st.caption("How long each account's borrowers take to get to a full draw package, and what usually holds them "
+               "up. Built from draws wired in the window you pick.")
+    c = st.columns([1.2, 1, 2])
+    days = c[0].selectbox("Window", [30, 60, 90, 180], index=2, format_func=lambda d: f"Last {d} days",
+                          key="acct_window")
+    min_draws = c[1].number_input("At least this many draws", 1, 20, 3, key="acct_min")
+    if not c[2].button("Build the list", icon=":material/groups:", key="acct_build"):
+        return
+    start = max(_today() - timedelta(days=int(days)), PKG_LAUNCH.date())
+    with st.spinner("Loading draws and Land Gorilla dates…"):
+        df = apply_lg_correction(add_intervals(run_soql(
+            inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d} "
+                       f"AND {WIRE_FIELD}<={_today():%Y-%m-%d}")), lg_config(), same_day)
+    if df.empty:
+        st.info("No draws were wired in that window."); return
+    df["_acct"] = _col(df, "Deal__r.Account.Name").map(_txt).replace("", "(no account)")
+    df["_reasons"] = [delay_labels(n) for n in _col(df, NOTES_FIELD)]
+    out = []
+    for acct, g in df.groupby("_acct"):
+        wait = pd.to_numeric(g["_wait_bd"], errors="coerce").dropna()
+        if len(g) < min_draws:
+            continue
+        top = pd.Series([r for rs in g["_reasons"] for r in rs]).value_counts()
+        out.append({"Account": acct, "Draws": len(g), "Loans": g["Loan_Number__c"].nunique(),
+                    "Days to a full package (avg)": round(wait.mean(), 1) if len(wait) else None,
+                    "Days to a full package (median)": wait.median() if len(wait) else None,
+                    "Over 5 days": (wait > 5).mean() if len(wait) else None,
+                    **({"Usual hold-ups": list(top.index[:3])} if DELAY_REASONS else {})})
+    if not out:
+        st.info("No account has enough draws in that window."); return
+    res = pd.DataFrame(out).sort_values("Days to a full package (avg)", ascending=False, na_position="last")
+    st.caption(f"Since {_mdy(start)} · draws with a full-package date only (it began Aug 3, 2026).")
+    st.dataframe(res, hide_index=True, width="stretch", height=480, column_config={
+        "Days to a full package (avg)": st.column_config.NumberColumn(format="%.1f bd"),
+        "Days to a full package (median)": st.column_config.NumberColumn(format="%d bd"),
+        "Over 5 days": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1,
+                                                       help="Share of the account's draws that took more than 5 "
+                                                            "business days to reach a full package"),
+        "Usual hold-ups": st.column_config.ListColumn()})
+
+
+def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
+    m = st.columns(4)
+    if ov.get("project_pct") is not None:
+        pct = float(ov["project_pct"])
+        m[0].metric("Project complete", f"{pct:.0f}%", border=True)
+        m[0].progress(min(max(pct / 100, 0), 1.0))
+    if ov.get("to_finish") is not None:
+        m[1].metric("Remaining to fund", money(ov["to_finish"]), border=True)
+    if ov.get("balance") is not None:
+        m[2].metric("Loan balance", money(ov["balance"]), border=True)
+    if ov.get("last_draw"):
+        m[3].metric("Last draw", _mdy(ov["last_draw"]), border=True)
+    bits = [f"**{lbl}:** {_mdy(ov[key]) if isinstance(ov[key], date) else ov[key]}"
+            for lbl, key in [("Status", "status"), ("Program", "program"), ("Funded", "funded_date"),
+                             ("Due", "due_date")] if ov.get(key)]
+    loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
+    if loc:
+        bits.append(f"**Location:** {loc}")
+    if bits:
+        st.caption("  ·  ".join(bits))
+    if ov.get("risk"):
+        st.caption("**Risk:** " + " · ".join(ov["risk"]))
+    draws = lg_draws(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), _col(g, CONTAINER_FIELD).tolist())
+    rows_, payees = [], []
     for _, row in g.iterrows():
-        container = row.get(CONTAINER_FIELD)
-        if pd.isna(container) or not container:
+        det = draws.get(row.get(CONTAINER_FIELD)) if isinstance(row.get(CONTAINER_FIELD), str) else None
+        if not det:
             continue
-        det = lg_draw_detail(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), str(container))
         sf_draw = _txt(row.get("Loan_Advance_Number__c")) or _txt(row.get("Name"))
-        if not det or det.get("_error"):
-            continue
-        draw_rows.append({"Draw": sf_draw, "Type": det.get("type"), "Status": det.get("status"),
-                          "Requested": det.get("created"), "Submitted": det.get("submitted"),
-                          "Approved": det.get("approved"), "Amount": det.get("amount")})
-        payees += [{"Draw": sf_draw, "Payee": p["payee"], "Amount": p.get("amount")} for p in det.get("payees") or []]
-    if draw_rows:
+        rows_.append({"Draw": sf_draw, "Type": det.get("type"), "Status": det.get("status"),
+                      "Requested": det.get("created"), "Submitted": det.get("submitted"),
+                      "Funded": det.get("effective") or det.get("approved"), "Amount": det.get("amount")})
+        payees += [{"Draw": sf_draw, "Paid to": p} for p in det.get("payees") or []]
+    if rows_:
         st.markdown("**Draws**")
-        ddf = pd.DataFrame(draw_rows)
+        ddf = pd.DataFrame(rows_)
+        for col in ("Requested", "Submitted", "Funded"):
+            ddf[col] = _dates(ddf[col])
         ddf["Amount"] = pd.to_numeric(ddf["Amount"], errors="coerce")
         dcol = st.column_config.DateColumn(format="M/D/YYYY")
         st.dataframe(ddf, hide_index=True, width="stretch",
-                     column_config={"Requested": dcol, "Submitted": dcol, "Approved": dcol,
+                     column_config={"Requested": dcol, "Submitted": dcol, "Funded": dcol,
                                     "Amount": st.column_config.NumberColumn(format="dollar", step=1)})
         if payees:
-            with st.expander(f"Payees ({len(payees)})"):
-                pdf = pd.DataFrame(payees)
-                pdf["Amount"] = pd.to_numeric(pdf["Amount"], errors="coerce")
-                st.dataframe(pdf, hide_index=True, width="stretch",
-                             column_config={"Amount": st.column_config.NumberColumn(format="dollar", step=1)})
+            with st.expander(f"Paid to ({len(payees)})"):
+                st.dataframe(pd.DataFrame(payees), hide_index=True, width="stretch")
 
 
 # ───────────────────────────── Funding request (weekly file) ────────────────
+RANGE_PRESETS = {"Last 7 days": 7, "Last 14 days": 14, "Month to date": None, "Custom": None}
+
+
 def render_funding_request(inst, tok, rt):
     st.header("Funding request")
-    st.caption("Melanie's weekly *Construction/Renovation Funding Request* workbook, filled from Salesforce — "
-               "one row per draw.")
+    st.caption("Melanie's weekly *Construction/Renovation Funding Request* workbook — the draws wired since the last "
+               "request, filled from Land Gorilla first and Salesforce for the rest.")
     tpl = _find_template()
     if not tpl:
         st.error("The funding-request template is missing from the app."); return
     with st.container(border=True):
-        c = st.columns([1.3, 1, 1.7])
+        c = st.columns([1.2, 1, 1.8])
         who = c[0].text_input("Submitted by (optional)", key="fr_by")
         fdate = c[1].date_input("Scheduled funding date", value=_today(), key="fr_date")
-        mode = c[2].segmented_control("Draws", ["Open (not yet wired)", "Wired in a date range"],
-                                      default="Open (not yet wired)", key="fr_mode") or "Open (not yet wired)"
-        if mode.startswith("Open"):
-            where = OPEN_WHERE
+        mode = c[2].segmented_control("Draws", ["Wired", "Open (not yet wired)"], default="Wired",
+                                      key="fr_mode") or "Wired"
+        if mode == "Wired":
+            r = st.columns([2, 1.4])
+            preset = r[0].pills("Wire dates", list(RANGE_PRESETS), default="Last 14 days", key="fr_preset") \
+                or "Last 14 days"
+            if preset == "Custom":
+                rng = r[1].date_input("From – to", value=(_today() - timedelta(days=14), _today()), key="fr_rng")
+                if len(rng) != 2:
+                    st.info("Pick a start and an end date."); return
+                lo, hi = rng
+            elif preset == "Month to date":
+                lo, hi = _today().replace(day=1), _today()
+            else:
+                lo, hi = _today() - timedelta(days=RANGE_PRESETS[preset]), _today()
+            where = f"{WIRE_FIELD}>={lo:%Y-%m-%d} AND {WIRE_FIELD}<={hi:%Y-%m-%d}"
+            scope = f"wired {_mdy(lo)} – {_mdy(hi)}"
         else:
-            rng = st.date_input("Wire dates", value=(_today() - timedelta(days=7), _today()), key="fr_rng")
-            if len(rng) != 2:
-                st.info("Pick a start and an end date."); return
-            where = f"{WIRE_FIELD}>={rng[0]:%Y-%m-%d} AND {WIRE_FIELD}<={rng[1]:%Y-%m-%d}"
+            where, scope = OPEN_WHERE, "not yet wired"
     with st.spinner("Loading draws…"):
         rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
     if rows.empty:
-        st.info("No draws in that range."); return
+        st.info(f"No draws {scope}."); return
+    rows, ftypes, _ = lg_overlay(rows, ftypes, lg_config(), loans=False)      # Land Gorilla's draw amounts
 
     f = st.columns(2)
     people = sorted({p for col in PERSON_FIELDS if col in rows for p in rows[col].dropna()})
@@ -1504,22 +1840,22 @@ def render_funding_request(inst, tok, rt):
     m[0].metric("Draws", f"{len(rows):,}", border=True)
     m[1].metric("Loans", f"{rows['B'].nunique() if 'B' in rows else 0:,}", border=True)
     m[2].metric("Current draw amount", money(total) if total is not None else "—", border=True)
-    preview = pd.DataFrame({"Loan #": _col(rows, "B"), "Deal": _col(rows, "C"), "Borrower": _col(rows, "D"),
-                            "Status": _col(rows, "Status__c"), "Current draw": pd.to_numeric(_col(rows, "U"),
-                                                                                            errors="coerce"),
-                            "Coordinator": _col(rows, "Advance_Coordinator__r.Name")})
-    st.dataframe(preview, hide_index=True, width="stretch", height=320,
+    _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope)
+    preview = pd.DataFrame({"Loan #": _col(rows, "B"), "Property": _col(rows, "F"), "Deal": _col(rows, "C"),
+                            "Borrower": _col(rows, "D"), "Status": _col(rows, "Status__c"),
+                            "Current draw": pd.to_numeric(_col(rows, "U"), errors="coerce"),
+                            "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name")})
+    st.dataframe(preview, hide_index=True, width="stretch", height=360,
                  column_config={"Current draw": st.column_config.NumberColumn(format="dollar", step=1)})
-    _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate)
 
 
 @st.fragment
-def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate):
-    if st.button("Build funding-request file", type="primary", icon=":material/description:",
-                 disabled=rows.empty, key="fr_build"):
-        with st.spinner("Filling the template…"):
-            xlsx = fill_melanie_template(tpl, rows, ftypes, who, fdate, file_summary(inst, tok, rt, rows))
-        st.download_button(f"Download funding-request file ({len(rows):,} draws)", xlsx, mime=XLSX_MIME,
+def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope):
+    if st.button(f"Build funding-request file ({len(rows):,} draws {scope})", type="primary",
+                 icon=":material/build:", disabled=rows.empty, key="fr_build"):
+        with st.spinner("Filling the template from Land Gorilla and Salesforce…"):
+            xlsx, n = build_funding_file(inst, tok, rt, tpl, rows, ftypes, who, fdate)
+        st.download_button(f"Download funding-request file ({n:,} draws)", xlsx, mime=XLSX_MIME, type="primary",
                            icon=":material/download:", on_click="ignore", key="fr_dl",
                            file_name=f"Construction-Renovation Funding Request {fdate.month}_{fdate.day}_{fdate.year}.xlsx")
         st.toast("Funding-request file is ready.", icon="✅")
