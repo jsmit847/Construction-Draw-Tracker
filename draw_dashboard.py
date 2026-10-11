@@ -1115,9 +1115,13 @@ def _span_start(gran: str, n: int) -> date:
     return date(today.year - (n - 1), 1, 1)
 
 
-def render_pipeline(inst, tok, rt, sel, same_day):
+def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     st.header("Draw turn-time")
     st.caption("How long construction draws take, and where the time goes. All figures are business days.")
+    if links:                                   # the other two pages, one click away
+        lk = st.columns([1, 1, 4])
+        lk[0].page_link(links[0], label="Find a draw", icon=":material/search:")
+        lk[1].page_link(links[1], label="Funding request", icon=":material/request_quote:")
     c = st.columns([2, 1.3, 1.4])
     gran = c[0].segmented_control("View by", ["Month", "Quarter", "Year", "Date range"], default="Quarter",
                                   key="ov_gran") or "Quarter"
@@ -1299,8 +1303,8 @@ def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: in
     r = roll.drop(columns="Period").rename(columns={"_raw": "Period"})
     st.markdown("**Funded per period**")
     st.altair_chart(alt.Chart(r).mark_bar(color="#54A24B").encode(
-        x=alt.X("Period:N", sort=list(r["Period"]), title=None),
-        y=alt.Y("Funded ($):Q", title=None, axis=alt.Axis(format="$,.0s")),
+        x=alt.X("Period:N", sort=list(r["Period"]), title=None, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("Funded ($):Q", title=None, axis=alt.Axis(format="$.2~s")),   # $18M, $2.5M — no repeats
         tooltip=["Period", alt.Tooltip("Funded ($):Q", format="$,.0f"), "Draws"]), width="stretch")
 
 
@@ -1578,14 +1582,14 @@ def main():
         if not rt:
             st.error("Couldn't find the Construction Advance draws in Salesforce."); st.stop()
         sel = select_fields(inst, tok)
-        pg = st.navigation([
-            st.Page(lambda: render_pipeline(inst, tok, rt, sel, same_day), title="Turn-time",
-                    icon=":material/timer:", url_path="turn-time", default=start == "turn-time"),
-            st.Page(lambda: render_loan_detail(inst, tok, rt, sel, same_day), title="Find a draw",
-                    icon=":material/search:", url_path="find", default=start == "find"),
-            st.Page(lambda: render_funding_request(inst, tok, rt), title="Funding request",
-                    icon=":material/request_quote:", url_path="funding-request", default=start == "funding-request"),
-        ])
+        find = st.Page(lambda: render_loan_detail(inst, tok, rt, sel, same_day), title="Find a draw",
+                       icon=":material/search:", url_path="find", default=start == "find")
+        funding = st.Page(lambda: render_funding_request(inst, tok, rt), title="Funding request",
+                          icon=":material/request_quote:", url_path="funding-request",
+                          default=start == "funding-request")
+        turn = st.Page(lambda: render_pipeline(inst, tok, rt, sel, same_day, links=(find, funding)),
+                       title="Turn-time", icon=":material/timer:", url_path="turn-time", default=start == "turn-time")
+        pg = st.navigation([turn, find, funding], position="top")      # pages along the top, always visible
         pg.run()
         st.session_state.pop("_sf_retried", None)
     except Exception as exc:
