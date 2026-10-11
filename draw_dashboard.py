@@ -759,7 +759,8 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     prop_ref = next((f for f, m in adv_meta.items() if m["ref"] == ["Property__c"]), None)  # Advance -> Property
     extra = [p for p in ("Id", "Name", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD, CONTAINER_FIELD)
              + PERSON_FIELDS if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
-    paths = [p for ps in cols.values() for p in ps]
+    checks = {label: path for label, path in DEAL_CHECKS.items() if _usable(resolve_path(inst, tok, "Advance__c", path))}
+    paths = [p for ps in cols.values() for p in ps] + list(checks.values())
     adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(extra + paths))} FROM Advance__c "
                               f"WHERE RecordTypeId='{rt}' AND {where} ORDER BY Loan_Number__c")
     if adv.empty:
@@ -767,7 +768,21 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     out = adv[[c for c in extra if c in adv]].copy()
     for col, ps in cols.items():
         out[col] = _first_filled(adv, ps)
+    for label, path in checks.items():                        # candidates for the columns no field is confirmed for
+        out[f"chk:{label}"] = _col(adv, path).values
+        ftypes[f"chk:{label}"] = resolve_path(inst, tok, "Advance__c", path)["type"]
     out["_multi_property"] = False
+
+    # One row per property per draw, like Salesforce's own file: Property_Advance__c ties each draw to each
+    # property with that property's approved amount. Portfolio rows keep that per-property amount.
+    pa = _property_advances(inst, tok, _col(out, "Id").tolist())
+    out["_prop_id"], out["_pa_amount"] = None, np.nan
+    if not pa.empty and "Id" in out:
+        out = out.drop(columns=["_prop_id", "_pa_amount"]).merge(pa, on="Id", how="left")
+    out["_pa_count"] = out.groupby(_col(out, "Id").fillna("").values)["_prop_id"].transform("count").values
+    out["_u_locked"] = out["_pa_count"] > 1                     # Land Gorilla's draw total can't be split by property
+    out["U"] = [a if (lock or pd.notna(a)) else u               # a split draw never repeats the whole amount
+                for a, u, lock in zip(out["_pa_amount"], _col(out, "U"), out["_u_locked"])]
 
     # Property columns — validated field by field, so one missing field can't blank the rest.
     try:
@@ -778,40 +793,83 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     pcols = {col: fs for col, fs in pcols.items() if fs}
     street = [f for f in STREET_PARTS if f in pmeta]
     unavailable += [col for col in MELANIE_PROPERTY_MAP if col not in pcols] + ([] if street else ["F"])
-    pfields = list(dict.fromkeys([f for fs in pcols.values() for f in fs] + street + (["Name"] if "Name" in pmeta else [])))
+    pchecks = {label: f for label, f in PROPERTY_CHECKS.items() if _usable(pmeta.get(f))}
+    pfields = list(dict.fromkeys([f for fs in pcols.values() for f in fs] + street + list(pchecks.values())
+                                 + (["Name"] if "Name" in pmeta else [])))
     link = "Advance__c" if (pmeta.get("Advance__c") or {}).get("ref") == ["Advance__c"] else None  # Property -> draw
-    match = [None] * len(adv)                                   # each advance's property record, when known
-    if pfields and prop_ref and prop_ref in adv:                # the advance names its own property
-        by_id = {r["Id"]: r for r in _soql_in(inst, tok, ",".join(["Id"] + pfields), "Property__c", "Id",
-                                              adv[prop_ref]).to_dict("records")}
-        match = [by_id.get(p) for p in adv[prop_ref]]
-    elif pfields and "Deal__c" in pmeta and "Deal__c" in adv:  # else via the Deal
+    direct = [p for p in list(_col(out, "_prop_id")) + (list(out[prop_ref]) if prop_ref and prop_ref in out else [])
+              if isinstance(p, str) and p]
+    by_id = {r["Id"]: r for r in _soql_in(inst, tok, ",".join(["Id"] + pfields), "Property__c", "Id",
+                                          direct).to_dict("records")} if pfields and direct else {}
+    per_deal, per_draw = {}, {}
+    if pfields and "Deal__c" in pmeta and "Deal__c" in out:
         sel = ",".join(dict.fromkeys(["Id", "Deal__c"] + ([link] if link else []) + pfields))
-        per_deal, per_draw = {}, {}
-        for r in _soql_in(inst, tok, sel, "Property__c", "Deal__c", adv["Deal__c"]).to_dict("records"):
+        for r in _soql_in(inst, tok, sel, "Property__c", "Deal__c", out["Deal__c"]).to_dict("records"):
             per_deal.setdefault(r["Deal__c"], []).append(r)
             if link and pd.notna(r.get(link)):
                 per_draw.setdefault(r[link], []).append(r)
-        ids, names = _col(adv, "Id"), _col(adv, "Name")
-        for i, (aid, deal, name) in enumerate(zip(ids, adv["Deal__c"], names)):
-            props, hits = per_deal.get(deal, []), per_draw.get(aid, [])
-            if len(props) == 1:
-                match[i] = props[0]
-            elif len(hits) == 1:                                # the one property pointing at this draw
-                match[i] = hits[0]
-            else:                                               # the draw is named for its property's address
-                key = _addr_key(name)
-                same = [p for p in props if key and key in (_addr_key(p.get("Name")), _addr_key(
-                    " ".join(_txt(p.get(f)) for f in street)))]
-                match[i] = same[0] if len(same) == 1 else None
-        out["_multi_property"] = [len(per_deal.get(d, [])) > 1 and m is None for d, m in zip(adv["Deal__c"], match)]
+    match = []
+    for _, row in out.iterrows():
+        pid = row.get("_prop_id") if isinstance(row.get("_prop_id"), str) else row.get(prop_ref) if prop_ref else None
+        props, hits = per_deal.get(row.get("Deal__c"), []), per_draw.get(row.get("Id"), [])
+        if isinstance(pid, str) and pid in by_id:              # the exact property (Property_Advance__c / lookup)
+            match.append(by_id[pid])
+        elif len(props) == 1:                                   # the deal's only property
+            match.append(props[0])
+        elif len(hits) == 1:                                    # the one property pointing at this draw
+            match.append(hits[0])
+        else:                                                   # a draw named for its property's address
+            key = _addr_key(row.get("Name"))
+            same = [p for p in props if key and key in (_addr_key(p.get("Name")), _addr_key(
+                " ".join(_txt(p.get(f)) for f in street)))]
+            match.append(same[0] if len(same) == 1 else None)
+    out["_multi_property"] = [len(per_deal.get(d, [])) > 1 and m is None for d, m in zip(_col(out, "Deal__c"), match)]
     for col, fs in pcols.items():
         out[col] = [next((m.get(f) for f in fs if m and _txt(m.get(f))), None) for m in match]
         ftypes[col] = pmeta[fs[0]]["type"]
-    street_txt = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) if m else "" for m in match]
-    names = _col(adv, "Name")                                   # unmatched portfolio rows still get their street
-    out["F"] = [s or (_txt(n) if _addr_key(n) else None) for s, n in zip(street_txt, names)]
+    for label, f in pchecks.items():
+        out[f"chk:{label}"] = [m.get(f) if m else None for m in match]
+        ftypes[f"chk:{label}"] = pmeta[f]["type"]
+    out["F"] = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) or None if m else None for m in match]
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
+
+
+# Candidates for the columns no Salesforce field is confirmed for yet. They go on the Prep worksheet (not the
+# request sheet), so they can be checked against Melanie's own file before any is promoted to a real column.
+DEAL_CHECKS = {
+    "Completion LTC % — deal Max LTC": "Deal__r.LTC__c",
+    "Completion LTC % — deal Total Loan LTC": "Deal__r.Total_Loan_LTC__c",
+    "Asset Manager — deal Loan Manager": "Deal__r.Loan_Coordinator__r.Name",
+}
+PROPERTY_CHECKS = {
+    "Completion LTC % — property Total Loan LTC": "Total_Loan_LTC__c",
+    "Asset Manager — property Servicer Asset Manager": "Asset_Manager__c",
+    "Estimated Completion — property Rehab Completion Date": "Rehab_Completion_Date__c",
+}
+
+
+def _property_advances(inst: str, tok: str, adv_ids) -> pd.DataFrame:
+    """Property_Advance__c rows for these draws — columns Id (the draw), _prop_id, _pa_amount. Empty when the org
+       doesn't have the object or the draws have no property split."""
+    try:
+        meta = describe_object(inst, tok, "Property_Advance__c")
+    except Exception:
+        return pd.DataFrame()
+    adv_fk = next((f for f, m in meta.items() if m["ref"] == ["Advance__c"]), None)
+    prop_fk = next((f for f, m in meta.items() if m["ref"] == ["Property__c"]), None)
+    if not adv_fk or not prop_fk:
+        return pd.DataFrame()
+    amt = "Approved_Advance_Amount_Calc__c" if "Approved_Advance_Amount_Calc__c" in meta else next(
+        (f for f, m in meta.items() if m["type"] == "currency" and "amount" in str(m.get("label", "")).lower()), None)
+    try:
+        pa = _soql_in(inst, tok, ",".join(["Id", adv_fk, prop_fk] + ([amt] if amt else [])), "Property_Advance__c",
+                      adv_fk, adv_ids)
+    except Exception:
+        return pd.DataFrame()
+    if pa.empty or adv_fk not in pa or prop_fk not in pa:
+        return pd.DataFrame()
+    return pd.DataFrame({"Id": pa[adv_fk].values, "_prop_id": pa[prop_fk].values,
+                         "_pa_amount": pd.to_numeric(pa[amt], errors="coerce").values if amt in pa else np.nan})
 
 
 def _first_filled(df: pd.DataFrame, paths: list) -> list:
@@ -970,7 +1028,8 @@ def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
                                  ("N", lo, "due_date", "date"), ("Y", lo, "project_pct", "percent"),
                                  ("AB", lo, "balance", "currency"), ("W", lo, "to_finish", "currency")):
         got = src.map(lambda d: d.get(key) if d else None)
-        rows[col] = [a if _txt(a) else b for a, b in zip(got, _col(rows, col))]
+        locks = [col == "U" and x is not None and not pd.isna(x) and bool(x) for x in _col(rows, "_u_locked")]
+        rows[col] = [b if lock else (a if _txt(a) else b) for a, b, lock in zip(got, _col(rows, col), locks)]
         if got.map(lambda x: _txt(x) != "").any():
             ftypes[col] = ftype
     rows["AG"] = payees.tolist()
@@ -978,9 +1037,10 @@ def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
     return rows, ftypes, lg
 
 
-def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None) -> pd.DataFrame:
+def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None, ftypes: dict | None = None) -> pd.DataFrame:
     """One line per row of the request with everything at hand for finishing it by hand: Land Gorilla's draw and
        loan details, the team on the loan, approvals and notes."""
+    ftypes = ftypes or {}
     dr = _col(rows, CONTAINER_FIELD).map(lambda c: lg["draws"].get(c) if isinstance(c, str) else None)
     lo = _col(rows, "B").map(lambda n: lg["loans"].get(_txt(n)) if _txt(n) else None)
     g = lambda s, k: s.map(lambda d: d.get(k) if d else None)            # noqa: E731
@@ -988,9 +1048,10 @@ def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None) -> pd.Dat
     t = pd.DataFrame({
         "Row": range(TEMPLATE_HEADER_ROW + 1, TEMPLATE_HEADER_ROW + 1 + len(rows)),
         "CV Loan #": _col(rows, "B").values, "Draw #": _col(rows, "Loan_Advance_Number__c").values,
-        "Draw / property": _col(rows, "Name").values, "Deal": _col(rows, "C").values,
+        "Property": _col(rows, "F").values, "Deal": _col(rows, "C").values,
         "Status": _col(rows, "Status__c").values, "Coordinator": _col(rows, "Advance_Coordinator__r.Name").values,
-        "Draw amount ($)": pd.to_numeric(g(dr, "amount"), errors="coerce").values,
+        "This property's amount ($)": pd.to_numeric(_col(rows, "_pa_amount"), errors="coerce").values,
+        "Whole draw amount ($)": pd.to_numeric(g(dr, "amount"), errors="coerce").values,
         "Requested amount ($)": pd.to_numeric(g(dr, "requested"), errors="coerce").values,
         "Paid to": dr.map(lambda d: "; ".join(d["payees"]) if d and d.get("payees") else None).values,
         "Draw type": g(dr, "type").values, "Requested": _dates(g(dr, "created")).values,
@@ -1009,6 +1070,13 @@ def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None) -> pd.Dat
         for c in ("Approved by", "Approved on", "Approval comments"):
             t[c] = ids.map(ap[c]).values if c in ap else None
         t["Approved on"] = _dates(t["Approved on"])
+    for c in [c for c in rows.columns if str(c).startswith("chk:")]:     # candidates to confirm against Melanie's file
+        vals = pd.Series(rows[c].values)
+        if ftypes.get(c) == "percent":
+            vals = pd.to_numeric(vals, errors="coerce") / 100
+        elif ftypes.get(c) in ("date", "datetime"):
+            vals = _dates(vals)
+        t["Check: " + c[4:] + (" %" if ftypes.get(c) == "percent" else "")] = vals.values
     t["Notes"] = _col(rows, "AF").values
     return t
 
@@ -1087,8 +1155,10 @@ def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
                 cell.number_format = "0%"
             if col in ("Notes", "Approval comments"):
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
-    for j, col in enumerate(prep.columns, 1):
-        width = 48 if col in ("Notes", "Approval comments") else max(10, min(32, len(col) + 4))
+    for j, col in enumerate(prep.columns, 1):                     # wide enough for what's in the column
+        sample = [len(_txt(v)) for v in prep[col].head(200)]
+        width = 48 if col in ("Notes", "Approval comments") else min(40, max([12, len(col) * 0.9 + 2]
+                                                                              + [n + 2 for n in sample]))
         ws.column_dimensions[get_column_letter(j)].width = width
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "C2"
@@ -1102,7 +1172,7 @@ def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFram
     rows, ftypes, lg = lg_overlay(rows, ftypes, lg_config())
     ap = approvals_for(inst, tok, tuple(_col(rows, "Id").dropna()))
     xlsx = fill_melanie_template(tpl, rows, ftypes, submitted_by, funding_date,
-                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap))
+                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap, ftypes))
     return xlsx, len(rows)
 
 
@@ -1831,10 +1901,11 @@ def render_funding_request(inst, tok, rt):
                                      "generates for them.")
         if person != "Everyone":
             rows = rows[np.logical_or.reduce([rows[col].eq(person) for col in PERSON_FIELDS if col in rows])]
-    if "Status__c" in rows:
-        statuses = sorted(rows["Status__c"].dropna().unique())
-        rows = rows[rows["Status__c"].isin(f[1].multiselect("Statuses", statuses, default=statuses,
-                                                            key=f"fr_status_{mode}"))]
+    if "Status__c" in rows:                                # every status in full, one click to drop one
+        counts = rows["Status__c"].fillna("(none)").value_counts()
+        picked = st.pills("Statuses", list(counts.index), selection_mode="multi", default=list(counts.index),
+                          format_func=lambda s: f"{s} ({counts[s]})", key=f"fr_status_{mode}")
+        rows = rows[rows["Status__c"].fillna("(none)").isin(picked)]
     total = pd.to_numeric(rows["U"], errors="coerce").sum() if "U" in rows else None
     m = st.columns(3)
     m[0].metric("Draws", f"{len(rows):,}", border=True)
