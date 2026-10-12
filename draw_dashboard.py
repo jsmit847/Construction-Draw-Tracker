@@ -111,7 +111,7 @@ WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
          "Deal__r.Name", "Deal__r.Account.Name", "Borrower_Name__c", "Borrower_Name_Text__c",
          "Lender__c", "Status__c", "Inspection_Method__c",
          "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name", NOTES_FIELD, CONTAINER_FIELD,
-         NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate", "CreatedDate"]
+         NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate", "CreatedDate", "Close_Date__c"]
         + [f for f, _ in CONSTRUCTION_FIELDS] + [m[1] for m in MILESTONES])
 TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
 OPEN_WHERE = f"{WIRE_FIELD}=null AND Status__c NOT IN ({','.join(repr(s) for s in TERMINAL)})"
@@ -1174,6 +1174,7 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         _write_total_summary(wb, summary)
     ws["E4"], ws["E5"] = _today(), funding_date                              # real dates (today in ET)
     ws["E4"].number_format = ws["E5"].number_format = "m/d/yyyy"
+    _current_layout(ws)
     letters = list(dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS)))
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
         for col in letters:
@@ -1192,6 +1193,26 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         _write_prep_sheet(wb, prep)
     buf = io.BytesIO(); wb.save(buf)
     return buf.getvalue()
+
+
+# Melanie's current workbook (her weekly files from Jul 2026 on) adds "Construction Manager" at AK, which moves the
+# asset-manager and deposit columns one to the right of where the committed template has them.
+CURRENT_TAIL = {"AK": "Construction Manager", "AL": "Asset Manager 1", "AM": "Asset Manager 2",
+                "AN": "Deposit for materials? Y/N"}
+
+
+def _current_layout(ws) -> None:
+    """Rewrite the request sheet's last header cells to Melanie's current layout, styled like their neighbours."""
+    from copy import copy
+    from openpyxl.utils import column_index_from_string as ci
+    style = ws.cell(TEMPLATE_HEADER_ROW, ci("AJ"))
+    for col, title in CURRENT_TAIL.items():
+        cell = ws.cell(TEMPLATE_HEADER_ROW, ci(col))
+        cell.value = title
+        cell.font, cell.fill, cell.border = copy(style.font), copy(style.fill), copy(style.border)
+        cell.alignment, cell.number_format = copy(style.alignment), style.number_format
+    width = ws.column_dimensions["AM"].width or ws.column_dimensions["AJ"].width or 14
+    ws.column_dimensions["AN"].width = width
 
 
 def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
@@ -1719,8 +1740,12 @@ def delay_keys(note) -> tuple:
 
 
 def delay_labels(note) -> list:
-    """What a draw's notes say held it up, in plain English."""
-    return [DELAY_REASONS[k][0] for k in delay_keys(note)]
+    """What a draw's notes say held it up, in plain English. A plain "Inspection" is dropped when the notes name a
+       more specific inspection hold-up (late or revised, or the borrower's own), so the same thing isn't listed twice."""
+    keys = delay_keys(note)
+    if "inspection" in keys and {"inspection_delay", "self_inspection"} & set(keys):
+        keys = tuple(k for k in keys if k != "inspection")
+    return [DELAY_REASONS[k][0] for k in keys]
 
 
 def delay_evidence(note, limit: int = 3) -> list:
@@ -1818,18 +1843,40 @@ def _wire_day(df: pd.DataFrame) -> pd.Series:
     return _day(_col(df, "_wire")).fillna(_day(_col(df, WIRE_FIELD)))
 
 
+def _believable(df: pd.DataFrame, col: str) -> pd.Series:
+    """A Salesforce date offered as a request date, kept only where it's believable. Rejected when it is just the wire
+       date (since Apr 15, 2026 Salesforce copies the wire date into its request date), after the wire or today, on or
+       before the loan's close date (an old mass update wrote close dates into some), more than 30 days before the
+       record was created, or the same date on three or more of the loan's draws."""
+    d = _day(_col(df, col))
+    wire, made, close = _wire_day(df), _created_day(df), _day(_col(df, "Close_Date__c"))
+    key = _col(df, "Loan_Number__c").map(_txt) + "|" + d.dt.strftime("%Y-%m-%d").fillna("")
+    shared = d.notna() & (key.map(key.value_counts()) >= 3)
+    bad = (d.isna() | (d == wire) | (wire.notna() & (d > wire)) | (d > pd.Timestamp(_today()))
+           | (close.notna() & (d <= close)) | (made.notna() & (d < made - pd.Timedelta(days=30))) | shared)
+    return d.where(~bad)
+
+
 def _request_date(df: pd.DataFrame) -> pd.Series:
-    """Each draw's request date: Land Gorilla's; else the earlier of Salesforce's request date (often just the wire
-       date copied over) and the day the record was created — unless that came after the wire (a bulk load)."""
+    """Each draw's request date: Land Gorilla's; else, for a draw synced from Land Gorilla, the moment Salesforce
+       received it; else a believable Salesforce request or inspection-ordered date; else the day the record was
+       created, if that was before the wire. Never the wire date itself (blank when nothing else is known)."""
     made, wire = _created_day(df), _wire_day(df)
-    sf = pd.concat([_day(_col(df, REQ_FIELD)), made.where(wire.isna() | (made <= wire))], axis=1).min(axis=1)
-    return _day(_col(df, "_lg_req")).fillna(sf.astype("datetime64[ns]"))
+    synced = _col(df, CONTAINER_FIELD).map(_txt) != ""
+    out = _day(_col(df, "_lg_req")).fillna(made.where(synced))
+    for col in (REQ_FIELD, "Date_Inspection_Ordered__c"):
+        out = out.fillna(_believable(df, col))
+    return out.fillna(made.where(wire.isna() | (made < wire)))
 
 
 def _order_date(df: pd.DataFrame) -> pd.Series:
-    """The date a draw sorts by: its request date, else its wire date (older draws often have nothing else), else the
-       day it was created in Salesforce."""
-    return _request_date(df).fillna(_wire_day(df)).fillna(_created_day(df))
+    """The date a draw sorts by: its request date, else the day it was created in Salesforce (never blank: older
+       draws were entered on their wire day)."""
+    return _request_date(df).fillna(_created_day(df))
+
+
+def _created_ts(df: pd.DataFrame) -> pd.Series:
+    return pd.to_datetime(_col(df, "CreatedDate"), errors="coerce", utc=True).dt.tz_localize(None)
 
 
 def _waiting_summary(keys_per_draw) -> tuple:
@@ -1852,21 +1899,23 @@ def _newest_first(df: pd.DataFrame) -> pd.DataFrame:
        the order they're requested); loans are ordered by their most recent draw."""
     if df.empty:
         return df
-    when = _order_date(df)
+    when, made = _order_date(df), _created_ts(df)
     seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
     loan = _col(df, "Loan_Number__c").map(_txt)
     latest = when.groupby(loan).transform("max")
-    return (df.assign(_when=when.values, _seq=seq.values, _latest=latest.values, _loan=loan.values)
-              .sort_values(["_latest", "_loan", "_seq", "_when"], ascending=[False, True, False, False],
+    return (df.assign(_when=when.values, _req_day=_request_date(df).values, _seq=seq.values, _made=made.values,
+                      _latest=latest.values, _loan=loan.values)
+              .sort_values(["_latest", "_loan", "_seq", "_made"], ascending=[False, True, False, False],
                            na_position="last", kind="stable")
               .drop(columns=["_latest", "_loan"]))
 
 
 def _by_date(df: pd.DataFrame) -> pd.DataFrame:
-    """Draws from many loans, most recent request first (ties: higher draw number first)."""
+    """Draws from many loans, most recent request first (ties: created later, then higher draw number first)."""
     seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
-    return (df.assign(_when=_order_date(df).values, _seq=seq.values)
-              .sort_values(["_when", "_seq"], ascending=False, na_position="last", kind="stable"))
+    return (df.assign(_when=_order_date(df).values, _req_day=_request_date(df).values, _made=_created_ts(df).values,
+                      _seq=seq.values)
+              .sort_values(["_when", "_made", "_seq"], ascending=False, na_position="last", kind="stable"))
 
 
 def latest_entry(note, ref: date | None = None) -> tuple | None:
@@ -1892,11 +1941,11 @@ def latest_entry(note, ref: date | None = None) -> tuple | None:
 def _timeline(row: pd.Series, a) -> pd.DataFrame:
     """What happened to a draw, in date order — only steps that were recorded: Land Gorilla's request and funding,
        the Salesforce milestones that were filled in, the full-package date, and each approval with who gave it."""
-    req, wire = _d(row.get("_lg_req")), _d(row.get("_wire")) or _d(row.get(WIRE_FIELD))
-    sf_req = _d(row.get(REQ_FIELD))
-    if not req and sf_req and (not wire or sf_req < wire):        # Salesforce's own request date, unless it's just
-        req = sf_req                                               # the wire date copied over
-    ev = [(req, "Requested", _txt(row.get("_lg_by")))]
+    lg_req, wire = _d(row.get("_lg_req")), _d(row.get("_wire")) or _d(row.get(WIRE_FIELD))
+    req = _d(row.get("_req_day")) or lg_req                        # the request-date chain (see _request_date)
+    from_lg = bool(req) and req == lg_req
+    ev = [(req, "Requested" if from_lg or not req else "Requested (from Salesforce)",
+           _txt(row.get("_lg_by")) if from_lg else "")]
     sub = _d(row.get("_lg_sub"))
     if sub and sub != req:
         ev.append((sub, "Submitted in Land Gorilla", ""))
@@ -2408,8 +2457,17 @@ def _open_draws(inst, tok, rt, sel, same_day):
     df, asof = data
     if df.empty:
         st.info("Every draw has been wired."); return
-    notes = _col(df, NOTES_FIELD)
     req = _request_date(df)
+    stale = (_col(df, "Status__c").map(_txt) == "") | ((_col(df, "Status__c").map(_txt) == "Received")
+                                                         & (req.fillna(_created_day(df)) <
+                                                            pd.Timestamp(_today()) - pd.Timedelta(days=183)))
+    if stale.any() and not st.toggle(f"Include {int(stale.sum())} cancelled or stale draws", key="open_all",
+                                     help="Draws with no status (usually cancelled) and requests over six months old "
+                                          "that never moved past Received."):
+        df, req = df[~stale], req[~stale]
+    if df.empty:
+        st.info("Nothing else is waiting."); return
+    notes = _col(df, NOTES_FIELD)
     latest = [latest_entry(n, w.date() if pd.notna(w) else None) for n, w in zip(notes, req)]
     t = pd.DataFrame({
         "Loan #": _col(df, "Loan_Number__c").values, "Draw #": _draw_nos(df), "Deal": _col(df, "Deal__r.Name").values,
@@ -2458,28 +2516,37 @@ def _draw_search(inst, tok, rt, sel, same_day):
         df = _newest_first(apply_lg_correction(df, cfg, same_day))
         ap = approvals_for(inst, tok, tuple(_col(df, "Id").dropna()))
     nloans = df["Loan_Number__c"].nunique(dropna=False) if "Loan_Number__c" in df else len(df)
+    c = st.columns([1, 1, 2])
+    oldest = (c[0].segmented_control(
+        "Order", ["Oldest first", "Newest first"], default="Oldest first", key="ld_order",
+        help="Oldest first: the earliest request at the top and the latest at the bottom. Newest first: the reverse.")
+        or "Oldest first") == "Oldest first"
     view = "By loan"
     if nloans > 1:
-        view = st.segmented_control(
-            "Show", ["Newest first", "By loan"], default="Newest first", key="ld_view",
-            help="Newest first: every draw in request order, the most recent at the top. By loan: each loan's draws "
-                 "together, with the loan's track record and construction progress.") or "Newest first"
-    if view == "Newest first":
-        st.caption(f"{len(df)} draw(s) on {nloans} loans · most recent request at the top, earliest at the bottom")
-        for _, row in _by_date(df).iterrows():
+        view = c[1].segmented_control(
+            "Show", ["One list", "By loan"], default="One list", key="ld_view",
+            help="One list: every draw in request order. By loan: each loan's draws together, with the loan's track "
+                 "record and construction progress.") or "One list"
+    if view == "One list":
+        flat = _by_date(df)
+        st.caption(f"{len(df)} draw(s) on {nloans} loans · " + ("earliest request at the top, latest at the bottom"
+                                                                if oldest else "latest request at the top"))
+        for _, row in (flat.iloc[::-1] if oldest else flat).iterrows():
             with st.container(border=True):
                 who = [x for x in (_txt(row.get("Deal__r.Name")), _txt(row.get("Deal__r.Account.Name"))) if x]
                 st.caption(f"**Loan {_md(row.get('Loan_Number__c'))}**" + "".join(f" · {_md(x)}" for x in who))
                 _render_draw(row, ap, inst)
         return
 
-    st.caption(f"{len(df)} draw(s) on {nloans} loan(s) · loans with the most recent request first, each loan's "
-               "latest draw on top")
-    groups = list(df.groupby("Loan_Number__c", dropna=False, sort=False))       # already newest first
+    groups = list(df.groupby("Loan_Number__c", dropna=False, sort=False))       # newest first so far
     if len(groups) > MAX_LOAN_SECTIONS:
         st.warning(f"Showing the {MAX_LOAN_SECTIONS} loans with the most recent draws — narrow the search to see the "
                    "rest.")
         groups = groups[:MAX_LOAN_SECTIONS]
+    if oldest:
+        groups = [(loan, g.iloc[::-1]) for loan, g in reversed(groups)]
+    st.caption(f"{len(df)} draw(s) on {nloans} loan(s) · " + ("each loan's first draw on top, its latest at the bottom"
+                                                              if oldest else "each loan's latest draw on top"))
     tmpl = str((cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT))
     loans = {}
     if cfg:
@@ -2724,6 +2791,25 @@ def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
 
 # ───────────────────────────── Funding request (weekly file) ────────────────
 RANGE_PRESETS = {"Last 7 days": 7, "Last 14 days": 14, "Month to date": None, "Custom": None}
+# Salesforce's draw statuses grouped into the stages a draw actually moves through (Advance__History: every draw starts
+# Received; the approval, release and approved steps almost always finish the same day; "Pending" only appears when a
+# completed record is reopened; a blank status is a cancelled draw).
+STATUS_STAGES = {"Received": "New request", "Pending Inspection": "Inspection",
+                 "Pending Inspection Report Revision": "Inspection", "Pending Borrower Response": "Waiting on borrower",
+                 "Hold": "On hold", "Pending Approval": "Approval & release", "Pending Release": "Approval & release",
+                 "Pending Capital Partner Release": "Approval & release", "Approved": "Approval & release",
+                 "Completed": "Wired", "Pending": "Reopened after funding"}
+STAGE_ORDER = ["New request", "Inspection", "Waiting on borrower", "On hold", "Approval & release", "Wired",
+               "Reopened after funding", "No status"]
+STAGE_HELP = ("New request = Received · Inspection = Pending Inspection or Inspection Report Revision · Waiting on "
+              "borrower = Pending Borrower Response · On hold = Hold · Approval & release = Pending Approval, Pending "
+              "Release or Approved · Reopened after funding = Pending · No status = blank, usually a cancelled draw "
+              "(left out unless you pick it).")
+
+
+def _stage(status) -> str:
+    s = _txt(status)
+    return STATUS_STAGES.get(s, s or "No status")
 
 
 def render_funding_request(inst, tok, rt):
@@ -2770,11 +2856,13 @@ def render_funding_request(inst, tok, rt):
                                      "generates for them.")
         if person != "Everyone":
             rows = rows[np.logical_or.reduce([rows[col].eq(person) for col in PERSON_FIELDS if col in rows])]
-    if "Status__c" in rows:                                # every status in full, one click to drop one
-        counts = rows["Status__c"].fillna("(none)").value_counts()
-        picked = st.pills("Statuses", list(counts.index), selection_mode="multi", default=list(counts.index),
-                          format_func=lambda s: f"{s} ({counts[s]})", key=f"fr_status_{mode}")
-        rows = rows[rows["Status__c"].fillna("(none)").isin(picked)]
+    if "Status__c" in rows:                                # stages in the order a draw moves through them
+        stage = rows["Status__c"].map(_stage)
+        counts = stage.value_counts()
+        options = sorted(counts.index, key=lambda s: (STAGE_ORDER.index(s) if s in STAGE_ORDER else 99, s))
+        picked = st.pills("Stage", options, selection_mode="multi", default=[s for s in options if s != "No status"],
+                          format_func=lambda s: f"{s} ({counts[s]})", key=f"fr_stage_{mode}", help=STAGE_HELP)
+        rows = rows[stage.isin(picked)]
     total = pd.to_numeric(rows["U"], errors="coerce").sum() if "U" in rows else None
     m = st.columns(3)
     m[0].metric("Draws", f"{len(rows):,}", border=True)
