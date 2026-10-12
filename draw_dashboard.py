@@ -18,9 +18,11 @@ Package Received", recorded since Aug 3, 2026. Turn-time = full package -> wire,
 Three pages on the same data:
   • Turn-time — monthly / quarterly / yearly turn-time KPIs, rollup, charts, the package-date
     check, a draw & deal details view, and the turn-time and funding-request downloads.
-  • Find a draw — search a borrower / property / loan # and see each draw's full cycle, most
-    recent request first; "Who's falling short" shows how long each account takes to reach a
-    full package and what its draws were waiting on (delay reasons read from the notes).
+  • Find a draw — search a borrower / property / loan # and see each draw's full cycle: every
+    status change with who made it (Salesforce's field history) and its IC approvers (the draw's
+    IC batch). "Not wired yet" shows where each open draw is stuck and for how long; "Who's falling
+    short" shows how long each account takes to reach a full package and what its draws were
+    waiting on (delay reasons read from the notes).
   • Funding request — Melanie's weekly "Construction/Renovation Funding Request" workbook,
     filled from Land Gorilla and Salesforce into the committed template (Advance_template.xlsx).
 
@@ -97,12 +99,11 @@ MILESTONES = [
     ("Full draw package received", PKG_FIELD),
     ("Wired",                      WIRE_FIELD),
 ]
-# Fully-populated construction dollars worth surfacing (api, friendly label).
+# Fully-populated construction dollars worth surfacing (api, friendly label). The interest-reserve fields are left
+# out: the total is $0 on every draw and what's left is $0 or negative on nearly all of them.
 CONSTRUCTION_FIELDS = [
     ("Renovation_Budget_Total__c",          "Renovation budget"),
-    ("Approved_Renovation_Amount_Total__c", "Approved renovation"),
-    ("Interest_Reserve_Total__c",           "Interest reserve"),
-    ("Remaining_Interest_Reserve__c",       "Interest reserve left"),
+    ("Approved_Renovation_Amount_Total__c", "Construction holdback (this draw's properties)"),
     ("Current_UPB__c",                      "Current UPB"),
     ("Outstanding_Facility_Amount__c",      "Remaining commitment"),
     ("Total_Fees__c",                       "Total fees"),
@@ -114,7 +115,10 @@ WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
          NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate", "CreatedDate", "Close_Date__c"]
         + [f for f, _ in CONSTRUCTION_FIELDS] + [m[1] for m in MILESTONES])
 TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
-OPEN_WHERE = f"{WIRE_FIELD}=null AND Status__c NOT IN ({','.join(repr(s) for s in TERMINAL)})"
+# Not wired and still in play. A blank status is a cancelled or abandoned draw (staff clear the status rather than use
+# Cancelled), and SOQL's NOT IN lets blanks through, so they're excluded here and listed on their own.
+OPEN_WHERE = f"{WIRE_FIELD}=null AND Status__c != null AND Status__c NOT IN ({','.join(repr(s) for s in TERMINAL)})"
+NO_STATUS_WHERE = f"{WIRE_FIELD}=null AND Status__c=null"
 # Status__c stages a weekly funding request covers (approval through release) — the export's default filter.
 FUNDING_STAGES = ("Pending Approval", "Approved", "Pending Capital Partner Release", "Pending Release")
 SEARCH_LIMIT = 200    # loan-detail search: most draws rendered (and dated in Land Gorilla) per query
@@ -627,8 +631,15 @@ class LGClient:
 
 
 def _lg_date(v):
+    """A Land Gorilla date or timestamp as a date. A timestamp that names its time zone ('Z', '-07:00') is read in
+       Eastern time, like everything else here; one without a zone keeps its own date."""
     if not v:
         return None
+    s = str(v).strip()
+    if "T" in s and re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", s):
+        t = pd.to_datetime(s, errors="coerce", utc=True)
+        if pd.notna(t):
+            return t.tz_convert("America/New_York").date()
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%m/%d/%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(str(v)[:19], fmt).date()
@@ -757,28 +768,39 @@ MELANIE_MAP = {
     "D": "Borrower_Name_Text__c",                                   # Borrower Name
     "E": ("Deal__r.Contact__r.Name", "Deal__r.Sponsor_Entity__c"),  # Sponsor(s) — a person in her file (Primary Contact)
     "J": "Deal__r.Project_Strategy__c",                             # Project Type (Ground Up / Fix and Flip / …)
-    "M": ("Purchase_Funded_Date__c", "Deal__r.CloseDate"),          # Funded Date
+    "M": "Deal__r.CloseDate",                                       # Funded Date — the property's first funding
+                                                                    # (MELANIE_PROPERTY_MAP) first; this fills gaps
     "N": ("Deal__r.Updated_Loan_Maturity_Date__c",                  # Maturity Date (current, after extensions)
           "Deal__r.Current_Line_Maturity_Date__c"),
-    "O": ("Deal__r.LOC_Commitment__c", "LOC_Commitment__c"),        # Total Loan Commitment (a Deal field)
-    "U": NET_FIELD,                                                 # Current Draw Amount — the net wire; feeds E6
+    "O": ("Deal__r.LOC_Commitment__c", "LOC_Commitment__c"),        # Total Loan Commitment — the whole loan's, on
+                                                                    # portfolio rows too, as in her files
+    "T": "Deal__r.Total_Loan_LTC__c",                               # Completion LTC % (the deal's Reno Total Loan LTC)
+    "U": NET_FIELD,                                                 # Current Draw Amount — replaced below by the
+                                                                    # property's approved (gross) amount, as she does
     "AC": "Deal__r.Next_Payment_Date__c",                           # Next Due Date
-    "AD": "Remaining_Interest_Reserve__c",                          # IR Balance
+    "AD": "Remaining_Interest_Reserve__c",                          # IR Balance (left blank on Full Funding Day 1
+                                                                    # loans, whose reserve sits with the servicer)
     "AF": NOTES_FIELD,                                              # Comments
-    "AH": ("Deal__r.Warehouse_Line__c", "Warehouse_Line__c"),       # Warehouse line (a Deal field)
+    "AH": ("Warehouse_Line_New__c", "Deal__r.Warehouse_Line__c",    # Warehouse line — the draw's own first
+           "Warehouse_Line__c"),
     "AJ": "Deal__r.Owner.Name",                                     # RM/LO — the Deal owner ("CAF Originator" here)
 }
 # From the advance's Property__c: Advance__c's own Property lookup if it has one; else the Deal's property when the
 # Deal has just one, or the single property whose Advance__c points at this draw. Otherwise blank — never a guess.
+# A property value wins over the same column's MELANIE_MAP value; a blank or $0 property value leaves that in place.
+# Checked against Melanie's weekly files (Jul–Oct 2026): the first choice in each column matches her value on 90–100%
+# of the rows that could be matched to Salesforce.
 MELANIE_PROPERTY_MAP = {
     "G": "City__c",                                                       # Property City
     "H": "State__c",                                                      # ST
     "I": "Property_Type__c",                                              # Property Type
-    "K": ("Origination_Date_Value__c", "Appraised_Value_Amount__c"),       # As-Is Value at Origination
+    "K": ("Appraised_Value_Amount__c", "Origination_Date_Value__c"),       # As-Is Value at Origination
     "L": ("Origination_After_Repair_Value__c", "After_Repair_Value__c"),  # As Complete Value at Origination
+    "M": "First_Funding_Date__c",                                         # Funded Date
     "Q": "Initial_Disbursement__c",                                       # Initial Loan Funding
     "AB": "Current_UPB__c",                                               # Current UPB
 }
+ZERO_IS_BLANK = {"K", "L", "O", "Q", "T", "AB"}        # a $0 / 0% here means "not filled in", never a real value
 STREET_PARTS = ("Street_Number__c", "Street_Name__c")   # F Property Street = number + name
 # Computed columns written as live Excel formulas — only where every input cell is filled.
 MELANIE_FORMULAS = {"R": "=Q{r}/K{r}",           # LTV% As-is = initial funding / as-is value
@@ -796,11 +818,11 @@ def _find_template() -> str | None:
     return next((p for p in (os.path.join(here, n) for n in TEMPLATE_CANDIDATES) if os.path.exists(p)), None)
 
 
-def _soql_in(inst: str, tok: str, select: str, obj: str, key: str, values) -> pd.DataFrame:
-    """SELECT … WHERE key IN (…), 200 values per query to stay under Salesforce's URL-length limit."""
+def _soql_in(inst: str, tok: str, select: str, obj: str, key: str, values, where: str = "") -> pd.DataFrame:
+    """SELECT … WHERE key IN (…) [AND where], 200 values per query to stay under Salesforce's URL-length limit."""
     vals = [str(v) for v in dict.fromkeys(values) if pd.notna(v) and str(v)]
     parts = [run_soql(inst, tok, f"SELECT {select} FROM {obj} WHERE {key} IN ('"
-                      + "','".join(soql_escape(v) for v in vals[i:i + 200]) + "')")
+                      + "','".join(soql_escape(v) for v in vals[i:i + 200]) + "')" + (f" AND {where}" if where else ""))
              for i in range(0, len(vals), 200)]
     parts = [p for p in parts if not p.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -831,29 +853,40 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     extra = [p for p in ("Id", "Name", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD, CONTAINER_FIELD)
              + PERSON_FIELDS if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
     checks = {label: path for label, path in DEAL_CHECKS.items() if _usable(resolve_path(inst, tok, "Advance__c", path))}
-    paths = [p for ps in cols.values() for p in ps] + list(checks.values())
+    info = {label: path for label, path in DEAL_INFO.items() if _usable(resolve_path(inst, tok, "Advance__c", path))}
+    paths = [p for ps in cols.values() for p in ps] + list(checks.values()) + list(info.values())
     adv = run_soql(inst, tok, f"SELECT {','.join(dict.fromkeys(extra + paths))} FROM Advance__c "
                               f"WHERE RecordTypeId='{rt}' AND {where} ORDER BY Loan_Number__c")
     if adv.empty:
         return adv, ftypes, unavailable
     out = adv[[c for c in extra if c in adv]].copy()
     for col, ps in cols.items():
-        out[col] = _first_filled(adv, ps)
+        out[col] = _first_filled(adv, ps, zero_is_blank=col in ZERO_IS_BLANK)
     for label, path in checks.items():                        # candidates for the columns no field is confirmed for
         out[f"chk:{label}"] = _col(adv, path).values
         ftypes[f"chk:{label}"] = resolve_path(inst, tok, "Advance__c", path)["type"]
+    for label, path in info.items():                          # shown in the deal details only, never in the file
+        out[f"info:{label}"] = _col(adv, path).values
+        ftypes[f"info:{label}"] = resolve_path(inst, tok, "Advance__c", path)["type"]
+    ffd1 = _col(out, f"chk:{IR_METHOD_CHECK}").map(_txt).eq("Full Funding Day 1")
+    if "AD" in out:                                           # their reserve is the servicer's suspense balance
+        out.loc[ffd1.values, "AD"] = None
     out["_multi_property"] = False
 
     # One row per property per draw, like Salesforce's own file: Property_Advance__c ties each draw to each
-    # property with that property's approved amount. Portfolio rows keep that per-property amount.
+    # property with that property's approved amount — the Current Draw Amount in Melanie's files (it matched her
+    # value on 102 of 104 single-property rows), so it stands over Land Gorilla's whole-draw total.
     pa = _property_advances(inst, tok, _col(out, "Id").tolist())
-    out["_prop_id"], out["_pa_amount"] = None, np.nan
+    out["_prop_id"], out["_pa_amount"], out["_pa_pct"] = None, np.nan, np.nan
     if not pa.empty and "Id" in out:
-        out = out.drop(columns=["_prop_id", "_pa_amount"]).merge(pa, on="Id", how="left")
+        out = out.drop(columns=["_prop_id", "_pa_amount", "_pa_pct"]).merge(pa, on="Id", how="left")
     out["_pa_count"] = out.groupby(_col(out, "Id").fillna("").values)["_prop_id"].transform("count").values
-    out["_u_locked"] = out["_pa_count"] > 1                     # Land Gorilla's draw total can't be split by property
+    out["_u_locked"] = (out["_pa_count"] > 1) | pd.to_numeric(out["_pa_amount"], errors="coerce").notna()
     out["U"] = [a if (lock or pd.notna(a)) else u               # a split draw never repeats the whole amount
                 for a, u, lock in zip(out["_pa_amount"], _col(out, "U"), out["_u_locked"])]
+    pct = pd.to_numeric(out["_pa_pct"], errors="coerce")       # Project Completion % (her values: 188 of 193)
+    if pct.notna().any():
+        out["Y"], ftypes["Y"] = pct.where(pct.between(0, 100)).values, "percent"
 
     # Property columns — validated field by field, so one missing field can't blank the rest.
     try:
@@ -896,8 +929,12 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
             match.append(same[0] if len(same) == 1 else None)
     out["_multi_property"] = [len(per_deal.get(d, [])) > 1 and m is None for d, m in zip(_col(out, "Deal__c"), match)]
     for col, fs in pcols.items():
-        out[col] = [next((m.get(f) for f in fs if m and _txt(m.get(f))), None) for m in match]
-        ftypes[col] = pmeta[fs[0]]["type"]
+        zero = col in ZERO_IS_BLANK
+        vals = [next((m.get(f) for f in fs if m and _filled(m.get(f), zero)), None) for m in match]
+        prior = list(_col(out, col))                           # the MELANIE_MAP value, if the column has one
+        out[col] = [v if v is not None else p for v, p in zip(vals, prior)]
+        if any(v is not None for v in vals) or col not in ftypes:
+            ftypes[col] = pmeta[fs[0]]["type"]
     for label, f in pchecks.items():
         out[f"chk:{label}"] = [m.get(f) if m else None for m in match]
         ftypes[f"chk:{label}"] = pmeta[f]["type"]
@@ -905,23 +942,30 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
 
-# Candidates for the columns no Salesforce field is confirmed for yet. They go on the Prep worksheet (not the
-# request sheet), so they can be checked against Melanie's own file before any is promoted to a real column.
+# Values the request sheet has no column for, put on the Prep worksheet to finish it by hand. Full Funding Day 1 loans
+# hold their interest reserve with the servicer, so their IR Balance is the deal's suspense balance — left for
+# Melanie to confirm rather than written into the request (servicer balances move monthly).
+IR_METHOD_CHECK = "IR funding method — deal IR funding method"
 DEAL_CHECKS = {
-    "Completion LTC % — deal Max LTC": "Deal__r.LTC__c",
-    "Completion LTC % — deal Total Loan LTC": "Deal__r.Total_Loan_LTC__c",
-    "Asset Manager — deal Loan Manager": "Deal__r.Loan_Coordinator__r.Name",
+    "IR balance — deal Servicer suspense balance": "Deal__r.Suspense_Balance__c",
+    IR_METHOD_CHECK: "Deal__r.IR_Funding_Method__c",
 }
-PROPERTY_CHECKS = {
-    "Completion LTC % — property Total Loan LTC": "Total_Loan_LTC__c",
-    "Asset Manager — property Servicer Asset Manager": "Asset_Manager__c",
-    "Estimated Completion — property Rehab Completion Date": "Rehab_Completion_Date__c",
+PROPERTY_CHECKS: dict = {}
+# Deal facts for the Draw & deal details view only (resolved one by one, so a missing field just drops out).
+DEAL_INFO = {
+    "Original maturity": "Deal__r.Stated_Maturity_Date__c",
+    "Extensions": "Deal__r.Num_of_Property_Extensions__c",
+    "Servicer status": "Deal__r.Servicer_Status__c",
+    "Servicer": "Deal__r.Servicer_Name__c",
+    "Interest reserve at closing": "Deal__r.Interest_Reserves__c",
+    "Construction holdback (whole loan)": "Deal__r.Total_Max_Reno_Cost_Reimbursement__c",
 }
 
 
 def _property_advances(inst: str, tok: str, adv_ids) -> pd.DataFrame:
-    """Property_Advance__c rows for these draws — columns Id (the draw), _prop_id, _pa_amount. Empty when the org
-       doesn't have the object or the draws have no property split."""
+    """Property_Advance__c rows for these draws — columns Id (the draw), _prop_id, _pa_amount (the property's approved
+       amount) and _pa_pct (its project completion %). Empty when the org doesn't have the object or the draws have no
+       property split."""
     try:
         meta = describe_object(inst, tok, "Property_Advance__c")
     except Exception:
@@ -932,21 +976,36 @@ def _property_advances(inst: str, tok: str, adv_ids) -> pd.DataFrame:
         return pd.DataFrame()
     amt = "Approved_Advance_Amount_Calc__c" if "Approved_Advance_Amount_Calc__c" in meta else next(
         (f for f, m in meta.items() if m["type"] == "currency" and "amount" in str(m.get("label", "")).lower()), None)
+    pct = "Project_Completion_Percent__c" if "Project_Completion_Percent__c" in meta else None
     try:
-        pa = _soql_in(inst, tok, ",".join(["Id", adv_fk, prop_fk] + ([amt] if amt else [])), "Property_Advance__c",
+        pa = _soql_in(inst, tok, ",".join(["Id", adv_fk, prop_fk] + [f for f in (amt, pct) if f]), "Property_Advance__c",
                       adv_fk, adv_ids)
     except Exception:
         return pd.DataFrame()
     if pa.empty or adv_fk not in pa or prop_fk not in pa:
         return pd.DataFrame()
     return pd.DataFrame({"Id": pa[adv_fk].values, "_prop_id": pa[prop_fk].values,
-                         "_pa_amount": pd.to_numeric(pa[amt], errors="coerce").values if amt in pa else np.nan})
+                         "_pa_amount": pd.to_numeric(pa[amt], errors="coerce").values if amt in pa else np.nan,
+                         "_pa_pct": pd.to_numeric(pa[pct], errors="coerce").values if pct in pa else np.nan})
 
 
-def _first_filled(df: pd.DataFrame, paths: list) -> list:
-    """Per row, the first of these columns that has a value (blank strings don't count)."""
+def _filled(v, zero_is_blank: bool = False) -> bool:
+    """Has a value: not blank, and — where a zero means nothing was entered — not 0."""
+    if not _txt(v):
+        return False
+    if zero_is_blank:
+        try:
+            return float(v) != 0
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
+def _first_filled(df: pd.DataFrame, paths: list, zero_is_blank: bool = False) -> list:
+    """Per row, the first of these columns that has a value (blank strings don't count, nor zeros if asked)."""
     cols = [df[p] for p in paths if p in df]
-    return [next((v for v in vals if _txt(v)), None) for vals in zip(*cols)] if cols else [None] * len(df)
+    return ([next((v for v in vals if _filled(v, zero_is_blank)), None) for vals in zip(*cols)] if cols
+            else [None] * len(df))
 
 
 _DIRECTIONS = {"n", "s", "e", "w", "north", "south", "east", "west", "ne", "nw", "se", "sw"}
@@ -1071,13 +1130,16 @@ def _write_total_summary(wb, summary: dict) -> None:
         r += 8
 
 
-LG_COLUMNS = ("U", "AG", "M", "N", "Y", "AB", "W")       # columns Land Gorilla fills first
+LG_COLUMNS = ("U", "AG", "M", "N", "Y", "AB")            # columns Land Gorilla can fill
+SF_FIRST = ("M", "Y")          # ... where Salesforce's value matches Melanie's files, so Land Gorilla only fills gaps
 
 
 def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
                loans: bool = True) -> tuple[pd.DataFrame, dict, dict]:
-    """Land Gorilla first: each draw's amount and payees, and each loan's funded date, current due date, project
-       completion, balance and remaining to fund. Salesforce stays only where Land Gorilla has nothing.
+    """Land Gorilla first: each draw's payees, its amount where Salesforce has no per-property amount, and each loan's
+       current due date and balance (single-property loans: the loan's balance is that property's). The funded date
+       and project completion stay Salesforce's (SF_FIRST), with Land Gorilla filling gaps. Its loan-level remaining to
+       fund goes on the Prep worksheet, never into a property's row.
        Returns (rows, ftypes, {"draws": {...}, "loans": {...}}) — the raw LG data feeds the prep worksheet."""
     lg = {"draws": {}, "loans": {}}
     if rows.empty or not cfg:
@@ -1095,14 +1157,23 @@ def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
     dr = _col(rows, CONTAINER_FIELD).map(lambda c: lg["draws"].get(c) if isinstance(c, str) else None)
     lo = _col(rows, "B").map(lambda n: lg["loans"].get(_txt(n)) if _txt(n) else None)
     payees = dr.map(lambda d: "; ".join(d["payees"]) if d and d.get("payees") else None)
+    portfolio = pd.to_numeric(_col(rows, "_pa_count"), errors="coerce").fillna(0) > 1
     for col, src, key, ftype in (("U", dr, "amount", "currency"), ("M", lo, "funded_date", "date"),
                                  ("N", lo, "due_date", "date"), ("Y", lo, "project_pct", "percent"),
-                                 ("AB", lo, "balance", "currency"), ("W", lo, "to_finish", "currency")):
+                                 ("AB", lo, "balance", "currency")):
         got = src.map(lambda d: d.get(key) if d else None)
+        if col == "AB":
+            got = got.where(~portfolio.values, None)
         locks = [col == "U" and x is not None and not pd.isna(x) and bool(x) for x in _col(rows, "_u_locked")]
-        rows[col] = [b if lock else (a if _txt(a) else b) for a, b, lock in zip(got, _col(rows, col), locks)]
-        if got.map(lambda x: _txt(x) != "").any():
-            ftypes[col] = ftype
+        sf = list(_col(rows, col))
+        if col in SF_FIRST:
+            rows[col] = [b if _txt(b) else a for a, b in zip(got, sf)]
+            used = any(not _txt(b) and _txt(a) for a, b in zip(got, sf))
+        else:
+            rows[col] = [b if lock else (a if _txt(a) else b) for a, b, lock in zip(got, sf, locks)]
+            used = any(not lock and _txt(a) for a, lock in zip(got, locks))
+        if used:                                    # same kind of value as Salesforce's, where it has one
+            ftypes.setdefault(col, ftype)
     rows["AG"] = payees.tolist()
     ftypes["AG"] = "string"
     return rows, ftypes, lg
@@ -1138,6 +1209,7 @@ def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None, ftypes: d
         "Property matched": ["No — portfolio loan" if bool(m) else "" for m in _col(rows, "_multi_property")],
     })
     if ap is not None and not ap.empty:
+        t["IC"] = ids.map(ap["_ic_label"]).values if "_ic_label" in ap else None
         for c in ("Approved by", "Approved on", "Approval comments"):
             t[c] = ids.map(ap[c]).values if c in ap else None
         t["Approved on"] = _dates(t["Approved on"])
@@ -1268,89 +1340,279 @@ def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFram
     return xlsx, len(rows)
 
 
-# ───────────────────────────── approvals ────────────────────────────────────
-APPROVAL_COLS = ["Approval", "Approval status", "Approved by", "Approved on", "Approval comments", "_steps"]
-STEP_NAMES = {"Started": "Sent for approval", "Approved": "Approved", "Rejected": "Rejected"}
+# ───────────────────────────── status history ───────────────────────────────
+# Advance__History tracks each draw's creation and every change to its status, IC approval status and wire date, with
+# who made it — about eight rows a draw. It fills in the review dates staff leave blank and shows how long each step
+# took. Every draw starts in Received; a move after the first Completed is a correction made after funding.
+HISTORY_FIELDS = ("created", "Status__c", "IC_Approval_Status__c", WIRE_FIELD)
+HISTORY_COLS = ["ParentId", "Field", "OldValue", "NewValue", "When", "By"]
+SYNC_USER = "Portal Site Guest User"               # how Land Gorilla's sync appears in Salesforce's history
+WAITING_STATUSES = ("", "Received", "Pending Inspection", "Pending Inspection Report Revision",
+                    "Pending Borrower Response", "Hold")
+REVIEW_STATUSES = ("Pending Approval", "Pending Release", "Approved", "Completed")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _approval_source(inst: str, tok: str) -> dict | None:
-    """The org's IC approval records for draws (the "B-mmddyyyy…" rows on the Construction Advance IC Approvals
-       page): an object tied to Advance__c whose name mentions approval, plus its likeliest fields."""
-    adv = describe_full(inst, tok, "Advance__c")
-    src = next(({"kind": "parent", "obj": m["ref"][0], "rel": m["rel"]} for m in adv["fields"].values()
-                if m["type"] == "reference" and m["ref"] and m["rel"] and "approv" in m["ref"][0].lower()), None)
-    src = src or next(({"kind": "child", "obj": ch, "fk": fk} for ch, fk in adv["children"]
-                       if ch and fk and "approv" in ch.lower()), None)
-    if not src:
+@st.cache_data(ttl=300, show_spinner=False)
+def draw_history(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
+    """The draws' tracked changes (HISTORY_FIELDS), oldest first, with who made each and when in Eastern time. Empty
+       when the history can't be read — every caller then falls back to the draw's own date fields."""
+    want = [i for i in dict.fromkeys(ids) if isinstance(i, str) and i]
+    empty = pd.DataFrame(columns=HISTORY_COLS)
+    if not want:
+        return empty
+    try:
+        h = _soql_in(inst, tok, "ParentId,Field,OldValue,NewValue,CreatedDate,CreatedBy.Name", "Advance__History",
+                     "ParentId", want, where="Field IN (" + ",".join(f"'{f}'" for f in HISTORY_FIELDS) + ")")
+    except Exception as exc:
+        if _session_expired(exc):
+            raise
+        return empty
+    if h.empty or "Field" not in h:
+        return empty
+    h = h[h["Field"].isin(HISTORY_FIELDS)]
+    out = pd.DataFrame({"ParentId": h["ParentId"], "Field": h["Field"],
+                        "OldValue": _col(h, "OldValue").map(_txt), "NewValue": _col(h, "NewValue").map(_txt),
+                        "When": pd.to_datetime(h["CreatedDate"], errors="coerce", utc=True).dt.tz_convert(
+                            "America/New_York"),
+                        "By": _col(h, "CreatedBy.Name").map(_txt).replace(SYNC_USER, "Land Gorilla sync")})
+    return out.dropna(subset=["When"]).sort_values(["ParentId", "When"], kind="stable").reset_index(drop=True)
+
+
+def _history_by_draw(h: pd.DataFrame | None) -> dict:
+    """{draw Id: its history rows}."""
+    return dict(tuple(h.groupby("ParentId", sort=False))) if h is not None and not h.empty else {}
+
+
+def _field_trail(h: pd.DataFrame | None, field: str) -> list:
+    """One field's changes, oldest first: [(when, old, new, by), ...]."""
+    if h is None or h.empty:
+        return []
+    s = h[h["Field"] == field]
+    return list(zip(s["When"], s["OldValue"], s["NewValue"], s["By"]))
+
+
+def _status_trail(h: pd.DataFrame | None) -> list:
+    """A draw's status changes in order — [(when, old, new, by), ...] — with changes saved in the same second put in
+       the order they chain (each one's old status is the one before's new status)."""
+    rows, out, cur = _field_trail(h, "Status__c"), [], None
+    while rows:
+        same = [r for r in rows if r[0] == rows[0][0]]
+        while same:
+            news = {r[2] for r in same}           # else start where no other change in that second led
+            nxt = (next((r for r in same if r[1] == cur), None) or next((r for r in same if r[1] not in news), None)
+                   or same[0])
+            out.append(nxt)
+            same.remove(nxt)
+            rows.remove(nxt)
+            cur = nxt[2]
+    return out
+
+
+def _until_completed(trail: list) -> list:
+    """The status trail up to and including the first move to Completed (later moves are corrections)."""
+    i = next((k for k, r in enumerate(trail) if r[2] == "Completed"), None)
+    return trail if i is None else trail[:i + 1]
+
+
+def _ic_trail(h: pd.DataFrame | None) -> list:
+    """IC approval status changes, oldest first, without an Approved that was undone within 5 seconds (a glitch when
+       some draws were created)."""
+    t, drop = _field_trail(h, "IC_Approval_Status__c"), set()
+    for i in range(len(t) - 1):
+        if t[i][2] == "Approved" and t[i + 1][1] == "Approved" and (t[i + 1][0] - t[i][0]).total_seconds() <= 5:
+            drop |= {i, i + 1}
+    return [r for i, r in enumerate(t) if i not in drop]
+
+
+def _bd_between(a, b) -> int | None:
+    """Business days from a to b, each a date or an Eastern timestamp (None if either is missing or b is earlier)."""
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
         return None
-    fields = describe_full(inst, tok, src["obj"])["fields"]
+    n = int(np.busday_count(np.datetime64(pd.Timestamp(a).date(), "D"), np.datetime64(pd.Timestamp(b).date(), "D"),
+                            holidays=_HOLS))
+    return n if n >= 0 else None
 
-    def pick(test):
-        return next((n for n, m in fields.items() if test(n.lower(), str(m.get("label", "")).lower(), m)), None)
 
-    by = pick(lambda n, l, m: m["type"] == "reference" and m["ref"] == ["User"] and "approv" in n + l)
-    src.update(status=pick(lambda n, l, m: "status" in l and m["type"] in ("picklist", "string")),
-               when=pick(lambda n, l, m: "approv" in l and m["type"] in ("date", "datetime")) or "LastModifiedDate",
-               comments=pick(lambda n, l, m: "comment" in l and m["type"] in ("textarea", "string")),
-               by=f"{fields[by]['rel']}.Name" if by and fields[by].get("rel") else "LastModifiedBy.Name")
-    return src
+def _likely_package(trail: list, ic: list) -> date | None:
+    """Status history's best guess at when the full package was in: the last move from a waiting status into review
+       before the draw was first completed — or its first IC submission, if that came earlier. Shown as an estimate,
+       never used for turn-time."""
+    moves = [r[0] for r in _until_completed(trail) if r[1] in WAITING_STATUSES and r[2] in REVIEW_STATUSES]
+    sent = next((r[0] for r in ic if r[2] == "Submitted"), None)
+    found = [x for x in (moves[-1] if moves else None, sent) if x is not None]
+    return min(found).date() if found else None
+
+
+# ───────────────────────────── approvals ────────────────────────────────────
+# IC approvals live on Batch_Approval__c — the "B-mmddyyyy-hhmm" records on the Construction Advance IC Approvals page
+# — which each draw points to (Batch_Approval__c). Its approvers are Batch_Approver__c rows, one per person, and their
+# replies are also appended to the batch's Approval Comments ('8/28/2026 : Name : …'; a reply by email reads
+# 'Approved from E-mail by Name'). There's no standard approval process on draws. The draw's history records each IC
+# status change and who made it; an approval sent by email reply is saved by the integration user.
+APPROVAL_COLS = ["Approval", "Approval status", "Approved by", "Approved on", "Approval comments", "_approvers",
+                 "_ic_label", "_ic_tone", "_ic_sent", "_ic_by", "_ic_at"]
+BATCH_PATHS = ("Batch_Approval__r.Name", "Batch_Approval__r.CreatedDate", "Batch_Approval__r.Approval_Type__c",
+               "Batch_Approval__r.Approval_Status__c", "Batch_Approval__r.Approved_Rejected_Date__c",
+               "Batch_Approval__r.Number_of_Approved__c", "Batch_Approval__r.Number_of_Rejected__c",
+               "Batch_Approval__r.Is_Recalled__c", "Batch_Approval__r.Recall_Reason__c",
+               "Batch_Approval__r.Approval_Comments__c", "Batch_Approval__r.Submitted_By__r.Name")
+OVER_1M = "Construction Batch Approval - Over 1M"   # needs a final sign-off that Salesforce often never records
+IC_BATCHES_LIVE = date(2026, 4, 14)                # IC batch approvals began; draws wired before then have none
+EMAIL_HANDLER = "Integrations User"                # the user that saves approvals IC members send by email reply
+_IC_HEAD = re.compile(r"(?m)^[ \t]*(\d{1,2}/\d{1,2}/\d{2,4})[ \t]*:[ \t]*([^:\r\n\"]+?)[ \t]*:[ \t]*")
+_IC_EMAIL = re.compile(r"\b(approved|rejected|recalled)\s+from\s+e-?mail\s+by\s+([^:\r\n\"]+?)\s*(?=[:\r\n\"]|$)",
+                       re.IGNORECASE)
+
+
+def _num(v) -> float:
+    x = pd.to_numeric(v, errors="coerce")
+    return 0.0 if pd.isna(x) else float(x)
+
+
+def _when_et(ts) -> str:
+    """'9/28/2026 1:05 PM' for an Eastern timestamp."""
+    return f"{_mdy(ts.date())} {ts.strftime('%I:%M %p').lstrip('0')}"
+
+
+def _approver_text(p: dict) -> str:
+    """'Pat Lee (8/28, email)'."""
+    bits = ([f"{p['date'].month}/{p['date'].day}"] if p.get("date") else []) + (
+        ["email"] if p.get("channel") == "email" else [])
+    return p["name"] + (f" ({', '.join(bits)})" if bits else "")
+
+
+def parse_ic_comments(text) -> list:
+    """The approvers in a batch's Approval Comments, latest line per person: [{"name", "status", "date", "channel",
+       "comment"}]. A line counts as a decision only when it says so — an email reply, or the words approved, reject
+       or recall; a plain comment isn't one."""
+    t = _txt(text)
+    heads = list(_IC_HEAD.finditer(t))
+    found = {}
+    for i, m in enumerate(heads):
+        body = t[m.end(): heads[i + 1].start() if i + 1 < len(heads) else len(t)].strip().strip('"').strip()
+        name, channel, e = m.group(2).strip(), "", _IC_EMAIL.search(body)
+        if e:
+            status, name, channel = e.group(1).title(), e.group(2).strip(), "email"
+            body = (body[:e.start()] + body[e.end():]).strip(' :-"\t\r\n')
+        elif re.search(r"\breject", body, re.IGNORECASE):
+            status = "Rejected"
+        elif re.search(r"\brecall", body, re.IGNORECASE):
+            status = "Recalled"
+        elif re.search(r"\bapprov", body, re.IGNORECASE):
+            status = "Approved"
+        else:
+            continue
+        found[name.lower()] = {"name": name, "status": status, "date": _d(m.group(1)), "channel": channel,
+                               "comment": body}
+    return list(found.values())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
-    """Who approved each draw, when, and what they wrote — indexed by Advance Id. Salesforce's approval history gives
-       every step (sent for approval, approved, rejected) and the person who took it; a draw can need more than one
-       approver. The org's IC approval record adds its name and status. _steps = [(date, step, person), ...]."""
-    out = {i: {} for i in ids if isinstance(i, str) and i}
-    if not out:
-        return pd.DataFrame(columns=APPROVAL_COLS)
+    """Each draw's IC approval, indexed by Advance Id (APPROVAL_COLS): its batch, where it stands in plain English, and
+       who approved and when — from the batch's approver records, else its comments, else the draw's history — plus
+       the batch's raw comments for the export. Empty when the org has no IC batches."""
+    want = [i for i in dict.fromkeys(ids) if isinstance(i, str) and i]
+    empty = pd.DataFrame(columns=APPROVAL_COLS)
+    if not want or not resolve_path(inst, tok, "Advance__c", "Batch_Approval__c"):
+        return empty
+    paths = [p for p in ("Batch_Approval__c", "IC_Approval_Status__c", WIRE_FIELD, NET_FIELD) + BATCH_PATHS
+             if resolve_path(inst, tok, "Advance__c", p)]
     try:
-        steps = _soql_in(inst, tok, "ProcessInstance.TargetObjectId,StepStatus,Comments,Actor.Name,CreatedDate",
-                         "ProcessInstanceStep", "ProcessInstance.TargetObjectId", list(out))
-    except Exception:
-        steps = pd.DataFrame()
-    if not steps.empty and "StepStatus" in steps:
-        steps = steps[steps["StepStatus"].isin(list(STEP_NAMES))].sort_values("CreatedDate", kind="stable")
-        for aid, g in steps.groupby("ProcessInstance.TargetObjectId"):
-            rec = {"_steps": [(_d(r["CreatedDate"]), STEP_NAMES[r["StepStatus"]], _txt(r.get("Actor.Name")))
-                              for _, r in g.iterrows()]}
-            done = g[g["StepStatus"].isin(["Approved", "Rejected"])]
-            if len(done):
-                approvers = dict.fromkeys(_txt(x) for x in done.loc[done["StepStatus"] == "Approved", "Actor.Name"])
-                rec.update({"Approval status": done.iloc[-1]["StepStatus"],
-                            "Approved by": ", ".join(a for a in approvers if a) or None,
-                            "Approved on": _d(done.iloc[-1].get("CreatedDate")),
-                            "Approval comments": "\n".join(
-                                f'{_mdy(_d(r["CreatedDate"]))}: {_txt(r.get("Actor.Name"))} : "{_txt(r.get("Comments"))}"'
-                                for _, r in done.iterrows() if _txt(r.get("Comments"))) or None})
-            out.setdefault(aid, {}).update(rec)
-    try:
-        src = _approval_source(inst, tok)
-        if src:
-            cols = [c for c in ("Name", src["status"], src["when"], src["comments"], src["by"]) if c]
-            if src["kind"] == "parent":
-                pre, key = f"{src['rel']}.", "Id"
-                recs = _soql_in(inst, tok, ",".join(["Id"] + [pre + c for c in cols]), "Advance__c", "Id", list(out))
-            else:
-                pre, key = "", src["fk"]
-                recs = _soql_in(inst, tok, ",".join([key] + cols), src["obj"], key, list(out))
-            if not recs.empty and pre + src["when"] in recs:
-                recs = recs.sort_values(pre + src["when"])
-            for _, r in recs.iterrows():                 # latest approval record per draw wins
-                if not _txt(r.get(pre + "Name")):
-                    continue
-                # Without a real approver / approval-date field, "by" and "when" fall back to the record's last edit,
-                # which is often an integration user — never let that stand in for the people who approved.
-                found = {"Approval": _txt(r.get(pre + "Name")),
-                         "Approval status": _txt(r.get(pre + src["status"])) if src["status"] else None,
-                         "Approved by": _txt(r.get(pre + src["by"])) if src["by"] != "LastModifiedBy.Name" else None,
-                         "Approved on": _d(r.get(pre + src["when"])) if src["when"] != "LastModifiedDate" else None,
-                         "Approval comments": _txt(r.get(pre + src["comments"])) if src["comments"] else None}
-                out.setdefault(r[key], {}).update({k: v for k, v in found.items() if v})
-    except Exception:
-        pass
+        draws = _soql_in(inst, tok, ",".join(["Id"] + paths), "Advance__c", "Id", want)
+    except Exception as exc:
+        if _session_expired(exc):
+            raise
+        return empty
+    if draws.empty:
+        return empty
+    batches = [b for b in dict.fromkeys(_col(draws, "Batch_Approval__c")) if isinstance(b, str) and b]
+    people: dict = {}
+    if batches:
+        try:
+            rows = _soql_in(inst, tok, "Batch_Approval__c,Approver__r.Name,Status__c,Approval_Date__c,Comments__c,"
+                                       "LastModifiedDate", "Batch_Approver__c", "Batch_Approval__c", batches)
+        except Exception as exc:              # approver rows follow the batch's sharing, so they may be hidden
+            if _session_expired(exc):
+                raise
+            rows = pd.DataFrame()
+        for _, r in rows.iterrows():
+            status = _txt(r.get("Status__c")) or "Pending"
+            people.setdefault(r.get("Batch_Approval__c"), []).append({
+                "name": _txt(r.get("Approver__r.Name")), "status": status, "channel": "",
+                "date": _d(r.get("Approval_Date__c")) or (_d(r.get("LastModifiedDate")) if status != "Pending"
+                                                          else None),
+                "comment": _txt(r.get("Comments__c"))})
+    hist = _history_by_draw(draw_history(inst, tok, ids))
+    out = {r["Id"]: _ic_record(r, people.get(r.get("Batch_Approval__c")), hist.get(r["Id"]))
+           for _, r in draws.iterrows()}
     return pd.DataFrame.from_dict(out, orient="index").reindex(columns=APPROVAL_COLS)
+
+
+def _ic_record(r: pd.Series, people: list | None, h: pd.DataFrame | None) -> dict:
+    """One draw's IC approval (see approvals_for)."""
+    wire, ic, status = _d(r.get(WIRE_FIELD)), _ic_trail(h), _txt(r.get("IC_Approval_Status__c"))
+    batch = _txt(r.get("Batch_Approval__r.Name"))
+    made = pd.to_datetime(r.get("Batch_Approval__r.CreatedDate"), errors="coerce", utc=True)
+    made = made.tz_convert("America/New_York") if pd.notna(made) else None
+    reopened = bool(batch and wire and made is not None and (_bd_between(wire, made) or 0) > 2)
+    if reopened:              # a batch made after the wire isn't this draw's approval: use what history shows before it
+        ic = [x for x in ic if x[0] < made]
+        status, batch, people, made = (ic[-1][2] if ic else ""), "", None, None
+    people = [p for p in people or [] if p["name"]]
+    pick = lambda name: _txt(r.get(f"Batch_Approval__r.{name}")) if batch else ""          # noqa: E731
+    comments = pick("Approval_Comments__c")
+    decided = [p for p in people if p["status"] in ("Approved", "Rejected", "Recalled")] or parse_ic_comments(comments)
+    approved = [x for x in ic if x[2] == "Approved"]
+    approved_at = approved[-1][0] if approved else None
+    if not decided and approved:              # whoever saved the approval in Salesforce (by email: no name)
+        who = approved[-1][3]
+        decided = [{"name": who if who != EMAIL_HANDLER else "IC member", "status": "Approved",
+                    "date": approved_at.date(), "channel": "email" if who == EMAIL_HANDLER else "", "comment": ""}]
+    ok = [p for p in decided if p["status"] == "Approved"]
+    waiting = [p["name"] for p in people if p["status"] in ("Pending", "No Response")]
+    names = ", ".join(p["name"] for p in ok)
+    n_ok, n_rej, batch_status = _num(pick("Number_of_Approved__c")), _num(pick("Number_of_Rejected__c")), \
+        pick("Approval_Status__c")
+    is_approved = status == "Approved" or (batch_status == "Approved" and n_ok > 0)
+    approved_on = None
+    if is_approved or ok:
+        approved_on = (approved_at.date() if approved_at is not None else None) or (
+            _d(pick("Approved_Rejected_Date__c")) if is_approved else None) or max(
+            (p["date"] for p in ok if p["date"]), default=None)
+    if is_approved:
+        label, tone = "IC approved" + (f" {_mdy(approved_on)}" if approved_on else "") + (
+            f" by {names}" if names else ""), "green"
+    elif status == "Rejected" or n_rej > 0:
+        who = ", ".join(p["name"] for p in decided if p["status"] == "Rejected")
+        label, tone = "IC rejected" + (f" by {who}" if who else ""), "red"
+    elif status == "Recalled" or pick("Is_Recalled__c").lower() in ("true", "1"):
+        reason = pick("Recall_Reason__c")
+        label, tone = "IC approval recalled" + (f": {reason}" if reason else ""), "red"
+    elif batch and pick("Approval_Type__c") == OVER_1M and (ok or n_ok > 0):
+        label, tone = ((f"Approved by {names or 'IC'} — final sign-off not recorded in Salesforce", "orange") if wire
+                       else ("Partly approved" + (f"; waiting on {', '.join(waiting)}" if waiting else ""), "blue"))
+    elif batch:
+        label, tone = ("With IC approvers" + (f" since {_when_et(made)}" if made is not None else "")
+                       + (f"; waiting on {', '.join(waiting)}" if waiting else ""), "blue")
+    elif wire and wire < IC_BATCHES_LIVE:
+        label, tone = "Before IC batch approvals", "gray"
+    elif wire and _num(r.get(NET_FIELD)) <= 0:
+        label, tone = "$0 or adjustment draw — no IC batch", "gray"
+    elif wire:
+        label, tone = "No IC batch recorded", "gray"
+    else:
+        label, tone = "Not sent for IC approval yet", "gray"
+    if reopened:
+        label += " · a new IC batch was opened after the wire"
+    sent = next((x[0] for x in ic if x[2] == "Submitted"), None)
+    sent_by = next((x[3] for x in ic if x[2] == "Submitted"), "")
+    if sent is None and made is not None:
+        sent, sent_by = made, pick("Submitted_By__r.Name")
+    return {"Approval": batch or None, "Approval status": status or batch_status or None,
+            "Approved by": "; ".join(_approver_text(p) for p in ok) or None, "Approved on": approved_on,
+            "Approval comments": comments or None, "_approvers": decided, "_ic_label": label, "_ic_tone": tone,
+            "_ic_sent": sent, "_ic_by": sent_by, "_ic_at": approved_at}
 
 
 # ───────────────────────────── delay reasons ────────────────────────────────
@@ -1740,12 +2002,29 @@ def delay_keys(note) -> tuple:
 
 
 def delay_labels(note) -> list:
-    """What a draw's notes say held it up, in plain English. A plain "Inspection" is dropped when the notes name a
-       more specific inspection hold-up (late or revised, or the borrower's own), so the same thing isn't listed twice."""
-    keys = delay_keys(note)
+    """What a draw's notes say held it up, in plain English."""
+    return _key_labels(delay_keys(note))
+
+
+def _key_labels(keys) -> list:
+    """DELAY_REASONS keys in plain English. A plain "Inspection" is dropped when a more specific inspection hold-up
+       (late or revised, or the borrower's own) is there too, so the same thing isn't listed twice."""
     if "inspection" in keys and {"inspection_delay", "self_inspection"} & set(keys):
         keys = tuple(k for k in keys if k != "inspection")
     return [DELAY_REASONS[k][0] for k in keys]
+
+
+def now_keys(note, ref: date | None = None) -> tuple:
+    """Hold-ups in a note's newest dated entries only (every entry on that day) — what the draw is waiting on now,
+       rather than everything its history ever mentioned. A note with no dated entries counts as a whole."""
+    got = latest_entries(note, ref)
+    return delay_keys("\n".join(got[1])) if got else delay_keys(note)
+
+
+def sent_back(note, ref: date | None = None) -> bool:
+    """The newest dated note entries say the draw went back to Unsubmitted in Land Gorilla."""
+    got = latest_entries(note, ref)
+    return bool(got) and "unsubmitted" in delay_reasons("\n".join(got[1]))
 
 
 def delay_evidence(note, limit: int = 3) -> list:
@@ -1816,7 +2095,7 @@ def _show(v, sftype: str | None = None) -> str | None:
 
 
 def _draw_no(r) -> str:
-    """A draw's number within its loan: '11' for advance 34961-11 (whose Salesforce Name is 11)."""
+    """A draw's number within its loan: '11' for advance 12345-11 (whose Salesforce Name is 11)."""
     name, adv = _txt(r.get("Name")), _txt(r.get("Loan_Advance_Number__c"))
     if name.isdigit():
         return name
@@ -1857,22 +2136,28 @@ def _believable(df: pd.DataFrame, col: str) -> pd.Series:
     return d.where(~bad)
 
 
-def _request_date(df: pd.DataFrame) -> pd.Series:
-    """Each draw's request date: Land Gorilla's; else, for a draw synced from Land Gorilla, the moment Salesforce
-       received it; else a believable Salesforce request or inspection-ordered date; else the day the record was
-       created, if that was before the wire. Never the wire date itself (blank when nothing else is known)."""
+def _request_chain(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Each draw's request date and where it came from: Land Gorilla's; else, for a draw synced from Land Gorilla, the
+       moment Salesforce received it; else a believable Salesforce request or inspection-ordered date; else the day the
+       record was created, if that was before the wire. Never the wire date itself (blank when nothing else is known:
+       the draw was entered on its funding day)."""
     made, wire = _created_day(df), _wire_day(df)
-    synced = _col(df, CONTAINER_FIELD).map(_txt) != ""
-    out = _day(_col(df, "_lg_req")).fillna(made.where(synced))
-    for col in (REQ_FIELD, "Date_Inspection_Ordered__c"):
-        out = out.fillna(_believable(df, col))
-    return out.fillna(made.where(wire.isna() | (made < wire)))
+    before_wire = wire.isna() | (made <= wire)
+    synced = (_col(df, CONTAINER_FIELD).map(_txt) != "") & before_wire
+    out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    src = pd.Series(None, index=df.index, dtype=object)
+    for vals, label in ((_day(_col(df, "_lg_req")), "Land Gorilla"), (made.where(synced), "Salesforce record created"),
+                        (_believable(df, REQ_FIELD), "Salesforce request date"),
+                        (_believable(df, "Date_Inspection_Ordered__c"), "inspection ordered"),
+                        (made.where(wire.isna() | (made < wire)), "Salesforce record created")):
+        take = out.isna() & vals.notna()
+        out[take], src[take] = vals[take], label
+    return out, src
 
 
-def _order_date(df: pd.DataFrame) -> pd.Series:
-    """The date a draw sorts by: its request date, else the day it was created in Salesforce (never blank: older
-       draws were entered on their wire day)."""
-    return _request_date(df).fillna(_created_day(df))
+def _request_date(df: pd.DataFrame) -> pd.Series:
+    """Each draw's request date (see _request_chain)."""
+    return _request_chain(df)[0]
 
 
 def _created_ts(df: pd.DataFrame) -> pd.Series:
@@ -1899,11 +2184,12 @@ def _newest_first(df: pd.DataFrame) -> pd.DataFrame:
        the order they're requested); loans are ordered by their most recent draw."""
     if df.empty:
         return df
-    when, made = _order_date(df), _created_ts(df)
+    (req, src), made = _request_chain(df), _created_ts(df)
+    when = req.fillna(_created_day(df))
     seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
     loan = _col(df, "Loan_Number__c").map(_txt)
     latest = when.groupby(loan).transform("max")
-    return (df.assign(_when=when.values, _req_day=_request_date(df).values, _seq=seq.values, _made=made.values,
+    return (df.assign(_when=when.values, _req_day=req.values, _req_src=src.values, _seq=seq.values, _made=made.values,
                       _latest=latest.values, _loan=loan.values)
               .sort_values(["_latest", "_loan", "_seq", "_made"], ascending=[False, True, False, False],
                            na_position="last", kind="stable")
@@ -1913,14 +2199,22 @@ def _newest_first(df: pd.DataFrame) -> pd.DataFrame:
 def _by_date(df: pd.DataFrame) -> pd.DataFrame:
     """Draws from many loans, most recent request first (ties: created later, then higher draw number first)."""
     seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
-    return (df.assign(_when=_order_date(df).values, _req_day=_request_date(df).values, _made=_created_ts(df).values,
-                      _seq=seq.values)
+    req, src = _request_chain(df)
+    return (df.assign(_when=req.fillna(_created_day(df)).values, _req_day=req.values, _req_src=src.values,
+                      _made=_created_ts(df).values, _seq=seq.values)
               .sort_values(["_when", "_made", "_seq"], ascending=False, na_position="last", kind="stable"))
 
 
 def latest_entry(note, ref: date | None = None) -> tuple | None:
-    """The newest dated entry in a note log, as (date, text). Logs run newest-first or oldest-first, and entry dates
-       usually have no year, so each goes in the year that puts it closest to ref (the draw's own date)."""
+    """The newest dated entry in a note log, as (date, text) — the first one written on that day."""
+    got = latest_entries(note, ref)
+    return (got[0], got[1][0]) if got else None
+
+
+def latest_entries(note, ref: date | None = None) -> tuple | None:
+    """The newest dated entries in a note log, as (date, [text, ...]) in the order written. Logs run newest-first or
+       oldest-first, and entry dates usually have no year, so each goes in the year that puts it closest to ref (the
+       draw's own date)."""
     ref, best = ref or _today(), None
     for when, text in note_entries(_txt(note)):
         text = text.lstrip(";:,-–— ").strip()
@@ -1934,38 +2228,111 @@ def latest_entry(note, ref: date | None = None) -> tuple | None:
         except ValueError:
             continue
         if best is None or d > best[0]:
-            best = (d, text)
+            best = (d, [text])
+        elif d == best[0]:
+            best[1].append(text)
     return best
 
 
-def _timeline(row: pd.Series, a) -> pd.DataFrame:
-    """What happened to a draw, in date order — only steps that were recorded: Land Gorilla's request and funding,
-       the Salesforce milestones that were filled in, the full-package date, and each approval with who gave it."""
+REQUEST_STEP = {"Land Gorilla": "Requested in Land Gorilla",
+                "Salesforce record created": "Requested (the day Salesforce's record was created)",
+                "Salesforce request date": "Requested (Salesforce's request date)",
+                "inspection ordered": "Requested (taken from the inspection order date)"}
+# What each status means on a draw (Pending Approval = sent for internal review, Pending Release = review done and
+# sent to IC, Approved = IC approved, Completed = wired).
+STATUS_MEANS = {"Pending Inspection Report Revision": "report sent back for revision",
+                "Pending Borrower Response": "waiting on the borrower", "Pending Approval": "sent for internal review",
+                "Pending Release": "review done, sent for IC approval", "Received": "back to the start",
+                "Pending": "reopened"}
+# Where a step that has a date but no time sits within its day, by kind (minutes after midnight).
+_DAY_SLOT = {"request": 0, "lg": 1, "inspection": 2, "package": 30, "review": 720, "ic": 1380, "wire": 1439}
+
+
+def _timeline(row: pd.Series, a, h: pd.DataFrame | None = None) -> pd.DataFrame:
+    """What happened to a draw, in time order — only steps that were recorded: the request (and where that date comes
+       from), Land Gorilla's submission, the inspection dates, every status change with who made it and how long the
+       draw sat in the step before, the full package, the IC approval with each approver, wire-date changes and the
+       wire. Without status history (h) the review steps come from the draw's own date fields. Estimates say so."""
     lg_req, wire = _d(row.get("_lg_req")), _d(row.get("_wire")) or _d(row.get(WIRE_FIELD))
-    req = _d(row.get("_req_day")) or lg_req                        # the request-date chain (see _request_date)
-    from_lg = bool(req) and req == lg_req
-    ev = [(req, "Requested" if from_lg or not req else "Requested (from Salesforce)",
-           _txt(row.get("_lg_by")) if from_lg else "")]
+    req, src = _d(row.get("_req_day")) or lg_req, _txt(row.get("_req_src")) or ("Land Gorilla" if lg_req else "")
+    ev = []                                           # (date or Eastern timestamp, kind, step, by, waited)
+    if req:
+        ev.append((req, "request", REQUEST_STEP.get(src, "Requested"),
+                   _txt(row.get("_lg_by")) if src == "Land Gorilla" else "", ""))
     sub = _d(row.get("_lg_sub"))
     if sub and sub != req:
-        ev.append((sub, "Submitted in Land Gorilla", ""))
-    ev += [(_d(row.get(field)), label, "") for label, field in MILESTONES[1:-2]]
-    ev.append((_d(row.get("_pkg")), "Full draw package received", ""))
-    steps = a.get("_steps") if a is not None else None
-    if isinstance(steps, (list, tuple)):
-        ev += [(d, step, who) for d, step, who in steps]
-    if a is not None and not any(s == "Approved" for _, s, _ in ev) and _d(a.get("Approved on")):
-        ev.append((_d(a.get("Approved on")), "Approved", _txt(a.get("Approved by"))))
-    ev.append((wire, "Wired", ""))
-    t = pd.DataFrame([(pd.Timestamp(d), s, w) for d, s, w in ev if d], columns=["Date", "Step", "By"])
-    return t.sort_values("Date", kind="stable").reset_index(drop=True)
+        ev.append((sub, "lg", "Submitted in Land Gorilla", "", ""))
+    ev += [(_d(row.get(field)), "inspection", label, "", "") for label, field in MILESTONES[1:4]]
+    trail, ic = _status_trail(h), _ic_trail(h)
+    if trail:
+        made = pd.to_datetime(row.get("CreatedDate"), errors="coerce", utc=True)
+        prev = made.tz_convert("America/New_York") if pd.notna(made) else None
+        done, fixed = False, None
+        for when, old, new, by in trail:
+            if done:                                  # changes after the first Completed: corrections
+                fixed = fixed or when
+                continue
+            waited = _bd_between(prev, when) if prev is not None else None
+            step = (f"Status → {new}" + (f" ({STATUS_MEANS[new]})" if new in STATUS_MEANS else "") if new
+                    else "Status cleared (usually a cancelled draw)")
+            ev.append((when, "status", step, by if by != EMAIL_HANDLER else "IC email reply",
+                       f"{waited} bd in {old or 'no status'}" if waited is not None else ""))
+            prev, done = when, new == "Completed"
+        if fixed is not None:
+            ev.append((fixed, "status", "Record reopened and corrected after funding", "", ""))
+    else:
+        ev += [(_d(row.get(field)), "review", label, "", "") for label, field in MILESTONES[4:6]]
+    pkg = _d(row.get("_pkg"))
+    likely = _likely_package(trail, ic) if trail and not pkg else None
+    if pkg or likely:
+        ev.append((pkg or likely, "package", "Full draw package received" if pkg else
+                   "Full package likely in (estimated from status history — not recorded)", "", ""))
+    if a is not None:
+        sent, at = a.get("_ic_sent"), a.get("_ic_at")
+        if isinstance(sent, pd.Timestamp) and pd.notna(sent):
+            ev.append((sent, "status", "Sent for IC approval" + (f" ({a['Approval']})" if _txt(a.get("Approval"))
+                                                                  else ""), _txt(a.get("_ic_by")), ""))
+        verbs = {"Approved": "IC approved", "Rejected": "IC rejected", "Recalled": "IC approval recalled"}
+        for p in a.get("_approvers") if isinstance(a.get("_approvers"), list) else []:
+            when = p.get("date")
+            if when and isinstance(at, pd.Timestamp) and pd.notna(at) and at.date() == when:
+                when = at                             # the approval's exact time, from the history
+            if when:
+                ev.append((when, "ic", verbs.get(p["status"], p["status"]) + (" (by email)" if p.get("channel") ==
+                                                                              "email" else ""), p["name"], ""))
+    ev += [(when, "status", "Sent back to IC" if old in ("Recalled", "Rejected") and new == "Submitted" else
+            "IC approval recalled", by, "") for when, old, new, by in ic
+           if new == "Recalled" or (old in ("Recalled", "Rejected") and new == "Submitted")]
+    for i, (when, old, new, by) in enumerate(_field_trail(h, WIRE_FIELD)):
+        o, n = _d(old), _d(new)
+        if n and not o:
+            step = f"Wire date set for {_mdy(n)}" if i == 0 else f"Wire date set again for {_mdy(n)}"
+        elif n and o and n != o:
+            step = f"Wire date moved {_mdy(o)} → {_mdy(n)}"
+        elif o and not n:
+            step = f"Wire date cleared (was {_mdy(o)})"
+        else:
+            continue
+        ev.append((when, "status", step, by, ""))
+    status = _txt(row.get("Status__c"))
+    ev.append((wire, "wire", "Wired" if status in ("Completed", "Pending", "") else "Wire scheduled", "", ""))
+
+    def key(e):
+        w = e[0]
+        if isinstance(w, pd.Timestamp):
+            return w.date(), w.hour * 60 + w.minute + w.second / 60
+        return w, _DAY_SLOT.get(e[1], 720)
+    ev = sorted((e for e in ev if e[0]), key=key)
+    return pd.DataFrame([(pd.Timestamp(w.date() if isinstance(w, pd.Timestamp) else w), s, b, x)
+                         for w, _k, s, b, x in ev], columns=["Date", "Step", "By", "Waited"])
 
 
 def _draw_names(df: pd.DataFrame) -> list:
     """How each draw reads in a picker: 'Loan 12345 · Draw 3 · Maple Row LLC  (requested 9/2/2026, wired 9/12/2026)'."""
     out = []
+    reqs = _day(_col(df, "_req_day")) if "_req_day" in df else _day(_col(df, "_lg_req"))
     for loan, no, deal, req, wired in zip(_col(df, "Loan_Number__c"), _draw_nos(df), _col(df, "Deal__r.Name"),
-                                          _day(_col(df, "_lg_req")), _day(_col(df, "_wire"))):
+                                          reqs, _day(_col(df, "_wire"))):
         when = ([f"requested {_mdy(req)}"] if pd.notna(req) else []) + ([f"wired {_mdy(wired)}"] if pd.notna(wired)
                                                                           else [])
         bits = [f"Loan {_txt(loan) or '?'}", f"Draw {no}"] + ([_txt(deal)] if _txt(deal) else [])
@@ -1984,8 +2351,9 @@ def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> p
         "Turn-time (bd)": pd.to_numeric(_col(d, "_fund_bd"), errors="coerce"),
         "Funded ($)": pd.to_numeric(_col(d, NET_FIELD), errors="coerce"),
     })
-    for c in ("Approved by", "Approved on", "Approval comments"):
-        t[c] = ids.map(ap[c]) if ap is not None and c in ap else None
+    for c, src in (("IC", "_ic_label"), ("Approved by", "Approved by"), ("Approved on", "Approved on"),
+                   ("Approval comments", "Approval comments")):
+        t[c] = ids.map(ap[src]) if ap is not None and src in ap else None
     t["Approved on"] = _dates(t["Approved on"])
     t["Held up by"] = [delay_labels(n) for n in _col(d, NOTES_FIELD)]
     t["Coordinator"] = _col(d, "Advance_Coordinator__r.Name")
@@ -2008,6 +2376,9 @@ def _table_config() -> dict:
         "Request → wire (bd)": C.NumberColumn("Request → wire", format="%d bd"),
         "Funded ($)": C.NumberColumn("Funded", format="dollar", step=1),
         "Approved on": C.DateColumn(format="M/D/YYYY"),
+        "Likely package date (status history)": C.DateColumn(
+            format="M/D/YYYY", help="Estimated from the draw's status history — never used for turn-time"),
+        "IC": C.TextColumn(help="Where the draw's IC approval stands, from its IC batch in Salesforce"),
         "Held up by": C.ListColumn(help="What the draw's notes say it was waiting on"),
         "What the notes say": C.TextColumn(width="large", help="The note entries behind those hold-ups"),
         "Approval comments": C.TextColumn(width="large"),
@@ -2016,15 +2387,37 @@ def _table_config() -> dict:
     }
 
 
-def _excel_table(fg: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
+def _review_dates(fg: pd.DataFrame, hist: dict) -> tuple[pd.Series, pd.Series]:
+    """Each draw's review dates as its status history shows them: sent for internal review (the first move to Pending
+       Approval or Pending Release, or IC submission, whichever came first) and review complete (the first move to
+       Pending Release or IC submission). These match the dates staff enter on about 96% and 98% of draws."""
+    sub, done = [], []
+    for i in _col(fg, "Id"):
+        h = hist.get(i)
+        trail, ic = _until_completed(_status_trail(h)), _ic_trail(h)
+        sent = [r[0] for r in ic if r[2] == "Submitted"][:1]
+        sub.append(min([r[0] for r in trail if r[2] in ("Pending Approval", "Pending Release")][:1] + sent, default=None))
+        done.append(min([r[0] for r in trail if r[2] == "Pending Release"][:1] + sent, default=None))
+    as_day = lambda xs: _dates(pd.Series([x.date() if x is not None else None for x in xs], index=fg.index))  # noqa
+    return as_day(sub), as_day(done)
+
+
+def _excel_table(fg: pd.DataFrame, table: pd.DataFrame, hist: dict | None = None) -> pd.DataFrame:
     """The turn-time data dump: every column in the table plus the milestone dates and the borrower-side numbers
-       (kept out of the overview, but useful in a pivot by account)."""
+       (kept out of the overview, but useful in a pivot by account). Review dates left blank are filled from the
+       draw's status history and marked."""
     x = table.drop(columns=["Salesforce"]).copy()
     if "Held up by" in x:
         x["Held up by"] = x["Held up by"].map(lambda r: ", ".join(r) if r else None)
     pos = x.columns.get_loc("Package received")
     for i, (label, field) in enumerate(MILESTONES[1:-2]):    # inspection ordered … internal review complete
         x.insert(pos + i, label, _dates(_col(fg, field)))
+    if hist:
+        sub, done = _review_dates(fg, hist)
+        a, b = MILESTONES[4][0], MILESTONES[5][0]
+        filled = (x[a].isna() & sub.notna()) | (x[b].isna() & done.notna())
+        x[a], x[b] = x[a].fillna(sub), x[b].fillna(done)
+        x.insert(x.columns.get_loc(b) + 1, "Review dates from status history", np.where(filled, "Y", ""))
     x.insert(x.columns.get_loc("Turn-time (bd)") + 1, "Days to a full package (bd)",
              pd.to_numeric(_col(fg, "_wait_bd"), errors="coerce"))
     x.insert(x.columns.get_loc("Days to a full package (bd)") + 1, "Request → wire (bd)",
@@ -2154,7 +2547,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                      "Loans": g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None,
                      "Funded ($)": amt, "Average draw ($)": round(amt / len(g)) if amt is not None and len(g) else None})
     roll = pd.DataFrame(rows)
-    ap = approvals_for(inst, tok, tuple(_col(fg, "Id").dropna()))
+    ids = tuple(_col(fg, "Id").dropna())
+    ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
     table = _draw_table(fg, inst, ap)
 
     t_sum, t_draws, t_detail, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
@@ -2171,6 +2565,7 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
         with right:
             _render_charts(roll, fg, feat, same_day)
         _holdups_chart(fg, f"What held draws up · {feat}")
+        _stuck_table(fg, hist, feat)
         with st.expander("How these numbers work"):
             st.markdown(
                 "- **Package received** — the *Full Draw Package Received* date in Salesforce: the day the borrower's "
@@ -2181,27 +2576,32 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                 "number — see it by account or deal under **Find a draw**.\n"
                 "- **Held up by** — what a draw's notes say it was waiting on: lien waivers, invoices, title, the "
                 "inspection and so on.\n"
+                "- **Where draws got stuck** — counted from Salesforce's record of every status change, so it doesn't "
+                "depend on what the notes say.\n"
+                "- **IC** — the draw's IC approval batch in Salesforce: who approved it and when. Batches of $1M or "
+                "more need a final sign-off that Salesforce often doesn't record; those are flagged.\n"
                 "- Draws without a package date, or with dates out of order, are left out of turn-time and listed on "
                 "the Package date check tab.")
     with t_draws:
         st.dataframe(table, hide_index=True, width="stretch", height=460, column_config=_table_config())
-        _period_workbook(feat, _excel_table(fg, table),
+        _period_workbook(feat, _excel_table(fg, table, hist),
                          roll.drop(columns="_raw").rename(columns={"Draws": "Draws funded"}))
     with t_detail:
-        _draw_details(inst, tok, rt, sel, fg, ap, feat)
+        _draw_details(inst, tok, rt, sel, fg, ap, feat, hist)
     with t_check:
-        _package_check(fg, table, same_day)
+        _package_check(fg, table, same_day, hist)
 
 
 DEAL_FACTS = (("C", "Deal"), ("D", "Borrower"), ("E", "Sponsor"), ("J", "Project type"), ("AJ", "RM / LO"),
-              ("O", "Total loan commitment"), ("M", "Loan funded"), ("N", "Maturity"), ("AC", "Next payment due"),
-              ("AD", "Interest reserve left"), ("AH", "Warehouse line"))
+              ("O", "Total loan commitment"), ("T", "Completion LTC"), ("M", "Funded (first funding)"),
+              ("N", "Maturity"), ("AC", "Next payment due"), ("AD", "IR balance"), ("AH", "Warehouse line"))
 PROPERTY_FACTS = (("F", "Street"), ("G", "City"), ("H", "State"), ("I", "Property type"), ("K", "As-is value"),
-                  ("L", "As-complete value"), ("Q", "Initial funding"), ("AB", "Current UPB"))
+                  ("L", "As-complete value"), ("Q", "Initial funding"), ("Y", "Project complete"),
+                  ("AB", "Current UPB"))
 
 
 @sf_fragment
-def _draw_details(inst, tok, rt, sel, fg: pd.DataFrame, ap: pd.DataFrame, feat: str):
+def _draw_details(inst, tok, rt, sel, fg: pd.DataFrame, ap: pd.DataFrame, feat: str, hist: dict | None = None):
     """Everything about one draw and the deal behind it, picked from the period's draws (most recent request first).
        A fragment, so picking a draw doesn't reload the rest of the page."""
     d = _by_date(fg)
@@ -2216,7 +2616,7 @@ def _draw_details(inst, tok, rt, sel, fg: pd.DataFrame, ap: pd.DataFrame, feat: 
         return
     row = d[d["Id"] == pick].iloc[0]
     with st.container(border=True):
-        _render_draw(row, ap, inst)
+        _render_draw(row, ap, inst, (hist or {}).get(pick))
     st.subheader("Deal", divider="gray")
     cfg, loan = lg_config(), _txt(row.get("Loan_Number__c"))
     with st.spinner("Loading the deal…"):
@@ -2250,6 +2650,12 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
     first = merged.iloc[0]
     facts = [(label, _show(first.get(col), mtypes.get(col))) for col, label in DEAL_FACTS]
     facts.insert(1, ("Account", _show(row.get("Deal__r.Account.Name"))))
+    today = _today()
+    for label, col, flag in (("Maturity", "N", "past maturity"), ("Next payment due", "AC", "past due")):
+        when = _d(first.get(col))
+        if when and when < today:                     # a past next-due date means a missed payment, not stale data
+            facts = [(k, f"{v} — {flag}" if k == label and v else v) for k, v in facts]
+    facts += [(c[5:], _show(first.get(c), mtypes.get(c))) for c in merged.columns if str(c).startswith("info:")]
     facts += [("Draw coordinator", _show(row.get("Advance_Coordinator__r.Name"))),
               ("Draw analyst", _show(row.get("Advance_Analyst__r.Name")))]
     facts += [(_check_label(c), _show(first.get(c), mtypes.get(c))) for c in merged.columns
@@ -2259,7 +2665,8 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
         half = (len(facts) + 1) // 2
         for col, part in zip(st.columns(2), (facts[:half], facts[half:])):
             col.dataframe(pd.DataFrame(part, columns=["Detail", "Value"]), hide_index=True, width="stretch")
-    props = pd.DataFrame({label: [_show(v, ftypes.get(col)) for v in _col(rows, col)] for col, label in PROPERTY_FACTS})
+    props = pd.DataFrame({label: [_show(v, mtypes.get(col)) for v in _col(merged, col)]
+                          for col, label in PROPERTY_FACTS})
     if len(rows) > 1:
         props["This draw"] = [_show(v, "currency") for v in _col(rows, "_pa_amount")]
     for c in [c for c in rows.columns if str(c).startswith("chk:") and c[4:] in PROPERTY_CHECKS]:
@@ -2273,8 +2680,9 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
     return lg["loans"].get(_txt(first.get("B")) or _txt(row.get("Loan_Number__c")))
 
 
-def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int):
-    """Is the full-package date trustworthy for this period? Checked live, in plain English."""
+def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: dict | None = None):
+    """Is the full-package date trustworthy for this period? Checked live, in plain English. Draws missing the date
+       get the date their status history suggests, so it can be filled in (estimates never count toward turn-time)."""
     s = _turn_stats(fg, same_day)
     st.markdown("The *Full Draw Package Received* date is new (Aug 3, 2026), so these checks show whether it's "
                 "being recorded well enough to measure turn-time.")
@@ -2332,11 +2740,21 @@ def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int):
         st.markdown("**By month**")
         st.dataframe(pd.DataFrame(by), hide_index=True, width="stretch")
     flagged = table.assign(Issue=fg["_check"].values)
+    likely = "Likely package date (status history)"
+    if hist:
+        flagged[likely] = _dates(pd.Series([_likely_package(_status_trail(hist.get(i)), _ic_trail(hist.get(i)))
+                                            for i in _col(fg, "Id")], index=flagged.index))
+        flagged[likely] = flagged[likely].where(flagged["Issue"] == "No package-received date")
     flagged = flagged[flagged["Issue"].isin(CHECK_EXCLUDED) | (flagged["Issue"] == "No package-received date")]
     if len(flagged):
         with st.expander(f"Draws to check ({len(flagged)})", icon=":material/rule:"):
-            st.dataframe(flagged[["Loan #", "Draw #", "Deal", "Requested", "Package received", "Wired", "Issue",
-                                  "Salesforce"]], hide_index=True, width="stretch", column_config=_table_config())
+            st.dataframe(flagged[["Loan #", "Draw #", "Deal", "Requested", "Package received", "Wired", "Issue"]
+                                 + ([likely] if likely in flagged else []) + ["Salesforce"]],
+                         hide_index=True, width="stretch", column_config=_table_config())
+            if likely in flagged and flagged[likely].notna().any():
+                st.caption("The likely date is the day the draw moved from a waiting status into review (or went to "
+                           "IC, if earlier), from Salesforce's status history. Use it to fill in the missing date; "
+                           "turn-time only ever uses dates that were entered.")
 
 
 @sf_fragment
@@ -2373,9 +2791,11 @@ def _period_workbook(feat, xtable, roll):
                            file_name=f"Draw turn-time {feat}.xlsx", key=f"dl_{feat}", on_click="ignore")
 
 
-def _holdups_chart(d: pd.DataFrame, title: str):
-    """How often each hold-up shows up in these draws' notes (share of draws), coloured by who it was on."""
-    keys = [k for n in _col(d, NOTES_FIELD) for k in delay_keys(n) if k not in ROUTINE_REASONS]
+def _holdups_chart(d: pd.DataFrame, title: str, keys_per_draw=None, note: str | None = None):
+    """How often each hold-up shows up in these draws' notes (share of draws), coloured by who it was on. Pass
+       keys_per_draw to count something other than each draw's whole note (e.g. only its newest entries)."""
+    per = keys_per_draw if keys_per_draw is not None else [delay_keys(n) for n in _col(d, NOTES_FIELD)]
+    keys = [k for ks in per for k in ks if k not in ROUTINE_REASONS]
     st.markdown(f"**{title}**")
     if not keys:
         st.caption("Nothing in these draws' notes points to a hold-up.")
@@ -2393,8 +2813,56 @@ def _holdups_chart(d: pd.DataFrame, title: str):
             color=alt.Color("Waiting on:N", legend=alt.Legend(orient="bottom", title="Waiting on")),
             tooltip=["Hold-up", "Draws", alt.Tooltip("Share:Q", format=".0%"), "Waiting on"]),
             width="stretch")
-    st.caption(f"Read from the notes of {len(d):,} draws; a draw can have more than one. Routine inspections are "
-               "left out unless they ran late.")
+    st.caption(note or f"Read from the notes of {len(d):,} draws; a draw can have more than one. Routine inspections "
+                       "are left out unless they ran late.")
+
+
+# Hiccups counted from Salesforce's status history: (name, what it counts). Only changes made before a draw was first
+# completed count — later ones are corrections.
+STUCK = (("Waited on the borrower", "Went to Pending Borrower Response"),
+         ("Put on hold", "Went to Hold"),
+         ("Inspection report sent back", "Went to Pending Inspection Report Revision"),
+         ("Back to the borrower after review", "Went from review (Pending Approval, Pending Release or Approved) back "
+                                               "to Pending Borrower Response"),
+         ("Wire date moved", "Wire date changed after it was first set"),
+         ("IC recalled or rejected", "IC approval recalled or rejected"))
+
+
+def _stuck_counts(ids, hist: dict) -> tuple[dict, int]:
+    """{hiccup: number of draws} over the draws that have status history, and how many do."""
+    counts, covered = dict.fromkeys((k for k, _ in STUCK), 0), 0
+    for i in ids:
+        h = hist.get(i)
+        if h is None or h.empty:
+            continue
+        covered += 1
+        trail = _until_completed(_status_trail(h))
+        entered = {r[2] for r in trail}
+        hits = {"Waited on the borrower": "Pending Borrower Response" in entered, "Put on hold": "Hold" in entered,
+                "Inspection report sent back": "Pending Inspection Report Revision" in entered,
+                "Back to the borrower after review": any(
+                    r[1] in ("Pending Approval", "Pending Release", "Approved") and r[2] == "Pending Borrower Response"
+                    for r in trail),
+                "Wire date moved": any(_d(o) and _d(n) and _d(o) != _d(n) for _w, o, n, _b in _field_trail(h, WIRE_FIELD)),
+                "IC recalled or rejected": any(r[2] in ("Recalled", "Rejected") for r in _ic_trail(h))}
+        for k, hit in hits.items():
+            counts[k] += bool(hit)
+    return counts, covered
+
+
+def _stuck_table(d: pd.DataFrame, hist: dict, feat: str):
+    """Where these draws got stuck, from status history rather than the notes: the share that hit each hiccup."""
+    counts, covered = _stuck_counts(_col(d, "Id"), hist)
+    if not covered:
+        return
+    data = pd.DataFrame([{"Hiccup": k, "Draws": counts[k], "Share": counts[k] / covered, "What it counts": what}
+                         for k, what in STUCK])
+    st.markdown(f"**Where draws got stuck · {feat}**")
+    st.dataframe(data, hide_index=True, width="stretch", column_config={
+        "Share": st.column_config.ProgressColumn("Share of draws", format="percent", min_value=0, max_value=1),
+        "What it counts": st.column_config.TextColumn(width="large")})
+    st.caption(f"From Salesforce's record of every status change, for the {covered:,} of these draws it covers. Changes "
+               "made after a draw was first completed (corrections) aren't counted.")
 
 
 def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: int):
@@ -2440,55 +2908,133 @@ def render_loan_detail(inst, tok, rt, sel, same_day):
         _accounts_view(inst, tok, rt, sel, same_day)
 
 
+# The most business days a draw usually spends in each status (90th percentile, Salesforce status history May–Oct
+# 2026; refresh it every quarter or so). Longer than this is flagged.
+STATUS_P90 = {"Received": 3, "Pending Inspection": 5, "Pending Borrower Response": 3,
+              "Pending Inspection Report Revision": 3, "Hold": 12, "Pending Approval": 1, "Pending Release": 0,
+              "Approved": 0}
+STALE_BD = 20          # no status change, dated note or new record in this many business days: probably dead
+
+
+def _stage_text(row) -> str:
+    """The draw's status, plus where the inspection stands while it's in Pending Inspection."""
+    s = _txt(row.get("Status__c"))
+    if s == "Pending Inspection":
+        ordered, seen, report = (_d(row.get(field)) for _label, field in MILESTONES[1:4])
+        if not ordered:
+            return f"{s} · not ordered yet"
+        if not seen:
+            return f"{s} · ordered {ordered.month}/{ordered.day}, visit pending"
+        if not report:
+            return f"{s} · inspected {seen.month}/{seen.day}, report due"
+    return s
+
+
+def _open_row(r: pd.Series, a, trail: list, today: date, inst: str) -> dict:
+    """One open draw for the Not wired yet table, plus _stale (nothing has happened in STALE_BD business days)."""
+    made = pd.to_datetime(r.get("CreatedDate"), errors="coerce", utc=True)
+    made = made.tz_convert("America/New_York") if pd.notna(made) else None
+    since, moved_by = (trail[-1][0], trail[-1][3]) if trail else (made, "")
+    req = r.get("_req_day")
+    req = req if isinstance(req, pd.Timestamp) and pd.notna(req) else None
+    note, ref = r.get(NOTES_FIELD), req.date() if req is not None else None
+    newest = latest_entries(note, ref)
+    now = now_keys(note, ref)
+    now_labels = _key_labels(now) + (["Sent back to Unsubmitted"] if sent_back(note, ref) else [])
+    earlier = [x for x in _key_labels(delay_keys(note)) if x not in now_labels]
+    status, in_stage = _txt(r.get("Status__c")), _bd_between(since, today)
+    usual = STATUS_P90.get(status)
+    ic = _txt(a.get("_ic_label")) if a is not None else ""
+    at = a.get("_ic_at") if a is not None else None
+    if ic.startswith("IC approved"):
+        ic += " · waiting on the wire" + (" (approved after 5 pm: usually wired the next business day)"
+                                          if isinstance(at, pd.Timestamp) and pd.notna(at) and at.hour >= 17 else "")
+    quiet = [x for x in (in_stage, _bd_between(newest[0], today) if newest else None,
+                         _bd_between(made, today) if made is not None else None) if x is not None]
+    rid = r.get("Id")
+    return {"Loan #": r.get("Loan_Number__c"), "Draw #": _draw_no(r), "Deal": r.get("Deal__r.Name"),
+            "Stage": _stage_text(r) or "(none)", "In this stage (bd)": in_stage,
+            "Longer than usual": bool(in_stage is not None and usual is not None and in_stage > usual),
+            "Now": now_labels, "Latest note": f"{_mdy(newest[0])}: {newest[1][0]}" if newest else None,
+            "IC": ic or None, "Land Gorilla status": _txt(r.get("_lg_status")) or None, "Requested": req,
+            "Open (bd)": _bd_between(req, today), "Raised earlier": earlier, "Moved here by": moved_by or None,
+            "Coordinator": r.get("Advance_Coordinator__r.Name"),
+            "Salesforce": f"{inst.rstrip('/')}/{rid}" if isinstance(rid, str) and rid else None,
+            "_stale": bool(quiet) and min(quiet) > STALE_BD, "_now": now}
+
+
 @sf_fragment
 def _open_draws(inst, tok, rt, sel, same_day):
-    """Every draw that isn't wired yet — its status, how long it's been open, and what its notes say it's waiting on
-       — most recent request first. A fragment, so loading it doesn't redraw the search results."""
-    st.caption("Draws that haven't been wired yet: where each one stands and what its notes say it's waiting on.")
+    """Every draw that isn't wired yet: where it stands, how long it's been there (flagged when that's longer than
+       usual), where its IC approval is, and what its newest notes say it's waiting on — most recent request first.
+       Draws with no status, or with nothing happening in STALE_BD business days, are set apart and left out of the
+       counts. A fragment, so loading it doesn't redraw the search results."""
+    st.caption("Draws that haven't been wired yet: where each one stands, how long it's been there, and what's "
+               "holding it up now.")
     data = st.session_state.get("open_data")                # built on request, then kept for the session
     if st.button("Refresh" if data else "Show draws not wired yet", icon=":material/pending_actions:",
                  key="open_build"):
-        with st.spinner("Loading open draws and Land Gorilla dates…"):
+        with st.spinner("Loading open draws, their status history and Land Gorilla dates…"):
             df = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
             df = _by_date(apply_lg_correction(add_intervals(df), lg_config(), same_day)) if not df.empty else df
-        st.session_state["open_data"] = data = (df, pd.Timestamp.now(tz="America/New_York"))
+            blank = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {NO_STATUS_WHERE}")
+            blank = _by_date(blank) if not blank.empty else blank
+            ids = tuple(_col(df, "Id").dropna())
+            ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
+        st.session_state["open_data"] = data = (df, blank, ap, hist, pd.Timestamp.now(tz="America/New_York"))
     if not data:
         return
-    df, asof = data
-    if df.empty:
+    df, blank, ap, hist, asof = data
+    if df.empty and blank.empty:
         st.info("Every draw has been wired."); return
-    req = _request_date(df)
-    stale = (_col(df, "Status__c").map(_txt) == "") | ((_col(df, "Status__c").map(_txt) == "Received")
-                                                         & (req.fillna(_created_day(df)) <
-                                                            pd.Timestamp(_today()) - pd.Timedelta(days=183)))
-    if stale.any() and not st.toggle(f"Include {int(stale.sum())} cancelled or stale draws", key="open_all",
-                                     help="Draws with no status (usually cancelled) and requests over six months old "
-                                          "that never moved past Received."):
-        df, req = df[~stale], req[~stale]
-    if df.empty:
-        st.info("Nothing else is waiting."); return
-    notes = _col(df, NOTES_FIELD)
-    latest = [latest_entry(n, w.date() if pd.notna(w) else None) for n, w in zip(notes, req)]
-    t = pd.DataFrame({
-        "Loan #": _col(df, "Loan_Number__c").values, "Draw #": _draw_nos(df), "Deal": _col(df, "Deal__r.Name").values,
-        "Status": _col(df, "Status__c").values, "Requested": req.values,
-        "Open (bd)": bdays(req, pd.Series(pd.Timestamp(_today()), index=df.index), same_day).values,
-        "Waiting on": [delay_labels(n) for n in notes],
-        "Latest note": [f"{_mdy(x[0])}: {x[1]}" if x else None for x in latest],
-        "Coordinator": _col(df, "Advance_Coordinator__r.Name").values,
-        "Salesforce": _col(df, "Id").map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i
-                                         else None).values,
-    })
-    by_status = _col(df, "Status__c").fillna("(none)").value_counts()
-    st.markdown(f"**{len(df):,} draws not wired yet** (as of {asof.strftime('%I:%M %p').lstrip('0')}) · "
-                + " · ".join(f"{_md(s)} {n}" for s, n in by_status.items()))
-    st.dataframe(t, hide_index=True, width="stretch", height=420, column_config={
-        **_table_config(),
-        "Open (bd)": st.column_config.NumberColumn("Open", format="%d bd",
-                                                   help="Business days since the draw was requested"),
-        "Waiting on": st.column_config.ListColumn(help="What the draw's notes say it's waiting on"),
-        "Latest note": st.column_config.TextColumn(width="large", help="The newest dated entry in the notes")})
-    _holdups_chart(df, "What open draws are waiting on")
+    today = _today()
+    rows = [_open_row(r, ap.loc[r["Id"]] if r.get("Id") in ap.index else None, _status_trail(hist.get(r.get("Id"))),
+                      today, inst) for _, r in df.iterrows()]
+    t = pd.DataFrame(rows, columns=list(rows[0]) if rows else ["_stale", "_now"])
+    live, stale = t[~t["_stale"].astype(bool)], t[t["_stale"].astype(bool)]
+    stages = live["Stage"].map(lambda s: s.split(" · ")[0]).value_counts() if len(live) else pd.Series(dtype=int)
+    st.markdown(f"**{len(live):,} draws not wired yet** (as of {asof.strftime('%I:%M %p').lstrip('0')})"
+                + "".join(f" · {_md(s)} {n}" for s, n in stages.items())
+                + (f" · **{int(live['Longer than usual'].sum())} longer than usual**"
+                   if len(live) and live["Longer than usual"].any() else ""))
+    if len(live):
+        C = st.column_config
+        st.dataframe(live.drop(columns=["_stale", "_now"]), hide_index=True, width="stretch", height=420,
+                     column_config={
+            **_table_config(),
+            "Stage": C.TextColumn(help="The draw's status in Salesforce (and, in inspection, where the inspection "
+                                       "stands)"),
+            "In this stage (bd)": C.NumberColumn("In this stage", format="%d bd",
+                                                 help="Business days since the draw moved to this status"),
+            "Longer than usual": C.CheckboxColumn(help="In this status longer than 9 in 10 draws usually are"),
+            "Now": C.ListColumn("Waiting on now", help="What the newest dated note entries say it's waiting on"),
+            "Latest note": C.TextColumn(width="large", help="The newest dated entry in the notes"),
+            "IC": C.TextColumn(help="Where the draw's IC approval stands"),
+            "Land Gorilla status": C.TextColumn(help="The draw's status in Land Gorilla"),
+            "Open (bd)": C.NumberColumn("Open", format="%d bd", help="Business days since the draw was requested"),
+            "Raised earlier": C.ListColumn(help="Hold-ups older note entries mention — often already resolved"),
+            "Moved here by": C.TextColumn(help="Who moved the draw to its current status")})
+        _holdups_chart(live, "What open draws are waiting on now", keys_per_draw=list(live["_now"]),
+                       note=f"Read from the newest dated note entries of {len(live):,} open draws — what each is "
+                            "waiting on now; a draw can have more than one. Routine inspections are left out unless "
+                            "they ran late.")
+    gone = [(x["Loan #"], x["Draw #"], x["Deal"], x["Stage"], x["Requested"], x["Latest note"], x["Coordinator"],
+             x["Salesforce"]) for _, x in stale.iterrows()]
+    for _, r in blank.iterrows():
+        newest = latest_entry(r.get(NOTES_FIELD))
+        req = r.get("_req_day")
+        gone.append((r.get("Loan_Number__c"), _draw_no(r), r.get("Deal__r.Name"), "(no status)",
+                     req if isinstance(req, pd.Timestamp) and pd.notna(req) else None,
+                     f"{_mdy(newest[0])}: {newest[1]}" if newest else None, r.get("Advance_Coordinator__r.Name"),
+                     f"{inst.rstrip('/')}/{r['Id']}" if _txt(r.get("Id")) else None))
+    if gone:
+        with st.expander(f"Stale or cancelled — confirm in Land Gorilla ({len(gone)})", icon=":material/inventory_2:"):
+            st.caption(f"No status (staff clear it when a draw is cancelled), or nothing in {STALE_BD} business days: "
+                       "no status change, no dated note, no new record. Left out of the counts and the chart above.")
+            st.dataframe(pd.DataFrame(gone, columns=["Loan #", "Draw #", "Deal", "Stage", "Requested", "Latest note",
+                                                     "Coordinator", "Salesforce"]),
+                         hide_index=True, width="stretch", column_config={
+                             **_table_config(), "Latest note": st.column_config.TextColumn(width="large")})
 
 
 def _draw_search(inst, tok, rt, sel, same_day):
@@ -2514,7 +3060,8 @@ def _draw_search(inst, tok, rt, sel, same_day):
     cfg = lg_config()
     with st.spinner("Loading draw history…"):
         df = _newest_first(apply_lg_correction(df, cfg, same_day))
-        ap = approvals_for(inst, tok, tuple(_col(df, "Id").dropna()))
+        ids = tuple(_col(df, "Id").dropna())
+        ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
     nloans = df["Loan_Number__c"].nunique(dropna=False) if "Loan_Number__c" in df else len(df)
     c = st.columns([1, 1, 2])
     oldest = (c[0].segmented_control(
@@ -2535,7 +3082,7 @@ def _draw_search(inst, tok, rt, sel, same_day):
             with st.container(border=True):
                 who = [x for x in (_txt(row.get("Deal__r.Name")), _txt(row.get("Deal__r.Account.Name"))) if x]
                 st.caption(f"**Loan {_md(row.get('Loan_Number__c'))}**" + "".join(f" · {_md(x)}" for x in who))
-                _render_draw(row, ap, inst)
+                _render_draw(row, ap, inst, hist.get(row.get("Id")))
         return
 
     groups = list(df.groupby("Loan_Number__c", dropna=False, sort=False))       # newest first so far
@@ -2565,7 +3112,7 @@ def _draw_search(inst, tok, rt, sel, same_day):
             st.caption("  ·  ".join(sub + [f"{len(g)} draw(s)"]))
             _track_record(g)
             for _, row in g.iterrows():
-                _render_draw(row, ap, inst)
+                _render_draw(row, ap, inst, hist.get(row.get("Id")))
             ov = loans.get(_txt(loan_no))
             if cfg and ov:
                 with st.expander("Construction progress", icon=":material/construction:"):
@@ -2585,9 +3132,10 @@ def _track_record(g: pd.DataFrame):
                 help="What this loan's draw notes most often say it was waiting on (routine inspections aside).")
 
 
-def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
-    """One draw: what it funded and how long it took, what held it up, its latest note, a timeline of what actually
-       happened (with each approver), the construction dollars, and the full notes."""
+def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str, h: pd.DataFrame | None = None):
+    """One draw: what it funded and how long it took, where its IC approval stands, what held it up, its latest note,
+       a timeline of what actually happened (every status change with who made it, each approver), the construction
+       dollars, and the full notes. h = the draw's status history, if it could be read."""
     rid = _txt(row.get("Id"))
     head = st.columns([4, 1])
     status = _txt(row.get("Status__c"))
@@ -2604,6 +3152,9 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
     m[2].metric("Days to a full package", _bd(row.get("_wait_bd")), border=True,
                 help="Business days from the request to a full package — the borrower's part")
     m[3].metric("Request → wire", _bd(row.get("_days")), border=True)
+    if a is not None and _txt(a.get("_ic_label")):
+        tone = _txt(a.get("_ic_tone")) if _txt(a.get("_ic_tone")) in ("green", "orange", "red", "blue") else "gray"
+        st.markdown(f"**IC:** :{tone}-badge[{_md(a['_ic_label'])}]")
     if reasons:
         st.markdown("**Held up by:** " + " ".join(f":orange-badge[{r}]" for r in reasons))
     latest = latest_entry(row.get(NOTES_FIELD), _d(row.get("_wire")) or _d(row.get("_lg_req")))
@@ -2620,19 +3171,21 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
     if facts:
         st.caption("  ·  ".join(facts))
 
-    tl = _timeline(row, a)
+    tl = _timeline(row, a, h)
     if len(tl):
         st.dataframe(tl, hide_index=True, width="stretch",
                      column_config={"Date": st.column_config.DateColumn(format="M/D/YYYY", width="small"),
                                     "Step": st.column_config.TextColumn(width="medium"),
-                                    "By": st.column_config.TextColumn(help="Who did it, where the record says")})
+                                    "By": st.column_config.TextColumn(help="Who did it, where the record says"),
+                                    "Waited": st.column_config.TextColumn(
+                                        help="How long the draw sat in its previous status (business days)")})
     if _txt(row.get("_check")):
         st.caption(f":material/error: {row['_check']}")
-    if a is not None and _txt(a.get("Approval comments")):
-        st.caption("**Approval comments:**  \n" + _md(a["Approval comments"]).replace("\n", "  \n"))
-    elif (a is None or not _txt(a.get("Approved by"))) and _txt(row.get("LastModifiedBy.Name")):
-        when = _d(row.get("LastModifiedDate"))
-        st.caption(f"Last updated by {_md(row['LastModifiedBy.Name'])}" + (f" on {_mdy(when)}" if when else ""))
+    people = a.get("_approvers") if a is not None else None
+    said = [p for p in people if p.get("comment")] if isinstance(people, list) else []
+    if said:                                     # what the IC members wrote (who and when are in the timeline)
+        st.caption("**IC comments:**  \n" + "  \n".join(f"{_md(p['name'])}: “{_md(p['comment'][:300])}”"
+                                                         for p in said))
     vals = pd.to_numeric(pd.Series([row.get(f) for f, _ in CONSTRUCTION_FIELDS]), errors="coerce")
     money_bits = [f"{lbl}: {money(v)}" for (_, lbl), v in zip(CONSTRUCTION_FIELDS, vals) if pd.notna(v) and v]
     if money_bits:                                  # "$" escaped: two of them would turn the text between into math
