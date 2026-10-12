@@ -41,6 +41,7 @@ import os
 import json
 import re
 import secrets
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
@@ -775,12 +776,10 @@ MELANIE_MAP = {
     "O": ("Deal__r.LOC_Commitment__c", "LOC_Commitment__c"),        # Total Loan Commitment — the whole loan's, on
                                                                     # portfolio rows too, as in her files
     "T": "Deal__r.Total_Loan_LTC__c",                               # Completion LTC % (the deal's Reno Total Loan LTC)
-    "U": NET_FIELD,                                                 # Current Draw Amount — replaced below by the
-                                                                    # property's approved (gross) amount, as she does
-    "AC": "Deal__r.Next_Payment_Date__c",                           # Next Due Date
-    "AD": "Remaining_Interest_Reserve__c",                          # IR Balance (left blank on Full Funding Day 1
-                                                                    # loans, whose reserve sits with the servicer)
-    "AF": NOTES_FIELD,                                              # Comments
+    "U": ("Approved_Advance_Amount_Total__c", NET_FIELD),           # Current Draw Amount — the gross approved amount
+                                                                    # (her E6 totals tie to it); a property's own
+                                                                    # amount replaces it below
+    "AF": NOTES_FIELD,                                              # Comments (written only if asked: she clears them)
     "AH": ("Warehouse_Line_New__c", "Deal__r.Warehouse_Line__c",    # Warehouse line — the draw's own first
            "Warehouse_Line__c"),
     "AJ": "Deal__r.Owner.Name",                                     # RM/LO — the Deal owner ("CAF Originator" here)
@@ -788,18 +787,24 @@ MELANIE_MAP = {
 # From the advance's Property__c: Advance__c's own Property lookup if it has one; else the Deal's property when the
 # Deal has just one, or the single property whose Advance__c points at this draw. Otherwise blank — never a guess.
 # A property value wins over the same column's MELANIE_MAP value; a blank or $0 property value leaves that in place.
-# Checked against Melanie's weekly files (Jul–Oct 2026): the first choice in each column matches her value on 90–100%
-# of the rows that could be matched to Salesforce.
+# Checked against Melanie's weekly files (Jul–Oct 2026) and Salesforce's own Generate File: the first choice in each
+# column matches her value on 90–100% of the rows that could be matched. Current UPB and Next Due Date are the
+# servicer's, on the property, and blank where it has none — as in her files.
 MELANIE_PROPERTY_MAP = {
     "G": "City__c",                                                       # Property City
     "H": "State__c",                                                      # ST
     "I": "Property_Type__c",                                              # Property Type
     "K": ("Appraised_Value_Amount__c", "Origination_Date_Value__c"),       # As-Is Value at Origination
-    "L": ("Origination_After_Repair_Value__c", "After_Repair_Value__c"),  # As Complete Value at Origination
+    "L": ("After_Repair_Value__c", "Origination_After_Repair_Value__c"),  # As Complete Value at Origination
     "M": "First_Funding_Date__c",                                         # Funded Date
     "Q": "Initial_Disbursement__c",                                       # Initial Loan Funding
     "AB": "Current_UPB__c",                                               # Current UPB
+    "AC": "Next_Payment_Date__c",                                         # Next Due Date
+    "AD": "Interest_Reserves__c",                                         # IR Balance ("Interest Holdback Funded")
 }
+# The same draw's Property_Advance__c values beat the property's own (as of the draw): As-Is and As Complete.
+PA_FIRST = {"K": "_pa_bpo", "L": "_pa_arv"}
+ESTIMATED_COMPLETION_DAYS = 31                         # her Estimated Completion Date = Maturity Date − 31 days
 ZERO_IS_BLANK = {"K", "L", "O", "Q", "T", "AB"}        # a $0 / 0% here means "not filled in", never a real value
 STREET_PARTS = ("Street_Number__c", "Street_Name__c")   # F Property Street = number + name
 # Computed columns written as live Excel formulas — only where every input cell is filled.
@@ -850,7 +855,8 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
                 ftypes.setdefault(col, meta["type"])
     unavailable = [col for col in MELANIE_MAP if col not in cols]
     prop_ref = next((f for f, m in adv_meta.items() if m["ref"] == ["Property__c"]), None)  # Advance -> Property
-    extra = [p for p in ("Id", "Name", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD, CONTAINER_FIELD)
+    extra = [p for p in ("Id", "Name", "Deal__c", "Status__c", "Loan_Advance_Number__c", WIRE_FIELD, CONTAINER_FIELD,
+                         NET_FIELD, "Approved_Advance_Amount_Total__c", "Batch_Approval__c", "Deal_RecordType__c")
              + PERSON_FIELDS if resolve_path(inst, tok, "Advance__c", p)] + ([prop_ref] if prop_ref else [])
     checks = {label: path for label, path in DEAL_CHECKS.items() if _usable(resolve_path(inst, tok, "Advance__c", path))}
     info = {label: path for label, path in DEAL_INFO.items() if _usable(resolve_path(inst, tok, "Advance__c", path))}
@@ -868,18 +874,17 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     for label, path in info.items():                          # shown in the deal details only, never in the file
         out[f"info:{label}"] = _col(adv, path).values
         ftypes[f"info:{label}"] = resolve_path(inst, tok, "Advance__c", path)["type"]
-    ffd1 = _col(out, f"chk:{IR_METHOD_CHECK}").map(_txt).eq("Full Funding Day 1")
-    if "AD" in out:                                           # their reserve is the servicer's suspense balance
-        out.loc[ffd1.values, "AD"] = None
     out["_multi_property"] = False
 
     # One row per property per draw, like Salesforce's own file: Property_Advance__c ties each draw to each
     # property with that property's approved amount — the Current Draw Amount in Melanie's files (it matched her
-    # value on 102 of 104 single-property rows), so it stands over Land Gorilla's whole-draw total.
+    # value on 363 of 371 rows), so it stands over Land Gorilla's whole-draw total.
     pa = _property_advances(inst, tok, _col(out, "Id").tolist())
-    out["_prop_id"], out["_pa_amount"], out["_pa_pct"] = None, np.nan, np.nan
+    pa_cols = ["_prop_id", "_pa_amount", "_pa_pct", "_pa_bpo", "_pa_arv"]
+    for c in pa_cols:
+        out[c] = None if c == "_prop_id" else np.nan
     if not pa.empty and "Id" in out:
-        out = out.drop(columns=["_prop_id", "_pa_amount", "_pa_pct"]).merge(pa, on="Id", how="left")
+        out = out.drop(columns=pa_cols).merge(pa, on="Id", how="left")
     out["_pa_count"] = out.groupby(_col(out, "Id").fillna("").values)["_prop_id"].transform("count").values
     out["_u_locked"] = (out["_pa_count"] > 1) | pd.to_numeric(out["_pa_amount"], errors="coerce").notna()
     out["U"] = [a if (lock or pd.notna(a)) else u               # a split draw never repeats the whole amount
@@ -935,6 +940,12 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
         out[col] = [v if v is not None else p for v, p in zip(vals, prior)]
         if any(v is not None for v in vals) or col not in ftypes:
             ftypes[col] = pmeta[fs[0]]["type"]
+    for col, src in PA_FIRST.items():                          # the draw's own property values, where it has them
+        v = pd.to_numeric(_col(out, src), errors="coerce")
+        have = v.notna() & (v != 0)
+        if have.any():
+            out[col] = [x if h else y for x, y, h in zip(v, _col(out, col), have)]
+            ftypes[col] = "currency"
     for label, f in pchecks.items():
         out[f"chk:{label}"] = [m.get(f) if m else None for m in match]
         ftypes[f"chk:{label}"] = pmeta[f]["type"]
@@ -942,17 +953,13 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
 
-# Values the request sheet has no column for, put on the Prep worksheet to finish it by hand. Full Funding Day 1 loans
-# hold their interest reserve with the servicer, so their IR Balance is the deal's suspense balance — left for
-# Melanie to confirm rather than written into the request (servicer balances move monthly).
-IR_METHOD_CHECK = "IR funding method — deal IR funding method"
-DEAL_CHECKS = {
-    "IR balance — deal Servicer suspense balance": "Deal__r.Suspense_Balance__c",
-    IR_METHOD_CHECK: "Deal__r.IR_Funding_Method__c",
-}
+# Candidate values for columns no Salesforce field is confirmed for, put on the Prep worksheet to check by hand
+# ({label: path}). None are open now: every mapped column was checked against Melanie's own files.
+DEAL_CHECKS: dict = {}
 PROPERTY_CHECKS: dict = {}
 # Deal facts for the Draw & deal details view only (resolved one by one, so a missing field just drops out).
 DEAL_INFO = {
+    "Next payment due": "Deal__r.Next_Payment_Date__c",
     "Original maturity": "Deal__r.Stated_Maturity_Date__c",
     "Extensions": "Deal__r.Num_of_Property_Extensions__c",
     "Servicer status": "Deal__r.Servicer_Status__c",
@@ -976,17 +983,21 @@ def _property_advances(inst: str, tok: str, adv_ids) -> pd.DataFrame:
         return pd.DataFrame()
     amt = "Approved_Advance_Amount_Calc__c" if "Approved_Advance_Amount_Calc__c" in meta else next(
         (f for f, m in meta.items() if m["type"] == "currency" and "amount" in str(m.get("label", "")).lower()), None)
-    pct = "Project_Completion_Percent__c" if "Project_Completion_Percent__c" in meta else None
+    named = {"_pa_pct": "Project_Completion_Percent__c", "_pa_bpo": "BPO_Appraisal_Value__c",
+             "_pa_arv": "After_Repair_Value__c"}
+    named = {k: f for k, f in named.items() if f in meta}
     try:
-        pa = _soql_in(inst, tok, ",".join(["Id", adv_fk, prop_fk] + [f for f in (amt, pct) if f]), "Property_Advance__c",
-                      adv_fk, adv_ids)
+        pa = _soql_in(inst, tok, ",".join(["Id", adv_fk, prop_fk] + ([amt] if amt else []) + list(named.values())),
+                      "Property_Advance__c", adv_fk, adv_ids)
     except Exception:
         return pd.DataFrame()
     if pa.empty or adv_fk not in pa or prop_fk not in pa:
         return pd.DataFrame()
-    return pd.DataFrame({"Id": pa[adv_fk].values, "_prop_id": pa[prop_fk].values,
-                         "_pa_amount": pd.to_numeric(pa[amt], errors="coerce").values if amt in pa else np.nan,
-                         "_pa_pct": pd.to_numeric(pa[pct], errors="coerce").values if pct in pa else np.nan})
+    out = pd.DataFrame({"Id": pa[adv_fk].values, "_prop_id": pa[prop_fk].values,
+                        "_pa_amount": pd.to_numeric(pa[amt], errors="coerce").values if amt in pa else np.nan})
+    for k in ("_pa_pct", "_pa_bpo", "_pa_arv"):
+        out[k] = pd.to_numeric(pa[named[k]], errors="coerce").values if named.get(k) in pa else np.nan
+    return out
 
 
 def _filled(v, zero_is_blank: bool = False) -> bool:
@@ -1062,84 +1073,113 @@ def _put(ws, r: int, c: int, v) -> None:
         cell.data_type = "s"
 
 
+GROSS_APPROVED = "Approved_Advance_Amount_Total__c"   # a draw's gross approved amount: her totals add these up
+FNF_TYPE = "Single_Asset_Bridge_Loan"                 # "FNF" on her scoreboard: draws on single-asset bridge loans
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def funded_by_quarter(inst: str, tok: str, rt: str, since: str, until: str) -> pd.DataFrame:
-    """Draws and dollars wired per calendar quarter (columns y, q, n, amt) — feeds the Total Summary sheet."""
-    base = f"FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={since} AND {WIRE_FIELD}<={until}"
-    try:                                                  # one aggregate query when the org allows it
-        agg = run_soql(inst, tok, f"SELECT CALENDAR_YEAR({WIRE_FIELD}) y, CALENDAR_QUARTER({WIRE_FIELD}) q, "
-                                  f"COUNT(Id) n, SUM({NET_FIELD}) amt {base} "
-                                  f"GROUP BY CALENDAR_YEAR({WIRE_FIELD}), CALENDAR_QUARTER({WIRE_FIELD})")
-        if {"y", "q", "n", "amt"} <= set(agg.columns):
-            return agg[["y", "q", "n", "amt"]].astype({"y": int, "q": int, "n": int})
-    except Exception:
-        pass
-    raw = run_soql(inst, tok, f"SELECT {WIRE_FIELD},{NET_FIELD} {base}")
+    """Draws and gross dollars wired per calendar quarter, with the FNF (single-asset bridge) share — columns y, q,
+       n, amt, fnf_n, fnf_amt — for the Total Summary sheet. Net amounts only where the gross field is missing."""
+    amt = GROSS_APPROVED if resolve_path(inst, tok, "Advance__c", GROSS_APPROVED) else NET_FIELD
+    kind = "Deal_RecordType__c" if resolve_path(inst, tok, "Advance__c", "Deal_RecordType__c") else None
+    raw = run_soql(inst, tok, f"SELECT {WIRE_FIELD},{amt}" + (f",{kind}" if kind else "") + f" FROM Advance__c "
+                              f"WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={since} AND {WIRE_FIELD}<={until}")
+    cols = ["y", "q", "n", "amt", "fnf_n", "fnf_amt"]
     if raw.empty:
-        return pd.DataFrame({"y": [], "q": [], "n": [], "amt": []})
+        return pd.DataFrame(columns=cols)
     w = pd.to_datetime(raw[WIRE_FIELD], errors="coerce")
-    g = pd.DataFrame({"y": w.dt.year, "q": w.dt.quarter, "amt": pd.to_numeric(raw[NET_FIELD], errors="coerce")})
-    return g.dropna(subset=["y"]).groupby(["y", "q"]).agg(n=("amt", "size"), amt=("amt", "sum")).reset_index()
+    money_ = pd.to_numeric(raw[amt], errors="coerce").fillna(0)
+    fnf = _col(raw, kind).eq(FNF_TYPE) if kind else pd.Series(False, index=raw.index)
+    g = pd.DataFrame({"y": w.dt.year, "q": w.dt.quarter, "amt": money_, "fnf_amt": money_.where(fnf, 0),
+                      "fnf": fnf.astype(int)}).dropna(subset=["y"])
+    out = g.groupby(["y", "q"]).agg(n=("amt", "size"), amt=("amt", "sum"), fnf_n=("fnf", "sum"),
+                                    fnf_amt=("fnf_amt", "sum")).reset_index()
+    return out.astype({"y": int, "q": int, "n": int, "fnf_n": int})[cols]
 
 
 def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame) -> dict:
-    """Figures for the workbook's Total Summary sheet: quarterly totals since 2021 and this month to date."""
+    """Figures for the workbook's Total Summary sheet: quarterly totals since 2021, this month to date, and this
+       request's wired draws — each with the FNF (single-asset bridge) share, all at gross approved amounts."""
     today = _today()
     quarters = funded_by_quarter(inst, tok, rt, "2021-01-01", f"{today:%Y-%m-%d}")
     month = funded_by_quarter(inst, tok, rt, f"{today.replace(day=1):%Y-%m-%d}", f"{today:%Y-%m-%d}")
-    pending = 0.0                                         # draws in this file that aren't wired yet
-    if "U" in rows and WIRE_FIELD in rows:
-        pending = float(pd.to_numeric(rows.loc[rows[WIRE_FIELD].isna(), "U"], errors="coerce").sum())
-    return {"quarters": quarters, "mtd": float(month["amt"].sum()), "pending": pending}
+    u = pd.to_numeric(_col(rows, "U"), errors="coerce").fillna(0)
+    label = _col(rows, "_label").map(_txt)
+    if label.ne("").any():          # the weekly list: wired rows say Funded; upcoming ones count only if she said so
+        wired = label.str.startswith("Funded")
+        pending = ~wired & _col(rows, "_count").map(lambda x: x is True or x is np.True_)
+    else:
+        wired = _col(rows, WIRE_FIELD).map(_txt) != ""
+        pending = ~wired
+    fnf = _col(rows, "Deal_RecordType__c").eq(FNF_TYPE)
+    ids = _col(rows, "Id")
+    return {"quarters": quarters, "mtd": float(month["amt"].sum()), "mtd_n": int(month["n"].sum()),
+            "mtd_fnf": float(month["fnf_amt"].sum()), "mtd_fnf_n": int(month["fnf_n"].sum()),
+            "pending": float(u[pending].sum()), "req": float(u[wired].sum()), "req_n": int(ids[wired].nunique()),
+            "req_fnf": float(u[wired & fnf].sum()), "req_fnf_n": int(ids[wired & fnf].nunique())}
 
 
 def _write_total_summary(wb, summary: dict) -> None:
-    """Replace the template's hard-coded 2024 ledger with figures computed from Salesforce."""
+    """Replace the template's hard-coded 2024 ledger with figures computed from Salesforce, at gross approved amounts
+       (as her running totals are), with the FNF (single-asset bridge) share beside each."""
     from openpyxl.styles import Font
     if "Total Summary" not in wb.sheetnames:
         return
     ws = wb["Total Summary"]
     money_fmt = ws["D6"].number_format or '"$"#,##0'
+    if money_fmt == "General":
+        money_fmt = '"$"#,##0'
     for row in ws.iter_rows(min_row=1, max_row=max(ws.max_row, 60), max_col=12):
         for c in row:
             c.value = None
     today = _today()
     now = (today.year, (today.month - 1) // 3 + 1)
     bold = Font(bold=True)
-    ws["B2"] = "This Month"
-    ws["B2"].font = bold
-    ws["B3"] = summary["mtd"] + summary["pending"]
-    ws["B3"].number_format = money_fmt
-    ws["C3"] = "funded this month to date" + (" + this request's pending draws" if summary["pending"] else "")
+
+    def line(r, label, n, amt, fnf_n, fnf_amt):
+        ws.cell(r, 2, label)
+        ws.cell(r, 3, n)
+        ws.cell(r, 4, amt).number_format = money_fmt
+        ws.cell(r, 5, fnf_n)
+        ws.cell(r, 6, fnf_amt).number_format = money_fmt
+    for c, title in zip(range(2, 7), ("This Month", "Draws", "Funded", "FNF draws", "FNF funded")):
+        ws.cell(2, c, title).font = bold
+    pend = summary.get("pending", 0.0)
+    line(3, "Month to date" + (" + pending" if pend else ""), summary.get("mtd_n", 0), summary["mtd"] + pend,
+         summary.get("mtd_fnf_n", 0), summary.get("mtd_fnf", 0.0))
+    line(4, "This request (wired)", summary.get("req_n", 0), summary.get("req", 0.0), summary.get("req_fnf_n", 0),
+         summary.get("req_fnf", 0.0))
     q = summary["quarters"]
     years = sorted({int(y) for y in q["y"]} | {today.year}, reverse=True)
-    r = 5
+    r = 6
     for y in years:
-        ws.cell(r, 2, f"{y} TOTALS").font = bold
-        ws.cell(r, 3, "Draws").font = bold
-        ws.cell(r, 4, "Funded").font = bold
+        for c, title in zip(range(2, 7), (f"{y} TOTALS", "Draws", "Funded", "FNF draws", "FNF funded")):
+            ws.cell(r, c, title).font = bold
         for n in range(1, 5):
             ws.cell(r + n, 2, f"Q{n}" + (" (running)" if (y, n) == now else ""))
             if (y, n) <= now:
                 m = q[(q["y"] == y) & (q["q"] == n)]
-                ws.cell(r + n, 3, int(m["n"].sum()))
-                ws.cell(r + n, 4, float(m["amt"].sum())).number_format = money_fmt
+                line(r + n, f"Q{n}" + (" (running)" if (y, n) == now else ""), int(m["n"].sum()),
+                     float(m["amt"].sum()), int(m["fnf_n"].sum()), float(m["fnf_amt"].sum()))
         ws.cell(r + 5, 2, "TOTAL").font = bold
-        ws.cell(r + 5, 3, f"=SUM(C{r + 1}:C{r + 4})")
-        ws.cell(r + 5, 4, f"=SUM(D{r + 1}:D{r + 4})").number_format = money_fmt
+        for c in range(3, 7):
+            col = "CDEF"[c - 3]
+            ws.cell(r + 5, c, f"=SUM({col}{r + 1}:{col}{r + 4})").number_format = (money_fmt if col in "DF"
+                                                                                  else "General")
         r += 8
+    ws.cell(r, 2, "Amounts are gross approved draw amounts. FNF = draws on single-asset bridge loans.")
 
 
-LG_COLUMNS = ("U", "AG", "M", "N", "Y", "AB")            # columns Land Gorilla can fill
-SF_FIRST = ("M", "Y")          # ... where Salesforce's value matches Melanie's files, so Land Gorilla only fills gaps
+LG_COLUMNS = ("U", "AG", "M", "N", "Y")       # columns Land Gorilla can fill where Salesforce has nothing
 
 
 def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
                loans: bool = True) -> tuple[pd.DataFrame, dict, dict]:
-    """Land Gorilla first: each draw's payees, its amount where Salesforce has no per-property amount, and each loan's
-       current due date and balance (single-property loans: the loan's balance is that property's). The funded date
-       and project completion stay Salesforce's (SF_FIRST), with Land Gorilla filling gaps. Its loan-level remaining to
-       fund goes on the Prep worksheet, never into a property's row.
+    """Land Gorilla fills the gaps: a draw's amount, and the loan's funded date, due date and project completion, only
+       where Salesforce has none. In those columns Salesforce's values are the ones in Melanie's files and Salesforce's
+       own Generate File (Land Gorilla's due date ran a month early on some loans, and its draw amount isn't the
+       approved amount), so Land Gorilla's figures go on the Prep worksheet instead. Payees come from Land Gorilla.
        Returns (rows, ftypes, {"draws": {...}, "loans": {...}}) — the raw LG data feeds the prep worksheet."""
     lg = {"draws": {}, "loans": {}}
     if rows.empty or not cfg:
@@ -1157,22 +1197,14 @@ def lg_overlay(rows: pd.DataFrame, ftypes: dict, cfg: dict | None,
     dr = _col(rows, CONTAINER_FIELD).map(lambda c: lg["draws"].get(c) if isinstance(c, str) else None)
     lo = _col(rows, "B").map(lambda n: lg["loans"].get(_txt(n)) if _txt(n) else None)
     payees = dr.map(lambda d: "; ".join(d["payees"]) if d and d.get("payees") else None)
-    portfolio = pd.to_numeric(_col(rows, "_pa_count"), errors="coerce").fillna(0) > 1
     for col, src, key, ftype in (("U", dr, "amount", "currency"), ("M", lo, "funded_date", "date"),
-                                 ("N", lo, "due_date", "date"), ("Y", lo, "project_pct", "percent"),
-                                 ("AB", lo, "balance", "currency")):
+                                 ("N", lo, "due_date", "date"), ("Y", lo, "project_pct", "percent")):
         got = src.map(lambda d: d.get(key) if d else None)
-        if col == "AB":
-            got = got.where(~portfolio.values, None)
         locks = [col == "U" and x is not None and not pd.isna(x) and bool(x) for x in _col(rows, "_u_locked")]
         sf = list(_col(rows, col))
-        if col in SF_FIRST:
-            rows[col] = [b if _txt(b) else a for a, b in zip(got, sf)]
-            used = any(not _txt(b) and _txt(a) for a, b in zip(got, sf))
-        else:
-            rows[col] = [b if lock else (a if _txt(a) else b) for a, b, lock in zip(got, sf, locks)]
-            used = any(not lock and _txt(a) for a, lock in zip(got, locks))
-        if used:                                    # same kind of value as Salesforce's, where it has one
+        fill = [not lock and not _txt(b) and bool(_txt(a)) for a, b, lock in zip(got, sf, locks)]
+        rows[col] = [a if f else b for a, b, f in zip(got, sf, fill)]
+        if any(fill):                               # same kind of value as Salesforce's, where it has one
             ftypes.setdefault(col, ftype)
     rows["AG"] = payees.tolist()
     ftypes["AG"] = "string"
@@ -1225,11 +1257,16 @@ def _prep_table(rows: pd.DataFrame, lg: dict, ap: pd.DataFrame | None, ftypes: d
 
 
 def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submitted_by: str,
-                          funding_date: date, summary: dict | None = None, prep: pd.DataFrame | None = None) -> bytes:
+                          funding_date: date, summary: dict | None = None, prep: pd.DataFrame | None = None,
+                          window: str | None = None, total_from: int | None = None, notes: bool = False) -> bytes:
     """Open the committed template, fill the title block, and write one row per draw in its own column order.
        The other sheets are brought up to date too: Total Summary from Salesforce, the Cap Partners title
        blocks from this request, the template's stale hidden reference sheet removed, and a Prep worksheet
-       added with everything needed to finish the columns no system holds."""
+       added with everything needed to finish the columns no system holds.
+       window = the wire window for F4 ('8/13-8/19'); total_from = the first row E6 adds up (rows above it are
+       upcoming draws left out of the total); notes = also fill Comments and Funding to from Salesforce's notes and
+       Land Gorilla's payees (Melanie clears them). Per-row extras: _label (column A), _comment, _funding_to, and the
+       hand-kept _cm / _am1 / _am2 / _deposit carried over from last week's file."""
     import openpyxl
     from openpyxl.utils import column_index_from_string as ci
     wb = openpyxl.load_workbook(template)
@@ -1246,8 +1283,12 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         _write_total_summary(wb, summary)
     ws["E4"], ws["E5"] = _today(), funding_date                              # real dates (today in ET)
     ws["E4"].number_format = ws["E5"].number_format = "m/d/yyyy"
+    if window:
+        ws["F4"] = window                                                    # the wire window, as she writes it
     _current_layout(ws)
-    letters = list(dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS)))
+    skip = set() if notes else {"AF", "AG"}
+    letters = [c for c in dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS))
+               if c not in skip]
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
         for col in letters:
             v = _xl(row.get(col), ftypes.get(col))
@@ -1255,12 +1296,27 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
                 _put(ws, r, ci(col), v)
                 if isinstance(v, date):
                     ws.cell(r, ci(col)).number_format = "m/d/yyyy"
+        for col, key in (("AF", "_comment"), ("AG", "_funding_to"), ("AK", "_cm"), ("AL", "_am1"), ("AM", "_am2"),
+                         ("AN", "_deposit")):
+            v = row.get(key)
+            if isinstance(v, str) and v.strip():
+                _put(ws, r, ci(col), _xl_text(v.strip()))
+        maturity = _d(row.get("N"))
+        if maturity:                                                         # Estimated Completion Date
+            ws.cell(r, ci("AA")).value = maturity - timedelta(days=ESTIMATED_COMPLETION_DAYS)
+            ws.cell(r, ci("AA")).number_format = "m/d/yyyy"
         ws.cell(r, ci("Z")).value = 1                                        # Borrower EC % — 100%, as Salesforce's file
-        if bool(row.get("_multi_property", False)):
+        label = row.get("_label")
+        if isinstance(label, str) and label.strip():
+            _put(ws, r, ci("A"), _xl_text(label.strip()))
+        elif bool(row.get("_multi_property", False)):
             ws.cell(r, ci("A")).value = "Portfolio loan — couldn't match this draw to one property"
         for col, pattern in MELANIE_FORMULAS.items():     # every input filled and non-zero (no #DIV/0!)
             if all(ws.cell(r, ci(c)).value not in (None, "", 0) for c in re.findall(r"([A-Z]+)\{r\}", pattern)):
                 ws.cell(r, ci(col)).value = pattern.format(r=r)
+    first = TEMPLATE_HEADER_ROW + 1
+    if total_from and total_from > first:                 # leave the upcoming draws above it out of the total
+        ws["E6"] = f"=SUM(U{total_from}:U{max(first + len(rows) - 1, total_from)})"
     if prep is not None and not prep.empty:
         _write_prep_sheet(wb, prep)
     buf = io.BytesIO(); wb.save(buf)
@@ -1330,13 +1386,14 @@ def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
 
 
 def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFrame, ftypes: dict,
-                       submitted_by: str, funding_date: date) -> tuple[bytes, int]:
-    """Everything that goes into one funding-request workbook: Land Gorilla first, Salesforce to fill gaps,
-       the summary sheet, and the prep worksheet. Returns (xlsx bytes, number of draws)."""
+                       submitted_by: str, funding_date: date, **layout) -> tuple[bytes, int]:
+    """Everything that goes into one funding-request workbook: Salesforce's values with Land Gorilla filling gaps,
+       the summary sheet, and the prep worksheet. layout = fill_melanie_template's window / total_from / notes.
+       Returns (xlsx bytes, number of rows)."""
     rows, ftypes, lg = lg_overlay(rows, ftypes, lg_config())
     ap = approvals_for(inst, tok, tuple(_col(rows, "Id").dropna()))
     xlsx = fill_melanie_template(tpl, rows, ftypes, submitted_by, funding_date,
-                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap, ftypes))
+                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap, ftypes), **layout)
     return xlsx, len(rows)
 
 
@@ -2155,11 +2212,6 @@ def _request_chain(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return out, src
 
 
-def _request_date(df: pd.DataFrame) -> pd.Series:
-    """Each draw's request date (see _request_chain)."""
-    return _request_chain(df)[0]
-
-
 def _created_ts(df: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(_col(df, "CreatedDate"), errors="coerce", utc=True).dt.tz_localize(None)
 
@@ -2594,10 +2646,10 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
 
 DEAL_FACTS = (("C", "Deal"), ("D", "Borrower"), ("E", "Sponsor"), ("J", "Project type"), ("AJ", "RM / LO"),
               ("O", "Total loan commitment"), ("T", "Completion LTC"), ("M", "Funded (first funding)"),
-              ("N", "Maturity"), ("AC", "Next payment due"), ("AD", "IR balance"), ("AH", "Warehouse line"))
+              ("N", "Maturity"), ("AH", "Warehouse line"))
 PROPERTY_FACTS = (("F", "Street"), ("G", "City"), ("H", "State"), ("I", "Property type"), ("K", "As-is value"),
                   ("L", "As-complete value"), ("Q", "Initial funding"), ("Y", "Project complete"),
-                  ("AB", "Current UPB"))
+                  ("AD", "IR balance"), ("AB", "Current UPB"), ("AC", "Next due (servicer)"))
 
 
 @sf_fragment
@@ -2650,12 +2702,13 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
     first = merged.iloc[0]
     facts = [(label, _show(first.get(col), mtypes.get(col))) for col, label in DEAL_FACTS]
     facts.insert(1, ("Account", _show(row.get("Deal__r.Account.Name"))))
+    facts += [(c[5:], _show(first.get(c), mtypes.get(c))) for c in merged.columns if str(c).startswith("info:")]
     today = _today()
-    for label, col, flag in (("Maturity", "N", "past maturity"), ("Next payment due", "AC", "past due")):
+    for label, col, flag in (("Maturity", "N", "past maturity"), ("Next payment due", "info:Next payment due",
+                                                                  "past due")):
         when = _d(first.get(col))
         if when and when < today:                     # a past next-due date means a missed payment, not stale data
             facts = [(k, f"{v} — {flag}" if k == label and v else v) for k, v in facts]
-    facts += [(c[5:], _show(first.get(c), mtypes.get(c))) for c in merged.columns if str(c).startswith("info:")]
     facts += [("Draw coordinator", _show(row.get("Advance_Coordinator__r.Name"))),
               ("Draw analyst", _show(row.get("Advance_Analyst__r.Name")))]
     facts += [(_check_label(c), _show(first.get(c), mtypes.get(c))) for c in merged.columns
@@ -3343,7 +3396,15 @@ def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
 
 
 # ───────────────────────────── Funding request (weekly file) ────────────────
-RANGE_PRESETS = {"Last 7 days": 7, "Last 14 days": 14, "Month to date": None, "Custom": None}
+# Melanie's weekly request, as her Jul–Oct 2026 files and Salesforce's Generate File show it: a few upcoming draws she
+# wants the team to OK on top (her pick, mostly credit-line loans), then every draw wired since her last request — one
+# row per property at the gross approved amount. She leaves off draws where no money moved (net $0 or less), draws
+# with no IC approval batch, and draws already on an earlier list. Her windows run Thursday to the Wednesday she sends
+# the file, and start over on the 1st of the month.
+RANGE_PRESETS = ("Since last request", "Last 7 days", "Month to date", "Custom")
+UPCOMING_EXCLUDE = TERMINAL + ["Pending"]                  # a reopened ("Pending") record was funded already
+SCOREBOARD = re.compile(r"^\s*(?:this month|\d{4}\s+totals|q[1-4]\b|total\b|fnf\b)", re.IGNORECASE)
+CARRIED = ("cm", "am1", "am2", "deposit")                 # her hand-kept AK–AN, carried over by loan
 # Salesforce's draw statuses grouped into the stages a draw actually moves through (Advance__History: every draw starts
 # Received; the approval, release and approved steps almost always finish the same day; "Pending" only appears when a
 # completed record is reopened; a blank status is a cancelled draw).
@@ -3365,81 +3426,391 @@ def _stage(status) -> str:
     return STATUS_STAGES.get(s, s or "No status")
 
 
+def _thursday_before(d: date) -> date:
+    """The Thursday before d: her lists usually cover Thursday through the Wednesday she sends them."""
+    return d - timedelta(days=(d.weekday() - 3) % 7 or 7)
+
+
+def _next_business_day(d: date) -> date:
+    return np.busday_offset(np.datetime64(d, "D"), 1, roll="forward", holidays=_HOLS).astype(object)
+
+
+def _window_text(lo: date, hi: date) -> str:
+    """'8/13-8/19', the way she writes the wire window next to the submitted date."""
+    return f"{lo.month}/{lo.day}" + ("" if lo == hi else f"-{hi.month}/{hi.day}")
+
+
+def _norm_head(v) -> str:
+    return " ".join(re.sub(r"[^a-z0-9#?/]+", " ", _txt(v).lower()).split())
+
+
+def _loan_key(v) -> str:
+    """A loan number as text, whether the sheet stored it as 60746, 60746.0 or '60746'."""
+    s = _txt(v)
+    return str(int(float(s))) if re.fullmatch(r"\d+(\.0+)?", s) else s
+
+
+_XLSX_LOCK = threading.Lock()
+
+
+def _open_values(data: bytes):
+    """A workbook opened for its values only. Salesforce's own Generate File has a stylesheet openpyxl rejects; values
+       don't need styles, so on that error the workbook is opened again without them."""
+    import openpyxl
+    import openpyxl.reader.excel as rx
+    try:
+        return openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except TypeError:
+        with _XLSX_LOCK:                  # other sessions may be opening workbooks at the same moment
+            keep = rx.apply_stylesheet
+            rx.apply_stylesheet = lambda archive, wb: None
+            try:
+                return openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+            finally:
+                rx.apply_stylesheet = keep
+
+
+def read_last_request(data: bytes) -> dict:
+    """Last week's request workbook, read from its main sheet: who sent it, the last day it covered (the later of its
+       submitted date and the end of its wire window), and its draw rows — loan, amount, column-A label, comment,
+       funding to, and the hand-kept managers and deposit answer, found by their headers (her 40-column layout or
+       Salesforce's 39). The running totals under the draws are skipped."""
+    wb = _open_values(data)
+    try:
+        ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.worksheets[0]
+        grid = [list(r) for r in ws.iter_rows(min_row=1, max_row=3000, max_col=45, values_only=True)]
+    finally:
+        wb.close()
+
+    def cell(r, c):
+        return grid[r - 1][c - 1] if c and r <= len(grid) and c <= len(grid[r - 1]) else None
+    head = {}
+    for j, v in enumerate(grid[TEMPLATE_HEADER_ROW - 1] if len(grid) >= TEMPLATE_HEADER_ROW else [], 1):
+        head.setdefault(_norm_head(v), j)
+
+    def col(name):
+        return head.get(_norm_head(name))
+    sent, window = _d(cell(4, 5)), _txt(cell(4, 6))
+    ends = [sent] if sent else []
+    m = re.search(r"(\d{1,2})/(\d{1,2})\s*$", window)
+    if m:
+        ref = sent or _today()
+        try:
+            end = date(ref.year, int(m.group(1)), int(m.group(2)))
+            ends.append(date(ref.year - 1, end.month, end.day) if end > ref + timedelta(days=60) else end)
+        except ValueError:
+            pass
+    rows, blank, c_loan = [], 0, col("CV Loan #") or 2
+    c_cm, c_am1 = col("Construction Manager"), col("Asset Manager 1")
+    if c_cm is None:                       # Salesforce's 39-column file: its "Asset Manager 1" holds the people she
+        c_cm, c_am1 = c_am1, None          # lists as Construction Manager
+    for r in range(TEMPLATE_HEADER_ROW + 1, len(grid) + 1):
+        loan = _loan_key(cell(r, c_loan))
+        if not loan:
+            blank += 1
+            if blank >= 5:
+                break
+            continue
+        blank = 0
+        if SCOREBOARD.match(loan):
+            break
+        rows.append({"loan": loan, "amount": pd.to_numeric(cell(r, col("Current Draw Amount")), errors="coerce"),
+                     "label": _txt(cell(r, col("Notes"))), "comment": _txt(cell(r, col("Comments"))),
+                     "funding_to": _txt(cell(r, col("Funding to"))), "cm": _txt(cell(r, c_cm)),
+                     "am1": _txt(cell(r, c_am1)), "am2": _txt(cell(r, col("Asset Manager 2"))),
+                     "deposit": _txt(cell(r, col("Deposit for materials? Y/N")))})
+    return {"by": _txt(cell(3, 5)), "sent": sent, "window": window, "last_day": max(ends) if ends else None,
+            "rows": rows}
+
+
+def _is_top(r: dict) -> bool:
+    """An upcoming row of hers (labelled Monday / next week / Carry Over, or commented), not a wired one."""
+    return not r["label"].lower().startswith("funded") and bool(r["label"] or r["comment"])
+
+
+def _last_request() -> dict | None:
+    """The optional upload of last week's request, read once per file and kept for this session only."""
+    up = st.file_uploader("Last week's request (optional)", type=["xlsx"], key="fr_last",
+                          help="The last file you sent. The wire window then starts from the last day it covered, "
+                               "draws already on it are left off, and its hand-filled columns carry over: "
+                               "Construction Manager, Asset Manager 1 and 2, and the labels and comments of its "
+                               "upcoming draws. Nothing is saved.")
+    if up is None:
+        return None
+    key = f"fr_last_{up.file_id}"
+    if key not in st.session_state:
+        try:
+            st.session_state[key] = read_last_request(up.getvalue())
+        except Exception as exc:             # no exception text: it could echo the file's contents
+            st.warning(f"Couldn't read that file ({type(exc).__name__}). Is it a funding-request workbook?")
+            st.session_state[key] = None
+        got = st.session_state[key]
+        if got and got.get("by") and not st.session_state.get("fr_by"):
+            st.session_state["fr_by"] = got["by"]
+    return st.session_state[key]
+
+
+def _left_off(rows: pd.DataFrame, last: dict | None) -> pd.Series:
+    """Why each row's draw stays off the list (blank = it goes on), as Melanie and Salesforce's Generate File do:
+       no money moved (net $0 or less), or no IC approval batch; and, given last week's file, already on it. Judged per
+       draw, so a $0 property inside a draw that moved money stays."""
+    why = pd.Series("", index=rows.index, dtype=object)
+    if NET_FIELD in rows:
+        why[pd.to_numeric(rows[NET_FIELD], errors="coerce").fillna(0) <= 0] = "$0 or negative net (no money moved)"
+    if "Batch_Approval__c" in rows:
+        why[(why == "") & (rows["Batch_Approval__c"].map(_txt) == "")] = "No IC approval batch"
+    if last and last.get("rows"):
+        seen = {(r["loan"], round(float(r["amount"]), 2)) for r in last["rows"] if pd.notna(r["amount"])}
+        amounts = pd.to_numeric(_col(rows, "U"), errors="coerce")
+        hit = [pd.notna(u) and (_loan_key(b), round(float(u), 2)) in seen for b, u in zip(_col(rows, "B"), amounts)]
+        why[(why == "") & _col(rows, "Id").isin(set(_col(rows, "Id")[hit]))] = "Already on last week's file"
+    return why
+
+
+def _per_draw(rows: pd.DataFrame) -> pd.DataFrame:
+    """One row per draw, the way her upcoming rows are written: the first property's row, with the properties'
+       values and amounts added up, completion averaged, and 'n properties' as the street of a portfolio draw."""
+    if rows.empty or "Id" not in rows:
+        return rows
+    g = rows.groupby("Id", sort=False)
+    one = g.head(1).set_index("Id")
+    for c in ("K", "L", "Q", "AB", "AD", "U", "_pa_amount"):
+        if c in rows:
+            one[c] = g[c].apply(lambda s: pd.to_numeric(s, errors="coerce").sum(min_count=1))
+    if "Y" in rows:
+        one["Y"] = g["Y"].apply(lambda s: pd.to_numeric(s, errors="coerce").mean())
+    n = g.size()
+    if (n > 1).any():
+        one["F"] = [f"{k} properties" if k > 1 else f for k, f in zip(n.reindex(one.index), _col(one, "F"))]
+    return one.reset_index()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def upcoming_draws(inst: str, tok: str, rt: str, after: date) -> tuple[pd.DataFrame, dict]:
+    """Draws that could go on top of the list, one row per draw: still in play (not finished, cancelled or reopened)
+       and not wired yet — or wired only after the window, i.e. with a planned wire date. The amount is the approved
+       draw total, else Land Gorilla's requested amount."""
+    where = (f"Status__c != null AND Status__c NOT IN ({','.join(repr(s) for s in UPCOMING_EXCLUDE)}) "
+             f"AND ({WIRE_FIELD}=null OR {WIRE_FIELD}>{after:%Y-%m-%d})")
+    rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
+    one = _per_draw(rows)
+    if one.empty:
+        return one, ftypes
+    asked, cfg = {}, lg_config()
+    if cfg:
+        try:
+            asked = {c: d.get("requested") for c, d in lg_draws(cfg["user"], cfg["password"], bool(cfg.get("verify", True)),
+                                                                 _col(one, CONTAINER_FIELD).tolist()).items()}
+        except Exception:                     # Land Gorilla down: Salesforce's amounts only
+            asked = {}
+    gross = pd.to_numeric(_col(one, GROSS_APPROVED), errors="coerce")
+    lg_ask = pd.to_numeric(_col(one, CONTAINER_FIELD).map(lambda c: asked.get(c) if isinstance(c, str) else None),
+                           errors="coerce")
+    one["U"] = gross.where(gross > 0, lg_ask).fillna(pd.to_numeric(one["U"], errors="coerce"))
+    return one, ftypes
+
+
+def _upcoming_picker(one: pd.DataFrame, last: dict | None, key: str) -> pd.DataFrame:
+    """Melanie's pick of upcoming draws for the top of the file: credit-line loans and last week's upcoming loans are
+       ticked to start; she labels each (Monday, next week…), says whether it counts in this file's total, and can fix
+       the amount, comment and receiving bank."""
+    tops = {}
+    for r in (last or {}).get("rows", []):
+        if _is_top(r):
+            tops.setdefault(r["loan"], r)
+    loans = _col(one, "B").map(_loan_key)
+    t = pd.DataFrame({
+        "Put on top": [_txt(k) == "LOC_Loan" or ln in tops for k, ln in zip(_col(one, "Deal_RecordType__c"), loans)],
+        "Label": [tops.get(ln, {}).get("label", "") for ln in loans],
+        "Count in total": False, "Loan #": loans.values, "Draw #": _draw_nos(one), "Deal": _col(one, "C").values,
+        "Stage": _col(one, "Status__c").values, "Planned wire": _dates(_col(one, WIRE_FIELD)).values,
+        "Amount": pd.to_numeric(_col(one, "U"), errors="coerce").values,
+        "Comment": [tops.get(ln, {}).get("comment", "") for ln in loans],
+        "Funding to": [tops.get(ln, {}).get("funding_to", "") for ln in loans], "Id": _col(one, "Id").values})
+    t = t.sort_values(["Put on top", "Planned wire", "Loan #"], ascending=[False, True, True], na_position="last",
+                      kind="stable").reset_index(drop=True)
+    C = st.column_config
+    return st.data_editor(t, key=key, hide_index=True, width="stretch", height=min(420, 40 + 35 * len(t)),
+                          column_order=[c for c in t.columns if c != "Id"],
+                          disabled=["Loan #", "Draw #", "Deal", "Stage", "Planned wire"],
+                          column_config={
+                              "Put on top": C.CheckboxColumn(help="Put this draw on top of the file for the team"),
+                              "Label": C.TextColumn(help="Column A, e.g. Monday, Thursday, next week"),
+                              "Count in total": C.CheckboxColumn(help="Add it to the file's Total; leave unticked for "
+                                                                      "draws that won't fund this cycle"),
+                              "Planned wire": C.DateColumn(format="M/D/YYYY", help="A wire date already entered"),
+                              "Amount": C.NumberColumn(format="dollar", help="The approved draw total, else Land "
+                                                                             "Gorilla's requested amount — edit freely"),
+                              "Comment": C.TextColumn(width="large"),
+                              "Funding to": C.TextColumn(help="The receiving bank")})
+
+
+def _carry_over(rows: pd.DataFrame, last: dict | None) -> pd.DataFrame:
+    """Last week's hand-filled Construction Manager, Asset Manager 1 and 2 and deposit answer, by loan."""
+    if not last or rows.empty:
+        return rows
+    keep: dict = {}
+    for r in last["rows"]:
+        k = keep.setdefault(r["loan"], {})
+        for f in CARRIED:
+            if r[f] and f not in k:
+                k[f] = r[f]
+    rows = rows.copy()
+    loans = _col(rows, "B").map(_loan_key)
+    for f in CARRIED:
+        rows[f"_{f}"] = loans.map(lambda ln, f=f: keep.get(ln, {}).get(f, "")).values
+    return rows
+
+
 def render_funding_request(inst, tok, rt):
     st.header("Funding request")
-    st.caption("Melanie's weekly *Construction/Renovation Funding Request* workbook — the draws wired since the last "
-               "request, filled from Land Gorilla first and Salesforce for the rest.")
+    st.caption("Melanie's weekly *Construction/Renovation Funding Request*: upcoming draws for the team to OK on top, "
+               "and every draw wired since the last request below — Salesforce's values, with Land Gorilla for gaps.")
     tpl = _find_template()
     if not tpl:
         st.error("The funding-request template is missing from the app."); return
+    today = _today()
     with st.container(border=True):
+        last = _last_request()
         c = st.columns([1.2, 1, 1.8])
-        who = c[0].text_input("Submitted by (optional)", key="fr_by")
-        fdate = c[1].date_input("Scheduled funding date", value=_today(), key="fr_date")
+        who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name (E3)")
+        fdate = c[1].date_input("Scheduled funding date", value=_next_business_day(today), key="fr_date")
         mode = c[2].segmented_control("Draws", ["Wired", "Open (not yet wired)"], default="Wired",
                                       key="fr_mode") or "Wired"
+        window = None
         if mode == "Wired":
             r = st.columns([2, 1.4])
-            preset = r[0].pills("Wire dates", list(RANGE_PRESETS), default="Last 14 days", key="fr_preset") \
-                or "Last 14 days"
+            preset = r[0].pills("Wire dates", list(RANGE_PRESETS), default="Since last request", key="fr_preset") \
+                or "Since last request"
             if preset == "Custom":
-                rng = r[1].date_input("From – to", value=(_today() - timedelta(days=14), _today()), key="fr_rng")
+                rng = r[1].date_input("From – to", value=(_thursday_before(today), today), key="fr_rng")
                 if len(rng) != 2:
                     st.info("Pick a start and an end date."); return
                 lo, hi = rng
             elif preset == "Month to date":
-                lo, hi = _today().replace(day=1), _today()
-            else:
-                lo, hi = _today() - timedelta(days=RANGE_PRESETS[preset]), _today()
+                lo, hi = today.replace(day=1), today
+            elif preset == "Last 7 days":
+                lo, hi = today - timedelta(days=6), today
+            else:                         # the day the last request covered (its draws are left off), else Thursday
+                lo = (last or {}).get("last_day") or _thursday_before(today)
+                lo, hi = min(max(lo, today.replace(day=1)), today), today
+            window = _window_text(lo, hi)
+            if preset == "Since last request":
+                r[1].caption(f"**{_mdy(lo)} – {_mdy(hi)}** · " + (
+                    "from the last day on last week's file" if (last or {}).get("last_day")
+                    else "from last Thursday (upload last week's file to start where it ended)")
+                    + "; never before the 1st of the month")
             where = f"{WIRE_FIELD}>={lo:%Y-%m-%d} AND {WIRE_FIELD}<={hi:%Y-%m-%d}"
             scope = f"wired {_mdy(lo)} – {_mdy(hi)}"
         else:
             where, scope = OPEN_WHERE, "not yet wired"
     with st.spinner("Loading draws…"):
         rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
-    if rows.empty:
+    if rows.empty and mode != "Wired":
         st.info(f"No draws {scope}."); return
-    rows, ftypes, _ = lg_overlay(rows, ftypes, lg_config(), loans=False)      # Land Gorilla's draw amounts
+    if not rows.empty:
+        rows, ftypes, _ = lg_overlay(rows, ftypes, lg_config(), loans=False)      # Land Gorilla fills gaps
 
     f = st.columns(2)
     people = sorted({p for col in PERSON_FIELDS if col in rows for p in rows[col].dropna()})
     if people:
         person = f[0].selectbox("Coordinator / analyst", ["Everyone"] + people, key="fr_person",
-                                help="Everyone gives the full list. Pick a person to match the file Salesforce "
-                                     "generates for them.")
+                                help="Everyone matches Melanie's file and Salesforce's Generate File, which cover every "
+                                     "coordinator (most credit-line draws have none).")
         if person != "Everyone":
             rows = rows[np.logical_or.reduce([rows[col].eq(person) for col in PERSON_FIELDS if col in rows])]
-    if "Status__c" in rows:                                # stages in the order a draw moves through them
+    if "Status__c" in rows and not rows.empty:            # stages in the order a draw moves through them
         stage = rows["Status__c"].map(_stage)
         counts = stage.value_counts()
         options = sorted(counts.index, key=lambda s: (STAGE_ORDER.index(s) if s in STAGE_ORDER else 99, s))
-        picked = st.pills("Stage", options, selection_mode="multi", default=[s for s in options if s != "No status"],
+        start = (["Wired"] if mode == "Wired" and "Wired" in options    # a wire date on a draw not yet completed
+                 else [s for s in options if s != "No status"])          # is only planned
+        picked = st.pills("Stage", options, selection_mode="multi", default=start,
                           format_func=lambda s: f"{s} ({counts[s]})", key=f"fr_stage_{mode}", help=STAGE_HELP)
         rows = rows[stage.isin(picked)]
-    total = pd.to_numeric(rows["U"], errors="coerce").sum() if "U" in rows else None
-    m = st.columns(3)
-    m[0].metric("Draws", f"{len(rows):,}", border=True)
-    m[1].metric("Loans", f"{rows['B'].nunique() if 'B' in rows else 0:,}", border=True)
-    m[2].metric("Current draw amount", money(total) if total is not None else "—", border=True)
-    _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope)
-    preview = pd.DataFrame({"Loan #": _col(rows, "B"), "Property": _col(rows, "F"), "Deal": _col(rows, "C"),
-                            "Borrower": _col(rows, "D"), "Status": _col(rows, "Status__c"),
+
+    total_from, top = None, pd.DataFrame()
+    if mode == "Wired":
+        why = _left_off(rows, last)
+        if (why != "").any():
+            off = rows[why != ""].assign(_why=why[why != ""])
+            off = off.drop_duplicates("Id") if "Id" in off else off
+            with st.expander(f"Left off ({len(off)} draw{'s' if len(off) != 1 else ''}) — and why",
+                             icon=":material/playlist_remove:"):
+                st.caption("Melanie leaves these off her list, and so does Salesforce's Generate File. Tick any to "
+                           "put it back.")
+                back = st.data_editor(pd.DataFrame({
+                    "Add back": False, "Loan #": _col(off, "B").values, "Draw #": _draw_nos(off),
+                    "Deal": _col(off, "C").values, "Why": off["_why"].values,
+                    "Net": pd.to_numeric(_col(off, NET_FIELD), errors="coerce").values, "Id": _col(off, "Id").values}),
+                    key=f"fr_off_{where}", hide_index=True, width="stretch", disabled=["Loan #", "Draw #", "Deal", "Why", "Net"],
+                    column_order=["Add back", "Loan #", "Draw #", "Deal", "Why", "Net"],
+                    column_config={"Net": st.column_config.NumberColumn(format="dollar", help="Net funding")})
+                why[_col(rows, "Id").isin(set(back.loc[back["Add back"].astype(bool), "Id"]))] = ""
+        rows = rows[why == ""]
+        tops = {r["loan"] for r in (last or {}).get("rows", []) if _is_top(r)}
+        rows = rows.assign(_label=["Funded - Approved last week" if _loan_key(b) in tops else "Funded"
+                                   for b in _col(rows, "B")])
+        one, otypes = upcoming_draws(inst, tok, rt, hi)
+        if not one.empty:
+            ticked = int(one["Deal_RecordType__c"].eq("LOC_Loan").sum()) if "Deal_RecordType__c" in one else 0
+            with st.expander(f"Upcoming draws for the top of the file ({len(one)} in play)",
+                             icon=":material/upcoming:", expanded=bool(ticked or tops)):
+                st.caption("Draws not wired yet, or with a planned wire date after the window. Credit-line loans "
+                           "and last week's upcoming loans start ticked. Ticked draws go on top, one row each.")
+                pick = _upcoming_picker(one, last, key=f"fr_up_{hi}")
+            sel = pick[pick["Put on top"].astype(bool)]
+            if len(sel):
+                top = one.set_index("Id").loc[sel["Id"]].reset_index()
+                top["U"] = pd.to_numeric(sel["Amount"], errors="coerce").values
+                top["_label"] = [(_txt(x) or "Upcoming") for x in sel["Label"]]
+                top["_comment"] = [_txt(x) for x in sel["Comment"]]
+                top["_funding_to"] = [_txt(x) for x in sel["Funding to"]]
+                counted = sel["Count in total"].map(lambda x: x is True or x is np.True_).values
+                top["_count"] = counted
+                top = pd.concat([top[~counted], top[counted]], ignore_index=True)
+                total_from = TEMPLATE_HEADER_ROW + 1 + int((~counted).sum())
+                ftypes = {**otypes, **ftypes}
+    if rows.empty and top.empty:
+        st.info(f"No draws {scope}."); return
+    funded = rows
+    rows = _carry_over(pd.concat([top, funded], ignore_index=True) if len(top) else funded, last)
+    u = pd.to_numeric(_col(funded, "U"), errors="coerce")
+    fnf = _col(funded, "Deal_RecordType__c").eq(FNF_TYPE)
+    m = st.columns(4)
+    m[0].metric("Wired draws", f"{funded['Id'].nunique() if 'Id' in funded else len(funded):,}", border=True)
+    m[1].metric("Loans", f"{funded['B'].nunique() if 'B' in funded else 0:,}", border=True)
+    m[2].metric("Wired total", money(u.sum()), border=True, help="Gross approved amounts, as in her Total")
+    m[3].metric("Upcoming on top", f"{len(top):,}", money(pd.to_numeric(_col(top, "U"), errors="coerce").sum())
+                if len(top) else None, delta_color="off", delta_arrow="off", border=True)
+    if mode == "Wired" and len(funded):
+        st.caption(f"For the running totals: FNF (single-asset bridge) draws on this list — "
+                   f"{_col(funded, 'Id')[fnf].nunique()} draws, {money(u[fnf].sum())}.".replace("$", "\\$"))
+    notes = st.checkbox("Also fill Comments and Funding to from Salesforce notes and Land Gorilla payees",
+                        key="fr_notes", help="Melanie clears these on wired rows; both are on the Prep worksheet "
+                                             "either way.")
+    _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope,
+                      {"window": window, "total_from": total_from, "notes": notes})
+    preview = pd.DataFrame({"Row": _col(rows, "_label"), "Loan #": _col(rows, "B"), "Property": _col(rows, "F"),
+                            "Deal": _col(rows, "C"), "Status": _col(rows, "Status__c"),
                             "Current draw": pd.to_numeric(_col(rows, "U"), errors="coerce"),
                             "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name"),
                             "Held up by": [delay_labels(n) for n in _col(rows, "AF")]})
     st.dataframe(preview, hide_index=True, width="stretch", height=360,
                  column_config={"Current draw": st.column_config.NumberColumn(format="dollar", step=1),
+                                "Row": st.column_config.TextColumn(help="Column A: upcoming draws' labels, then "
+                                                                        "Funded"),
                                 "Held up by": st.column_config.ListColumn(help="What the draw's notes say it was "
                                                                                 "waiting on")})
 
 
 @sf_fragment
-def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope):
-    if st.button(f"Build funding-request file ({len(rows):,} draws {scope})", type="primary",
+def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope, layout=None):
+    if st.button(f"Build funding-request file ({len(rows):,} rows, {scope})", type="primary",
                  icon=":material/build:", disabled=rows.empty, key="fr_build"):
-        with st.spinner("Filling the template from Land Gorilla and Salesforce…"):
-            xlsx, n = build_funding_file(inst, tok, rt, tpl, rows, ftypes, who, fdate)
-        st.download_button(f"Download funding-request file ({n:,} draws)", xlsx, mime=XLSX_MIME, type="primary",
+        with st.spinner("Filling the template from Salesforce and Land Gorilla…"):
+            xlsx, n = build_funding_file(inst, tok, rt, tpl, rows, ftypes, who, fdate, **(layout or {}))
+        st.download_button(f"Download funding-request file ({n:,} rows)", xlsx, mime=XLSX_MIME, type="primary",
                            icon=":material/download:", on_click="ignore", key="fr_dl",
                            file_name=f"Construction-Renovation Funding Request {fdate.month}_{fdate.day}_{fdate.year}.xlsx")
         st.toast("Funding-request file is ready.", icon="✅")
