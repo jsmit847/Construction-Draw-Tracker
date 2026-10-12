@@ -9,18 +9,20 @@ report), so paid-off draws are retained — closing the "paid off today drops of
 report" gap Melanie flagged. It carries the rb number (Loan_Number__c), the milestone
 dates, Notes__c, and the real dollars.
 
-Land Gorilla is the source of truth for TIMING: Salesforce collapses the request /
-package dates onto the wire date, so each draw's real request (createdDate) and
-complete-package (approvedDate) dates come from Land Gorilla via DrawContainerId__c,
-and the wire date from Salesforce. All spans are BUSINESS days.
+Land Gorilla is the source of truth wherever it has the data; Salesforce's own dates are
+unreliable. Through DrawContainerId__c, each draw's request date is Land Gorilla's createdDate
+and its wire date Land Gorilla's funding (effective) date; Salesforce's wire date fills in only
+where there's no Land Gorilla link. The full-package date is Salesforce's "Date Full Draw
+Package Received", recorded since Aug 3, 2026. Turn-time = full package -> wire, in BUSINESS days.
 
-Two lenses on the same data, plus an export:
-  • Pipeline (macro) — monthly/quarter/year report: borrower wait (request -> package),
-    our funding (package -> wire), KPIs, rollup, charts, turn-time Excel.
-  • Loan detail (micro) — search a borrower / property / loan# and see each draw's
-    full cycle: timing, the Salesforce milestones + notes, Land Gorilla detail beneath.
-  • Funding-request file — Melanie's weekly "Construction/Renovation Funding Request"
-    workbook, filled from Salesforce into the committed template (Advance_template.xlsx).
+Three pages on the same data:
+  • Turn-time — monthly / quarterly / yearly turn-time KPIs, rollup, charts, the package-date
+    check, a draw & deal details view, and the turn-time and funding-request downloads.
+  • Find a draw — search a borrower / property / loan # and see each draw's full cycle, most
+    recent request first; "Who's falling short" shows how long each account takes to reach a
+    full package and what its draws were waiting on (delay reasons read from the notes).
+  • Funding request — Melanie's weekly "Construction/Renovation Funding Request" workbook,
+    filled from Land Gorilla and Salesforce into the committed template (Advance_template.xlsx).
 
 Secrets (.streamlit/secrets.toml — see .streamlit/secrets.toml.example): [salesforce]
 (username/password/security_token, or OAuth client_id/client_secret/redirect_uri/auth_host),
@@ -39,6 +41,7 @@ import re
 import secrets
 import time
 from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -108,13 +111,14 @@ WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
          "Deal__r.Name", "Deal__r.Account.Name", "Borrower_Name__c", "Borrower_Name_Text__c",
          "Lender__c", "Status__c", "Inspection_Method__c",
          "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name", NOTES_FIELD, CONTAINER_FIELD,
-         NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate"]
+         NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate", "CreatedDate"]
         + [f for f, _ in CONSTRUCTION_FIELDS] + [m[1] for m in MILESTONES])
 TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
 OPEN_WHERE = f"{WIRE_FIELD}=null AND Status__c NOT IN ({','.join(repr(s) for s in TERMINAL)})"
 # Status__c stages a weekly funding request covers (approval through release) — the export's default filter.
 FUNDING_STAGES = ("Pending Approval", "Approved", "Pending Capital Partner Release", "Pending Release")
 SEARCH_LIMIT = 200    # loan-detail search: most draws rendered (and dated in Land Gorilla) per query
+MAX_LOAN_SECTIONS = 40   # ... and most loans shown with their track record and construction progress
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 _HOLS = USFederalHolidayCalendar().holidays("2018-01-01", "2032-12-31").values.astype("datetime64[D]")
@@ -237,6 +241,39 @@ def finish_oauth(cfg: dict[str, str]) -> None:
     st.session_state["salesforce_auth"] = {"access_token": at, "instance_url": iu}
     st.session_state["_last_sf_code"] = code
     st.query_params.clear(); st.rerun()
+
+
+def _session_expired(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "INVALID_SESSION_ID" in msg or "Session expired" in msg or type(exc).__name__ == "SalesforceExpiredSession"
+
+
+def _restart_session():
+    """Forget an expired Salesforce session and rerun the whole app once, so main() logs in again (a second failure
+       stops with a message)."""
+    try:
+        sf_login_credentials.clear()          # force a fresh login on the credentials path
+    except Exception:
+        pass
+    clear_sf_session()
+    if not st.session_state.get("_sf_retried"):
+        st.session_state["_sf_retried"] = True
+        st.rerun(scope="app")
+    st.warning("Your Salesforce session expired — refresh the page to log in again."); st.stop()
+
+
+def sf_fragment(fn):
+    """st.fragment that recovers from an expired Salesforce session the way a full rerun does: a fragment rerun
+       doesn't pass through main(), where that recovery lives."""
+    @wraps(fn)
+    def run(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:              # st.rerun / st.stop are BaseExceptions and pass straight through
+            if _session_expired(exc):
+                _restart_session()
+            raise
+    return st.fragment(run)
 
 
 def sf_from_session() -> Salesforce | None:
@@ -455,7 +492,7 @@ def lg_draws(user: str, password: str, verify: bool, containers) -> dict:
                     "amount": det.get("amount"), "requested": det.get("requested_total"),
                     "payees": [p["payee"] for p in det.get("payees") or [] if p.get("payee")],
                     "status": det.get("status"), "type": det.get("type"), "name": det.get("name"),
-                    "dates": det.get("dates") or {}})
+                    "requested_by": det.get("requested_by"), "dates": det.get("dates") or {}})
     return {c: store[("draw", c)][1] for c in want if ("draw", c) in store}
 
 
@@ -464,10 +501,18 @@ def lg_loans(user: str, password: str, verify: bool, template_id: str, loan_numb
        funded / due dates, balance, remaining to fund, team, risk. Fetched in parallel; cached per loan."""
     store, now = _lg_store(), time.time()
     want = [str(n).strip() for n in dict.fromkeys(loan_numbers) if lg_filenumber(n)]
-    need = [n for n in want if not (("loan", n) in store and now - store[("loan", n)][0] < LG_TTL_LOAN)]
+
+    def fresh(n):                          # a loan Land Gorilla doesn't have is remembered for a while too
+        hit = store.get(("loan", n))
+        return hit and now - hit[0] < (LG_TTL_LOAN if hit[1] is not None else LG_TTL_OPEN)
+
+    need = [n for n in want if not fresh(n)]
     if need:
         client = LGClient(user, password, verify=verify)
         found = _lg_batch(client, {n: "/api/clm/loan?" + urlencode({"fileNumber": f"rb0{n}"}) for n in need})
+        for n, p in found.items():
+            if isinstance(p, (dict, list)) and not items_of(p):       # answered, with no such loan (not an error)
+                store[("loan", n)] = (time.time(), None)
         ids = {n: items_of(p)[0].get("id") for n, p in found.items() if p and items_of(p)}
         ids = {n: i for n, i in ids.items() if i}
         tmpl = _lg_batch(client, {n: f"/api/clm/pipelineReportTemplates/{template_id}/loans/{i}" for n, i in ids.items()})
@@ -478,7 +523,7 @@ def lg_loans(user: str, password: str, verify: bool, template_id: str, loan_numb
             ov.update(balance=sd.get("loanBalance"), to_finish=sd.get("balanceToFinish"),
                       last_approved_draw=_lg_date(sd.get("lastApprovedDrawEffectiveDate")))
             store[("loan", n)] = (time.time(), ov)
-    return {n: store[("loan", n)][1] for n in want if ("loan", n) in store}
+    return {n: store[("loan", n)][1] for n in want if store.get(("loan", n), (0, None))[1] is not None}
 
 
 PKG_LAUNCH = pd.Timestamp("2026-08-03")   # Salesforce's "Date Full Draw Package Received" went live this day
@@ -504,8 +549,9 @@ def apply_lg_correction(df: pd.DataFrame, cfg: dict | None, same_day: int) -> pd
         except Exception as exc:      # no exception text: a malformed secret would be echoed to every viewer
             st.warning(f"Land Gorilla is unavailable right now ({type(exc).__name__}) — timing is incomplete.")
     info = _col(df, CONTAINER_FIELD).map(lambda c: lg.get(c) if isinstance(c, str) else None)
-    created, approved, effective = (info.map(lambda d, k=k: d.get(k) if d else None)
-                                    for k in ("created", "approved", "effective"))
+    created, approved, effective, submitted, requested_by = (
+        info.map(lambda d, k=k: d.get(k) if d else None)
+        for k in ("created", "approved", "effective", "submitted", "requested_by"))
     sf_wire = _col(df, WIRE_FIELD)
     lg_wire = effective.where(effective.notna(), approved)
     wire = lg_wire.where(lg_wire.notna(), sf_wire).where(sf_wire.notna())
@@ -516,6 +562,10 @@ def apply_lg_correction(df: pd.DataFrame, cfg: dict | None, same_day: int) -> pd
 
     df["_lg_req"], df["_lg_appr"], df["_wire"], df["_pkg"] = created, approved, w, pkg
     df["_lg_pkg"] = approved                                           # kept for older callers
+    df["_lg_sub"], df["_lg_by"] = submitted, requested_by              # for the draw's timeline and card
+    for col, key in (("_lg_amount", "amount"), ("_lg_requested", "requested"), ("_lg_status", "status"),
+                     ("_lg_payees", "payees")):
+        df[col] = info.map(lambda d, k=key: d.get(k) if d else None)
     df["_days"] = bdays(created, w, same_day)                          # request -> wired (per draw / account)
     df["_days_src"] = np.where(c.notna(), "Land Gorilla", "")
     df["_fund_bd"] = bdays(pkg, w, same_day)                           # turn-time: full package -> wired
@@ -1198,7 +1248,8 @@ def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFram
 
 
 # ───────────────────────────── approvals ────────────────────────────────────
-APPROVAL_COLS = ["Approval", "Approval status", "Approved by", "Approved on", "Approval comments"]
+APPROVAL_COLS = ["Approval", "Approval status", "Approved by", "Approved on", "Approval comments", "_steps"]
+STEP_NAMES = {"Started": "Sent for approval", "Approved": "Approved", "Rejected": "Rejected"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1227,8 +1278,9 @@ def _approval_source(inst: str, tok: str) -> dict | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
-    """Who approved each draw, when, and what they wrote — indexed by Advance Id. Uses the org's IC approval
-       records when they can be found, else Salesforce's approval history (approve / reject steps)."""
+    """Who approved each draw, when, and what they wrote — indexed by Advance Id. Salesforce's approval history gives
+       every step (sent for approval, approved, rejected) and the person who took it; a draw can need more than one
+       approver. The org's IC approval record adds its name and status. _steps = [(date, step, person), ...]."""
     out = {i: {} for i in ids if isinstance(i, str) and i}
     if not out:
         return pd.DataFrame(columns=APPROVAL_COLS)
@@ -1238,15 +1290,20 @@ def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
     except Exception:
         steps = pd.DataFrame()
     if not steps.empty and "StepStatus" in steps:
-        steps = steps[steps["StepStatus"].isin(["Approved", "Rejected"])].sort_values("CreatedDate")
+        steps = steps[steps["StepStatus"].isin(list(STEP_NAMES))].sort_values("CreatedDate", kind="stable")
         for aid, g in steps.groupby("ProcessInstance.TargetObjectId"):
-            last = g.iloc[-1]
-            out.setdefault(aid, {}).update({
-                "Approval status": last["StepStatus"], "Approved by": _txt(last.get("Actor.Name")) or None,
-                "Approved on": _d(last.get("CreatedDate")),
-                "Approval comments": "\n".join(
-                    f'{_mdy(_d(r["CreatedDate"]))}: {_txt(r.get("Actor.Name"))} : "{_txt(r.get("Comments"))}"'
-                    for _, r in g.iterrows())})
+            rec = {"_steps": [(_d(r["CreatedDate"]), STEP_NAMES[r["StepStatus"]], _txt(r.get("Actor.Name")))
+                              for _, r in g.iterrows()]}
+            done = g[g["StepStatus"].isin(["Approved", "Rejected"])]
+            if len(done):
+                approvers = dict.fromkeys(_txt(x) for x in done.loc[done["StepStatus"] == "Approved", "Actor.Name"])
+                rec.update({"Approval status": done.iloc[-1]["StepStatus"],
+                            "Approved by": ", ".join(a for a in approvers if a) or None,
+                            "Approved on": _d(done.iloc[-1].get("CreatedDate")),
+                            "Approval comments": "\n".join(
+                                f'{_mdy(_d(r["CreatedDate"]))}: {_txt(r.get("Actor.Name"))} : "{_txt(r.get("Comments"))}"'
+                                for _, r in done.iterrows() if _txt(r.get("Comments"))) or None})
+            out.setdefault(aid, {}).update(rec)
     try:
         src = _approval_source(inst, tok)
         if src:
@@ -1262,10 +1319,12 @@ def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
             for _, r in recs.iterrows():                 # latest approval record per draw wins
                 if not _txt(r.get(pre + "Name")):
                     continue
+                # Without a real approver / approval-date field, "by" and "when" fall back to the record's last edit,
+                # which is often an integration user — never let that stand in for the people who approved.
                 found = {"Approval": _txt(r.get(pre + "Name")),
                          "Approval status": _txt(r.get(pre + src["status"])) if src["status"] else None,
-                         "Approved by": _txt(r.get(pre + src["by"])),
-                         "Approved on": _d(r.get(pre + src["when"])),
+                         "Approved by": _txt(r.get(pre + src["by"])) if src["by"] != "LastModifiedBy.Name" else None,
+                         "Approved on": _d(r.get(pre + src["when"])) if src["when"] != "LastModifiedDate" else None,
                          "Approval comments": _txt(r.get(pre + src["comments"])) if src["comments"] else None}
                 out.setdefault(r[key], {}).update({k: v for k, v in found.items() if v})
     except Exception:
@@ -1274,16 +1333,408 @@ def approvals_for(inst: str, tok: str, ids: tuple) -> pd.DataFrame:
 
 
 # ───────────────────────────── delay reasons ────────────────────────────────
-# What the notes (and approval comments) say held a draw up. Plain-English label -> pattern; matched with
-# re.IGNORECASE. A draw can have several. Patterns are conservative: a missed reason beats a wrong one.
-DELAY_REASONS: dict = {}   # label -> regex; empty until the note rules are validated on real notes
-_DELAY_RX = {label: re.compile(rx, re.IGNORECASE) for label, rx in DELAY_REASONS.items()}
+# What a draw's notes say held it up. Notes__c is a running log, one entry per line, mostly newest first:
+# "AB 09/28 - Pending response on reductions", "9/30/2026 CD: report recd; funding initiated", "EF 09/30 approved".
+#     note_entries(text) -> [(date or None, entry text), ...]   in the order written, header stripped
+#     delay_reasons(text) -> [key, ...]                          DELAY_REASONS keys found, in display order
+# DELAY_REASONS = {key: (label, side, compiled regex)}. Sides borrower, third_party, lender and admin are delay
+# reasons; status_marker keys are progress markers, not reasons. Each pattern runs on one entry with its header
+# removed, so staff initials and dates never fire on their own. Borrower documents count only while the notes show
+# them outstanding (pending, needed, asked for, missing); third-party and internal steps count whenever they
+# appear. Checked by hand against 189 real notes in Oct 2026: about 99% of tags right; on notes the rules had never
+# seen (before the final fixes) 96% right, with 86% of reasons caught. Keep the patterns in step with that review.
+# ---------------------------------------------------------------------------------------------------------
+# Shared pieces
+# ---------------------------------------------------------------------------------------------------------
+# A word that says something is still outstanding, then a short window (same sentence) that may not cross a
+# receipt / approval word or Land Gorilla / the inspector (so "Received lw", "Pending Approval - got LW" and
+# "messaged LG for photos" do not count as borrower items).
+_CUE = (r"(?<!'s\s)(?<!date\s)(?<!lg\s)(?<!inspector\s)\b(?:pending|need(?:s|ed)?|still\s+need|"
+        r"still\s+waiting\s+(?:on|for)|waiting\s+(?:on|for)|wait\s+(?:on|for)|awaiting|follow(?:ed|ing)?[\s-]*up|f/u|"
+        r"asked|asking|ask|request(?:ed|ing|s)?|req|(?<!borrower\s)(?<!borr\s)(?<!he\s)(?<!she\s)(?<!they\s)(?<!gc\s)sent|"
+        r"send|emailed|missing|without|until\s+(?:we\s+)?(?:receive|get)|until|provid(?:e|es|ing)|expects?)\b")
+_WIN = r"(?:(?!\b(?:received|receive|recd|rcvd|got|approv\w*|lg|inspector)\b)[^.;\n]){0,45}?"
+
+_LW = r"(?:l/?ws?|lien[\s-]*waivers?|(?<!fee\s)(?<!tax\s)(?<!taxes\s)(?<!interest\s)(?<!penalty\s)waivers?(?!\s+of\s+(?:the\s+)?(?:fees?|inspection|requirements?)))"
+_BACKUP = (r"(?:invoices?|pops?|proof(?:\s+of\s+payment)?|receipts|back[\s-]?up(?!\s+(?:generator|power|plan))|"
+           r"back\s+of\s+(?:the\s+)?check|photos?|pictures?|pics|sow|scope(?:\s+of\s+work)?|"
+           r"clarification(?![^.;\n]{0,50}?\b(?:lien|title|tax\w*|single\s*source|abstractor)\b)|"
+           r"confirmation\s+(?:on|of|for)\b(?!\s+(?:the\s+)?(?:lien|title|(?:prop\w*\s+)?tax\w*|insurance|payment|inspection|wire|signed|documents?|docs?|loan))|"
+           r"line\s+items?|soft[\s-]?costs?(?!\s+(?:draw|only)))")
+_DOC_OUT = (r"(?:w-?9s?|wir(?:e|ing)\s+(?:instructions|info)|initial\s+docs?|"
+            r"c\s?of\s?o(?!\s+(?:is\s+)?on\s+file)|certificates?\s+of\s+occupancy|"
+            r"(?<!no\s)(?<!&\s)(?<!&)co(?![-'/\w])(?!\s+(?:is\s+)?on\s+file)(?!\s+\d{5})|bloc|letter\s+of\s+completion|"
+            r"(?<!lw\s)(?<!waiver\s)e[\s-]?sig(?:s|natures?)?(?!\s+(?:for|on)\s+(?:the\s+)?(?:final\s+)?(?:l/?ws?|lien|waivers?))|docusign)")
+# Optional entry header, so the line-start patterns also work on a raw note
+_HDR = (r"(?:['\"*\-]*\s*(?:[a-z]{2}\s*-?\s*)?\d{1,2}[/.]\d{1,2}(?:/\d{2,4})?(?:\s*[a-z]{2}\b)?\s*[-\N{EN DASH}:.]*\s*)?"
+        r"(?:(?!(?:co|lw|sc|gc|dq|ir|pf)\b)[a-z]{2}\s+(?=(?:approved|apv)\b))?")
+_LINE_START = r"(?:^|(?<=\n))\s*"
 
 
-def delay_labels(*texts) -> list:
-    """The delay reasons mentioned in a draw's notes / approval comments, in DELAY_REASONS order."""
-    blob = "\n".join(_txt(t) for t in texts if _txt(t))
-    return [label for label, rx in _DELAY_RX.items() if blob and rx.search(blob)]
+def _any(*parts):
+    return "|".join("(?:%s)" % p for p in parts)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Categories, in display order: (key, label, side, pattern)
+# ---------------------------------------------------------------------------------------------------------
+_CATEGORIES = [
+    # ------------------------------------------------ borrower
+    ("lien_waivers", "Lien waivers", "borrower", _any(
+        _CUE + _WIN + r"\b" + _LW + r"\b",
+        r"(?<!no\s)\b(?:l/?ws?|lien[\s-]*waivers?|waivers?)\s+(?:were\s+|was\s+)?(?:sent|requested|pending|outstanding|needed|missing)\b",
+        r"\b(?:partial|remaining)\s+(?:l/?ws?|lien[\s-]*waivers?|waivers?)\b")),
+
+    ("backup", "Invoices / backup", "borrower", _any(
+        _CUE + _WIN + r"\b" + _BACKUP + r"\b(?!\s+(?:from|by|via|in)\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector|inspection|report)\b)",
+        r"(?<!provided\s)(?<!received\s)(?<!recd\s)(?<!rcvd\s)\bpops?\s+for\b(?!\s+plans\s+have)",
+        r"\bpops?\s+(?:issues?|are\s+provided|provided)\b|\b(?:once|when)\s+(?:the\s+)?(?:borrower\s+)?(?:provides\s+)?pops?\b",
+        r"\b(?:does\s+not|doesn'?t)\s+have\s+(?:the\s+)?(?:backup|invoices?|receipts?|pops?|photos?)\b",
+        r"\bconfirmation\s+from\s+(?:the\s+)?borr\w*\s+that\b",
+        r"\b(?:flooring|item|line\s+item|scope|material|finish(?:es)?)\s+confirmation\b",
+        r"\breach\s+out\s+to\s+(?:the\s+)?borr\w*\s+about\s+(?:the\s+)?scope\b",
+        r"\bhad\s+questions\b")),
+
+    ("documents", "Missing documents", "borrower", _any(
+        _CUE + _WIN + r"\b" + _DOC_OUT + r"\b",
+        r"\bpermits?\b(?!\s+(?:is\s+|are\s+)?(?:(?:received|rcvd|recd)\s+(?:and\s+)?)?(?:on\s+file|not\s+(?:required|needed)))(?![\s-]+trigger)",
+        r"(?<!for\s)(?<!business\s)(?<!exit\s)\b(?:stamped\s+|approved\s+)?plans\b(?!\s+(?:to|on|that|have\s+been|(?:and|&)\s+engineering)\b)|\bplan\s+set\b",
+        r"\b(?:city|county|municipal)\s+(?:final\s+)?(?:inspections?|sign[\s-]?off)\b",
+        r"\bgc\s+(?:lic(?:en[cs]e)?|info|contract)\b|\bcontractor'?s?\s+(?:list|lic(?:en[cs]e)?|info)\b|\blicen[cs]e\s+info\w*",
+        r"\bheavy\s+rehab\s+info\b",
+        r"\b(?:c\s?of\s?o|co)\s+(?:is\s+)?(?:still\s+)?(?:pending|eta|outstanding|not\s+yet)\b")),
+
+    ("borrower_response", "Borrower response", "borrower", _any(
+        r"\bno\s+response\b(?!\s+(?:yet\s+)?from\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector|title|single\s*source|city|county|permit\w*|servicer|fci|onity|appraiser|insurance|agent|bank))",
+        r"(?<!lg\s)(?<!inspector\s)\bhas\s+not\s+(?:been\s+responsive|responded)\b",
+        r"\b(?:borrower|borr|gc)\s+(?:is\s+|was\s+)?(?:un|non[\s-]?)responsive\b",
+        r"\basked\b(?!\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector|title|single\s*source)\b)[^.;\n]{0,40}?\bagain\b",
+        r"\bsent\s+(?:a\s+)?reminders?\b(?!\s+to\s+(?:the\s+)?(?:lg|inspector|title))",
+        r"\bwill\s+(?:cancel|delete)\b",
+        r"\b(?:pending|awaiting|waiting\s+(?:on|for))\s+(?:the\s+)?borr\w*'?s?\s+(?:response|reply|answer|decision|confirmation|on|re|regarding|about)\b",
+        r"(?<!lg\s)(?<!inspector\s)\bresponse\s+on\b",
+        r"\bfollow(?:ed|ing)?[\s-]*up\s+(?:\w+\s+){0,2}?(?:with|to)\s+(?:the\s+)?borr\w*",
+        r"(?<!lg\sto\s)\bfollow(?:ed|ing)?[\s-]*up\s+on\s+(?!(?:the\s+)?(?:report|insp\w*|title|extension|lg|order|site\s+visit|scheduling)\b)\w",
+        r"\b(?:waiting|wait)\s+(?:on|for)\s+[^.;\n]{0,40}?\bfrom\s+(?:the\s+)?borr\w*",
+        r"\bhave\s+not\s+received\s+(?:an?\s+)?update\b",
+        r"\b(?:waiting|wait)\s+(?:on|for)\s+(?:the\s+)?borr\w*\s+to\b",
+        r"\b(?:emailed|called|texted|messaged|sent)\b(?:(?!\b(?:lg|land\s+gorilla|inspector)\b)[^.;\n]){0,25}?\bremind\w*\b"
+        r"(?!\s+to\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector|title|single\s*source)\b)",
+        r"\b(?:requested|requesting|asked\s+for)\s+(?:an?\s+)?(?:update|status)\s+from\s+(?:the\s+)?borr\w*",
+        r"\bsent\s+(?:another|an?\s+additional|a\s+second|2nd|(?:a\s+)?follow[\s-]*up)\s+(?:email|e-mail|message|request|vm|voice\s*mail)\b"
+        r"(?![^.;\n]{0,25}\b(?:lg|inspector|title|single\s*source)\b)",
+        r"\b(?:l/?ws?|lien\s+waivers?|soft[\s-]?costs?|pops?|invoices?|photos?|pics|bloc|w-?9s?|wire\s+info|eoi|insurance|"
+        r"back[\s-]?up|self[\s-]*insp\w*|guc\s+info)\b[^.;\n]{0,15}?-\s*\d{1,2}/\d{1,2}\s+(?:[a-z]{2}\s+)?followed\s+up\b")),
+
+    ("self_inspection", "Self-inspection / site access", "borrower", _any(
+        r"\bself[\s-]*(?:insp\w*|inps\w*)",
+        r"\bremote\s+inspection\b",
+        r"\bno\s+access\b(?!\s+to\s+(?:the\s+)?(?:portal|system|box|folder|lg|email))",
+        r"\b(?:could\s*n[o']?t|unable\s+to|not\s+able\s+to|can'?t|cannot|did\s*n[o']?t)\s+(?:get\s+(?:in(?:to)?\b|access)|access|enter)",
+        r"\b(?:site|property|house|home|unit|gate)\s+(?:was\s+|is\s+)?locked\b",
+        r"\b(?:borrower|borr|gc|contractor|poc)\s+(?:has\s+|is\s+|was\s+)?(?:moved|rescheduled|requested|requesting|scheduled|cancell?ed|postponed|delayed|pushed)\b(?:\s+that)?\s+(?:the\s+)?(?:\w+\s+)?inspection",
+        r"\b(?:is\s*n[o']?t|is\s+not|was\s*n[o']?t|not)\s+ready\s+for\s+(?:the\s+)?inspection\b",
+        r"\b(?:asked|wants|wanted)\s+to\s+(?:hold|delay|push|move|reschedule|postpone)\s+(?:the\s+)?inspection",
+        r"\bin\s+lieu\s+of\s+(?:an?\s+)?inspection\b")),
+
+    ("insurance", "Insurance", "borrower", _any(
+        r"\b(?:insurance|policy|eoi)\b[^.;\n]{0,20}?\b(?:expired|lapsed|cancell?ed|was\s+extended)\b",
+        r"\b(?:updated?|new|renewed)\s+(?:insurance|policy|eoi|dec\s+page)\b",
+        r"\b(?:need|needs|pending|waiting\s+(?:on|for)|awaiting|requested|asked|asking|req|reminders?\s+for|expects?|follow(?:ed)?[\s-]*up\s+(?:on|for))\b"
+        r"[^.;\n]{0,30}?\b(?:insurance|eoi|policy)\b(?!\s+(?:claim|agent|current|exp))",
+        r"\bextension\s+of\s+(?:the\s+)?(?:insurance\s+)?policy\b",
+        r"\beoi\b(?!\s+(?:is\s+)?(?:on\s+file|current|good|received|rcvd|recd|in\s+(?:box|sf)))|\bevidence\s+of\s+insurance\b|\bbuilder'?s'?\s+risk\b")),
+
+    ("taxes_payments", "Taxes / payments due", "borrower", _any(
+        r"\btax(?:es)?\b[^.;\n/]{0,25}?\b(?<!not\s)(?<!not\syet\s)(?<!no\slonger\s)(?<!never\s)(?:delinq|deliq)\w*\b(?!\s+until)",
+        r"\b(?:dq|delinquent)\s+(?:property\s+)?tax",
+        r"\b(?:prop(?:erty)?\s+)?tax\s+(?:pmt|payment)",
+        r"\bconfirmation\s+that\s+(?:the\s+)?(?:property\s+)?taxes\b",
+        r"\btaxes\s+(?:are\s+)?due\b(?!\s+(?:on\s+|in\s+|by\s+)?(?:\d|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))(?![^.;\n]*\bnot\s+(?:yet\s+)?delinquent)",
+        r"\bwaiv\w*\s+(?:the\s+)?(?:property\s+)?taxes\b|\bbring\s+(?:the\s+)?(?:property\s+)?taxes\s+current\b",
+        r"\b(?:fci|onity|servicer)\s+(?:\w+\s+)?(?:payment|pmt)\b(?!s?\s+(?:due|made\s+internally))",
+        r"\b(?:pending|waiting\s+on|awaiting|need|due\s+for|missed|late)\s+(?:the\s+)?(?:(?:loan|mortgage|monthly|interest|"
+        r"january|february|march|april|may|june|july|august|september|october|november|december|sept|oct|nov|dec|aug|"
+        r"\d{1,2}/\d{1,2})\s+){1,2}(?:payment|pmt)s?\b",
+        r"\b(?:loan|mortgage|monthly|\d{1,2}/\d{1,2})\s+(?:payment|pmt)\s+(?:was\s+|has\s+been\s+)?(?:made|rec\w*)\b",
+        r"\b(?:loan|mortgage)\s+(?:payment|pmt)\b(?!\s+(?:is\s+)?(?:due|amount))",
+        r"\bdue\s+for\s+(?:the\s+)?\d{1,2}/\d{1,2}\b(?![^.;\n]{0,30}\b(?:has\s+(?:an?\s+)?ir|interest\s+reserve|autopay)\b)",
+        r"\b(?:pending|need(?:s|ed)?|still\s+(?:pending|due)|reminders?\s+for|follow(?:ed)?[\s-]*up\s+on|waiting\s+on|awaiting)\b"
+        r"[^.;\n]{0,40}?\b(?:\d{1,2}/\d{1,2}/?(?:\d{2,4})?|loan|mortgage|monthly)\s+(?:payment|pmt)s?\b",
+        r"\b(?:payment|pmt)s?\s+(?:must|needs?\s+to|has\s+to)\s+be\s+(?:brought\s+)?current\b",
+        r"\bpast\s+due\b|\bnow\s+current\b")),
+
+    ("budget_changes", "Budget changes", "borrower", _any(
+        r"(?<!no\s)(?<!no\snew\s)(?<!without\s)(?<!without\sa\s)\bchange\s*order(?:s|\s*#?\d+)?\b",
+        r"\bre-?alloc\w*",
+        r"\bbudget\s+(?:revision|change|modification|increase|reallocation|amendment|shortfall|overrun)s?\b",
+        r"\bcontingency\b|\bcost\s+overruns?\b|\bover[\s-]budget\b",
+        r"\badditional\s+\$\s?\d",
+        r"\bunexpected\s+(?:costs?|expenses?)\b|\bcosts?\s+over\s+\$",
+        r"\b(?:changed|changing|change\s+(?:in|to)|revised|revising)\s+(?:the\s+)?(?:business\s+plan|scope(?:\s+of\s+work)?)\b|\bscope\s+change\b")),
+
+    # ------------------------------------------------ admin (loan-level: both sides work on it)
+    ("extension_maturity", "Extension / maturity / payoff", "admin", _any(
+        r"(?<!bedroom\s)(?<!bedroom-)(?<!room\s)(?<!kitchen\s)(?<!rear\s)(?<!garage\s)(?<!house\s)(?<!home\s)(?<!story\s)(?<!deck\s)(?<!building\s)"
+        r"\bextension\b(?!\s+of\s+(?:the\s+)?(?:insurance\s+)?polic)(?!\s+or\s+(?:new\s+)?(?:bath|bed|room|addition|kitchen))",
+        r"\bmaturity\b|\boutside\s+(?:advance|complete|completion)\s+date\b",
+        r"\bloan\s+mod(?:ification)?\b|\b(?:extension|loan)\s*/\s*mod\w*",
+        r"(?<!lien\s)(?<!mortgage\s)(?<!judgment\s)(?<!judgement\s)\bpay[\s-]?offs?\b(?!\s+(?:of\s+)?(?:the\s+)?(?:\w+\s+)?(?:lien|mortgage|judge?ment)s?\b)|\brefinanc\w*|\brefi\b")),
+
+    # ------------------------------------------------ third party
+    ("inspection", "Inspection", "third_party", _any(
+        r"(?<!self-)(?<!self\s)(?<!remote\s)(?<!no\s)(?<!lieu\sof\s)(?<!permit\s)(?<!city\s)(?<!county\s)"
+        r"(?<!self-\s)(?<!without\sa\sfinal\s)(?<!last\s)(?<!previous\s)(?<!prior\s)(?<!city\sfinal\s)(?<!county\sfinal\s)\binsp\w*\b(?!\s+fees?\b)",
+        r"\bqc\b|\bqaqc\b",
+        r"(?<!title\s)\breport\s+(?:rec\w*|rcvd|in\b|expected|pending|delivered|finally)",
+        r"\bin\s+review\b(?=[^.;\n]*\blg\b)|\bsite\s+visit\b")),
+
+    ("inspection_delay", "Inspection delay / revision", "third_party", _any(
+        r"\binsp\w*\s+(?:scheduling\s+)?(?:delays?|issues?|problems?|revisions?)\b|\bscheduling\s+delays?\b",
+        r"\b(?:lg|land\s+gorilla|inspector)\s+delays?\b|\bdelays?\s+(?:from|with|at|by)\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector)\b",
+        r"\bre-?inspect\w*|\bnew\s+inspection\b|\bsecond\s+inspection\b|\bgo\s+back\s+out\b",
+        r"\brevised\s+report\b|(?<!title\s)\breport\s+(?:update|revision)s?\b",
+        r"\b(?:needs?|needing|pending|wait(?:ing)?\s+(?:on|for))\s+(?:(?:inspection|report|the)\s+)?revisions?\b",
+        r"\brevisions?\s+(?:from|by)\s+(?:the\s+)?inspector\b",
+        r"\binspector\s+(?:was\s+|is\s+)?(?:non[\s-]?responsive|unresponsive)\b",
+        r"\binspector\s+(?:didn'?t|did\s+not|has\s+not|hasn'?t)\s+(?:get|take|include|send|upload)\b",
+        r"\b(?:pics|photos|pictures)\b[^.;\n]{0,40}?\bnot\s+included\b|\bnot\s+included\s+in\s+the\s+report\b",
+        r"\bno\s+update\s+on\s+(?:the\s+)?(?:inspection|report|order)\b|\bnot\s+(?:yet\s+)?scheduled\b",
+        r"\b(?:follow(?:ed|ing)?[\s-]*up|f/u|reached\s+out|inquired|checked\s+in)\s+(?:with|to)\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector)\b",
+        r"\b(?:status|update)\s+from\s+(?:lg|land\s+gorilla)\b|\b(?:messaged|emailed|sent)\s+(?:the\s+)?lg\b|\blg\s+followed\s+up\b",
+        r"\b(?:sent|emailed|messaged)\s+(?:an?\s+)?reminders?\s+to\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector)\b|"
+        r"\breminded\s+(?:the\s+)?(?:lg|land\s+gorilla|inspector)\b",
+        r"\bsent\s+(?:an?\s+)?(?:email|message)\b[^.;\n]{0,40}?\b(?:report|inspection)\b|\bfollowing\s+up\s+on\s+(?:the\s+)?report\b",
+        r"\breason\s+for\s+(?:the\s+)?delay\b|\bconfirmed\s+(?:inspection|site\s+visit)\s+date\b",
+        r"\bholiday\b[^.;\n]{0,60}?\b(?:report|inspection)\b|\binformation\s+from\s+the\s+inspector\b",
+        r"\b(?:unable\s+to|could\s*n[o']?t|not)\s+(?:yet\s+)?(?:locate[d]?|find|found|assign(?:ed)?)\s+(?:an?\s+)?inspector\b")),
+
+    # a line that only sets conditions for later fundings ("no more fundings without ... title search") is skipped
+    ("title", "Title", "third_party",
+        _LINE_START + r"(?![^\n]*\bno\s+(?:more|further)\s+fund\w*\s+without\b)[^\n]*?"
+        r"(?:(?<!job\s)\btitle\b(?!\s*:\s*(?:\w+\s+)?(?:officer|manager|director|analyst|processor|closer|coordinator|"
+        r"specialist|vp|president)\b)|\bsingle\s*source\b|\babstractor\b)"),
+
+    ("liens", "Liens / title issues", "third_party", _any(
+        r"(?<!no\s)(?<!no\sopen\s)(?<!no\sother\s)(?<!no\sknown\s)(?<!no\snew\s)\bliens?\b(?![\s-]*(?:waivers?|free))",
+        r"\bmortgagee\b|\bnot\s+(?:yet\s+)?(?:been\s+)?recorded\b|\bbe\s+recorded\b",
+        r"\b(?:second|2nd|junior)\s+(?:mortgage|lien|deed)s?\b",
+        r"\bjudge?ments?\b(?!\s+call)|\blis\s+pendens\b|\blitigation\b|\blawsuits?\b",
+        r"\bcannot\s+complete\s+the\s+title\b|\btitle\s+(?:issue|problem|exception|defect)s?\b")),
+
+    ("capital_partner", "Capital partner", "third_party", _any(
+        r"\bcap(?:ital)?\.?\s+partners?\b",
+        r"\bcp\s+(?:release|approval|funding)\b|\bpartner\s+release\b",
+        r"\brejected\s+by\s+(?:the\s+)?(?:capital\s+)?partner\b")),
+
+    # ------------------------------------------------ lender
+    ("internal_approval", "Internal approval", "lender", _any(
+        r"\bsecondary\s+review\b|\b(?:mgmt|management|manager|senior|credit\s+committee)\s+(?:review|approval)\b",
+        r"\breview(?:ed)?\s+by\s+(?:mgmt|management)\b|\bfunding\s+approval\b",
+        r"\b(?:response|decision|review|approval|sign[\s-]?off)\s+(?:by|from)\s+(?:mgmt|management|manager|credit)\b",
+        r"\bpending\s+(?!(?-i:LG|LW|CO|IC|QC|GC|SC|PF|DQ|IR|OK|IT|CV|AM|PM|ID|NO|RE|FW|TO|IN|ON|AT|BY|UP|CP)\b)"
+        r"(?-i:[A-Z]{2})\s+(?:review|approval)\b",
+        r"\bset\s+up\s+a\s+(?:conference\s+)?call\b",
+        r"\bhow\s+to\s+proceed\b|(?<!title\s)\bexceptions?\b",
+        r"\b(?:approv\w*|fund\w*|process\w*|releas\w*)\b[^.;\n]{0,40}?\b(?:despite|knowing\s+that|even\s+though)\b",
+        r"\bwaiv(?:e|ed|ing)\b(?!\s+(?:the\s+)?(?:inspection\s+)?fees?\b)",
+        r"\bapproved\b[^.;\n]{0,40}?\bafter\s+talking\s+(?:to|with)\b",
+        r"\bescalat\w*\s+to\s+(?:mgmt|management|manager|credit)\b|\bper\s+(?:mgmt|management)\b")),
+
+    ("processing", "Processing / wire timing", "lender", _any(
+        r"\bcut[\s-]?off\b|\bmissed\s+the\s+wire\b|\bwire\s+deadline\b|\b(?:after|past)\s+(?:the\s+)?(?:wire\s+)?deadline\b",
+        r"\b(?:approval|sign[\s-]?off)\s+from\s+accounting\b|\baccounting\s+(?:approval|review)\b|\bpending\s+accounting\b",
+        r"\b(?:cancel+ed|recalled|returned|rejected|bounced)\s+(?:the\s+)?wires?\b|\bwires?\s+(?:was\s+|were\s+)?(?:cancel+ed|recalled|returned|rejected|bounced)\b|"
+        r"\bmanual(?:ly)?\b[^.;\n]{0,25}?\b(?:wd|workday)\b",
+        r"\bvendor\s+(?:setup|set[\s-]?up|account)\b|\bpayee\s+(?:setup|set[\s-]?up)\b|\bbank\s+account\s+change\b",
+        r"\bwiring\s+info\s+approved\b|\bunlock\w*",
+        r"\byardi\b|\bpending\s+workday\b",
+        r"\bno\s+one\s+can\s+(?:currently\s+)?approve\b|\brecreat\w*",
+        r"\b(?:advance|draw|request)\s+(?:\w+\s+)?(?:was\s+)?(?:somehow\s+)?deleted\b",
+        r"\bper\s+ticket\b|\b(?-i:IT)\s+(?:has\s+change\w*|issues?|outage|ticket)\b",
+        r"\bholiday\b[^.;\n]{0,40}?\b(?:funding|wire)\b|\boffice\s+clos\w+")),
+
+    # ------------------------------------------------ status markers (milestones, not reasons)
+    ("sent_for_approval", "Sent for approval", "status_marker", _any(
+        r"\bsubmit(?:ted|ting)?\s+(?:[\w/]+\s+){0,3}?for\s+(?:final\s+)?approval\b",
+        r"\bpending\s+approval\b|\bsubmitted\s+to\s+ic\b",
+        r"\bfull\s+(?:draw\s+)?(?:pkg|package)\s+(?:rec\w*|rcvd|in|complete)\b")),
+
+    ("approved", "Approved", "status_marker", _any(
+        _LINE_START + _HDR + r"(?:approved|apv)\b(?!\s+to\s+(?:switch|change|use|order|add)\b)(?!\s+(?:an?\s+)?(?:additional|extra|change\s+order|co\b|budget|realloc\w*)(?![^.;\n]{0,25}\b(?:and|&)\s+(?:the\s+)?draw\b))",
+        r"(?<!then\s)\b(?:advance|draw)\s+(?:was\s+|is\s+|has\s+been\s+)?approved\b",
+        r"\bapprov(?:ed|ing)\s+(?:this\s+)?(?:wire|draw)\b(?!\s+amount)|\bapproved\s+and\s+funded\b",
+        r"(?<!not\s)(?<!be\s)\bapproved\s+(?:for\s+(?:funding|draw|release)|to\s+(?:fund|release|wire)|as)\b",
+        r"\bdraw\s+reviewed\s*(?:;|,|and)?\s*approved\b|[.;]\s+approved\s+(?:by|per|for)\b",
+        r"\bfunding\s+(?:to\s+be\s+|was\s+|is\s+)?initiated\b|\bsubmitting\s+(?:the\s+)?wire\b|\bpending\s+release\b")),
+
+    ("unsubmitted", "Sent back to Unsubmitted", "status_marker", _any(
+        r"(?<!go\sinto\s)(?<!will\sbe\sput\sin\s)(?<!will\sput\sin\s)(?<!will\sput\sit\sin\s)(?<!will\sgo\sto\s)(?<!will\smove\sto\s)(?<!will\sbe\smoved\sto\s)\bun-?s(?:ub|bu)mitted\b|\bunsub\b",
+        r"\bnot\s+submitted\b")),
+
+    ("final_draw", "Final draw", "status_marker", _any(
+        r"(?<!for\s)(?<!if\sthis\sis\sthe\s)(?<!on\sthe\s)(?<!supposed\sto\sbe\s)(?<!not\s)(?<!not\sa\s)(?<!not\sthe\s)(?<!next\sdraw\swill\sbe\sthe\s)(?<!next\sone\swill\sbe\sthe\s)(?<!next\sdraw\sis\sthe\s)"
+        r"\bfinal\s+draw\b(?!\s+with\s+no)",
+        r"\bnow\s+final\b|\bdraw\s+is\s+(?:now\s+)?final\b",
+        r"\bproject\s+is\s+(?:100%\s+)?complete\b",
+        r"(?<!without\sa\s)\bfinal\s+inspection\b",
+        r"\bfinal\s+(?:l/?ws?|lien\s+waivers?|waivers?|pay\s*app\w*)\b")),
+]
+
+DELAY_REASONS = {key: (label, side, re.compile(rx, re.IGNORECASE)) for key, label, side, rx in _CATEGORIES}
+REASON_SIDES = ("borrower", "third_party", "lender", "admin")
+
+# ---------------------------------------------------------------------------------------------------------
+# Entry header: initials + date in the orders staff write them. Case-sensitive on purpose: initials AFTER a date
+# must be upper case so "10/01 payment due" is not read as initials "pa". Dot dates ("AB 08.13") only after
+# initials, so "8.5% complete" is never a date.
+#   "AB 09/28 - text"  "Ab 09/28 -"  "CD09/22 approved"  "EF- 9/2- text"  "AB - 09/02 - text"  "GH 08.13 Approved"
+#   "9/30/2026 CD: text"  "9/15 EF- text"  "09/22 Approved"  "10/01 payment due"  "GH approved 09/28"
+# ---------------------------------------------------------------------------------------------------------
+NOTE_ENTRY = re.compile(
+    r"^\s*['\"*\-]*\s*(?:"
+    r"(?P<ini>[A-Za-z]{2})\s*-?\s*(?P<date>\d{1,2}(?:/\d{1,2}(?:/\d{2,4})?|\.\d{2}))(?![\d/%]|\.\d)"
+    r"|(?P<date2>\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?![\d/%]|\.\d)(?:\s*(?P<ini2>[A-Z]{2})\b)?"
+    r"|(?P<ini3>[A-Za-z]{2})\s+(?P<verb>[Aa]pproved|APPROVED|[Aa]pv)\s+(?P<date3>\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?![\d/%]|\.\d)"
+    r")\s*[-\N{EN DASH}\N{EM DASH}:.]*\s*(?P<text>.*)$")
+_NOT_INITIALS = {"LG", "LW", "CO", "IC", "QC", "GC", "SC", "PF", "DQ", "IR", "OK", "IT", "CV", "AM", "PM", "ID",
+                 "NO", "RE", "FW", "TO", "IN", "ON", "AT", "BY", "UP"}
+_APPROVED_FIRST = re.compile(r"(?:approved|apv)\b", re.IGNORECASE)   # "CO 09/14 - approved": CO = initials
+_DUE_LINE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:/\d{2,4})?\s+(?:payment|pmt)s?\s+(?:now\s+)?due\b", re.IGNORECASE)
+
+
+def _valid(date):
+    parts = re.split(r"[/.]", date)
+    try:
+        m, d = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return False
+    return 1 <= m <= 12 and 1 <= d <= 31
+
+
+def note_entries(text):
+    """Split a note log into [(date or None, entry text), ...] in the order written (newest first, as staff
+    write them). The date is the entry header's date as written, with '.' turned into '/' ("09/28",
+    "9/30/2026"); the text has the initials/date header removed (a header word such as LG or CO is kept in the text,
+    except before "approved", where it is the approver's initials). 'MM/DD payment due' lines give the next loan
+    payment date, not an entry date, so they come back as (None, whole line). Lines starting with '/' continue
+    the entry above. Excel's '_x000D_' escapes count as line breaks."""
+    if text is None or not isinstance(text, str):
+        return []
+    out = []
+    for raw in re.split(r"[\r\n]+", re.sub(r"_x000[dD]_", "\n", text)):
+        line = " ".join(raw.split())          # one space between words: long blank runs made some patterns crawl
+        if not line:
+            continue
+        if line.startswith("/") and out:
+            d, t = out[-1]
+            out[-1] = (d, (t + " " + line.lstrip("/ ").strip()).strip())
+            continue
+        if _DUE_LINE.match(line):
+            out.append((None, line))
+            continue
+        m = NOTE_ENTRY.match(line)
+        if not m:
+            out.append((None, line))
+            continue
+        ini = m.group("ini") or m.group("ini2") or m.group("ini3")
+        date = m.group("date") or m.group("date2") or m.group("date3")
+        body = m.group("text").strip()
+        if m.group("verb"):
+            body = (m.group("verb") + " " + body).strip()
+        if ini and ini.upper() in _NOT_INITIALS and (m.group("ini3") or not _APPROVED_FIRST.match(body)):
+            body = (ini + " " + body).strip()         # "LG 9/14 ..." is not a person: keep the word
+        date = date.replace(".", "/") if _valid(date) else None
+        out.append((date, body))
+    return out
+
+
+# A self / remote inspection named in the note ("elf inspection" is a typo seen in the notes) ...
+_SELF_INSP = re.compile(r"\bs?elf[\s-]*(?:insp|inps)\w*|\bremote\s+inspection\b|\bin\s+lieu\s+of\s+(?:an?\s+)?inspection\b",
+                        re.IGNORECASE)
+# ... and signs of a third-party inspection: LG, the inspector, QC, a report, a site visit, 3rd party, re-inspection,
+# or an inspection ordered / scheduled in an entry that is not about the self-inspection.
+_THIRD_INSP = re.compile(r"\b(?:lg|land\s+gorilla|inspectors?|qc|qaqc|report|site\s+visit|on[\s-]?site|third[\s-]*party|"
+                         r"3rd[\s-]*party|partner|re-?inspect\w*)\b", re.IGNORECASE)
+_ORDERED = re.compile(r"\b(?:ordered|scheduled|sched)\b", re.IGNORECASE)
+
+
+def _self_inspection_only(entries):
+    """True when the note names a self / remote inspection and nothing in it shows a third-party inspection."""
+    if not any(_SELF_INSP.search(e) for e in entries):
+        return False
+    return not any(_THIRD_INSP.search(e) or (_ORDERED.search(e) and not _SELF_INSP.search(e)) for e in entries)
+
+
+def delay_reasons(text):
+    """DELAY_REASONS keys found in a note (or any free text), in DELAY_REASONS order, each once.
+    Includes status markers; keep side != 'status_marker' for 'held up by' reasons.
+    One note-level rule: when the note names a self / remote inspection and shows no third-party inspection
+    (_self_inspection_only), a bare "inspection" there is the borrower's self-inspection, so 'inspection' (third
+    party) is dropped and 'self_inspection' (borrower) kept."""
+    found = set()
+    entries = [entry for _date, entry in note_entries(text)]
+    for entry in entries:
+        for key, (_label, _side, rx) in DELAY_REASONS.items():
+            if key not in found and rx.search(entry):
+                found.add(key)
+    if "inspection" in found and "self_inspection" in found and _self_inspection_only(entries):
+        found.discard("inspection")
+    return [key for key in DELAY_REASONS if key in found]
+
+
+# How the app shows them: progress markers aren't reasons, and a routine inspection (about half of all draws have
+# one) is listed on each draw but not counted as an account's usual hold-up.
+WAITING_ON = {"borrower": "Borrower", "third_party": "Third parties", "lender": "CoreVest", "admin": "Loan changes"}
+ROUTINE_REASONS = ("inspection",)
+
+
+@st.cache_resource(show_spinner=False)
+def _reason_memo(rules_version: str) -> dict:
+    """Process-wide note -> reasons memo. It outlives reruns (the original deployment re-runs this whole file each
+       time), and a change to the patterns starts a fresh one."""
+    return {}
+
+
+_RULES_VERSION = hashlib.sha1("\n".join(rx for _k, _l, _s, rx in _CATEGORIES).encode()).hexdigest()
+_MEMO: dict | None = None                     # the memo above, fetched once: looking it up per note is slow
+
+
+def delay_keys(note) -> tuple:
+    """DELAY_REASONS keys for what a draw's notes say held it up, in display order (no progress markers)."""
+    global _MEMO
+    t = _txt(note)
+    if not t:
+        return ()
+    if _MEMO is None:
+        _MEMO = _reason_memo(_RULES_VERSION)
+    memo = _MEMO
+    hit = memo.get(t)
+    if hit is None:
+        hit = tuple(k for k in delay_reasons(t) if DELAY_REASONS[k][1] in REASON_SIDES)
+        if len(memo) > 20000:
+            memo.clear()
+        memo[t] = hit
+    return hit
+
+
+def delay_labels(note) -> list:
+    """What a draw's notes say held it up, in plain English."""
+    return [DELAY_REASONS[k][0] for k in delay_keys(note)]
+
+
+def delay_evidence(note, limit: int = 3) -> list:
+    """The note entries behind those reasons, in the order written (usually newest first): '09/28: Pending LW'."""
+    keys = delay_keys(note)
+    if not keys:
+        return []
+    out = []
+    for when, entry in note_entries(_txt(note)):
+        if any(DELAY_REASONS[k][2].search(entry) for k in keys):
+            out.append((f"{when}: " if when else "") + (entry if len(entry) <= 160 else entry[:157] + "…"))
+            if len(out) == limit:
+                break
+    return out
 
 
 # ───────────────────────────── display helpers ──────────────────────────────
@@ -1312,12 +1763,173 @@ def _col(df: pd.DataFrame, name: str) -> pd.Series:
     return df[name] if name in df else pd.Series(None, index=df.index, dtype=object)
 
 
+def _md(v) -> str:
+    """Salesforce text made safe to drop into markdown: no stray bold, links or math."""
+    return re.sub(r"([\\`*_{}\[\]()#+!|~<>$])", r"\\\1", _txt(v))
+
+
+def _show(v, sftype: str | None = None) -> str | None:
+    """A Salesforce / Land Gorilla value as display text: dates m/d/yyyy, money $1,234, percents 45% (None if blank)."""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(s for s in (_show(x) for x in v) if s) or None
+    t = _txt(v)
+    if not t:
+        return None
+    if sftype in ("date", "datetime") or isinstance(v, date):
+        d = _d(v)
+        return _mdy(d) if d else t
+    try:
+        if sftype == "currency":
+            return f"${float(v):,.0f}"
+        if sftype == "percent":
+            return f"{float(v):,.1f}".rstrip("0").rstrip(".") + "%"
+    except (TypeError, ValueError):
+        return t
+    if sftype == "boolean":
+        return "Yes" if t.lower() in ("true", "1", "yes", "y") else "No"
+    return t
+
+
+def _draw_no(r) -> str:
+    """A draw's number within its loan: '11' for advance 34961-11 (whose Salesforce Name is 11)."""
+    name, adv = _txt(r.get("Name")), _txt(r.get("Loan_Advance_Number__c"))
+    if name.isdigit():
+        return name
+    m = re.search(r"-(\d+)\s*$", adv)
+    return m.group(1) if m else (adv or name or "?")
+
+
+def _draw_nos(df: pd.DataFrame) -> list:
+    return [_draw_no({"Name": n, "Loan_Advance_Number__c": a})
+            for n, a in zip(_col(df, "Name"), _col(df, "Loan_Advance_Number__c"))]
+
+
+def _day(s) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").astype("datetime64[ns]")
+
+
+def _created_day(df: pd.DataFrame) -> pd.Series:
+    """Salesforce's CreatedDate as an Eastern-time date."""
+    t = pd.to_datetime(_col(df, "CreatedDate"), errors="coerce", utc=True)
+    return t.dt.tz_convert("America/New_York").dt.tz_localize(None).dt.normalize().astype("datetime64[ns]")
+
+
+def _wire_day(df: pd.DataFrame) -> pd.Series:
+    return _day(_col(df, "_wire")).fillna(_day(_col(df, WIRE_FIELD)))
+
+
+def _request_date(df: pd.DataFrame) -> pd.Series:
+    """Each draw's request date: Land Gorilla's; else the earlier of Salesforce's request date (often just the wire
+       date copied over) and the day the record was created — unless that came after the wire (a bulk load)."""
+    made, wire = _created_day(df), _wire_day(df)
+    sf = pd.concat([_day(_col(df, REQ_FIELD)), made.where(wire.isna() | (made <= wire))], axis=1).min(axis=1)
+    return _day(_col(df, "_lg_req")).fillna(sf.astype("datetime64[ns]"))
+
+
+def _order_date(df: pd.DataFrame) -> pd.Series:
+    """The date a draw sorts by: its request date, else its wire date (older draws often have nothing else), else the
+       day it was created in Salesforce."""
+    return _request_date(df).fillna(_wire_day(df)).fillna(_created_day(df))
+
+
+def _waiting_summary(keys_per_draw) -> tuple:
+    """What a set of draws was usually waiting on: (top hold-ups, who they were mostly on, hold-up counts). A draw
+       counts once per hold-up and once per side, so one long note can't outvote several draws; tied sides are all
+       named; ties between hold-ups go alphabetically. Routine inspections aren't counted."""
+    keys = [[k for k in ks if k not in ROUTINE_REASONS] for ks in keys_per_draw]
+    top = pd.Series([DELAY_REASONS[k][0] for ks in keys for k in ks], dtype=object).value_counts()
+    top = top.sort_index().sort_values(ascending=False, kind="stable")
+    sides = pd.Series([s for ks in keys for s in {DELAY_REASONS[k][1] for k in ks}], dtype=object).value_counts()
+    who = None
+    if len(sides):
+        best = set(sides[sides == sides.max()].index)
+        who = " & ".join(WAITING_ON[s] for s in WAITING_ON if s in best)
+    return list(top.index[:3]), who, top
+
+
+def _newest_first(df: pd.DataFrame) -> pd.DataFrame:
+    """Most recent request on top. A loan's draws stay together, highest draw number first (draws are numbered in
+       the order they're requested); loans are ordered by their most recent draw."""
+    if df.empty:
+        return df
+    when = _order_date(df)
+    seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
+    loan = _col(df, "Loan_Number__c").map(_txt)
+    latest = when.groupby(loan).transform("max")
+    return (df.assign(_when=when.values, _seq=seq.values, _latest=latest.values, _loan=loan.values)
+              .sort_values(["_latest", "_loan", "_seq", "_when"], ascending=[False, True, False, False],
+                           na_position="last", kind="stable")
+              .drop(columns=["_latest", "_loan"]))
+
+
+def _by_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Draws from many loans, most recent request first (ties: higher draw number first)."""
+    seq = pd.to_numeric(pd.Series(_draw_nos(df), index=df.index), errors="coerce")
+    return (df.assign(_when=_order_date(df).values, _seq=seq.values)
+              .sort_values(["_when", "_seq"], ascending=False, na_position="last", kind="stable"))
+
+
+def latest_entry(note, ref: date | None = None) -> tuple | None:
+    """The newest dated entry in a note log, as (date, text). Logs run newest-first or oldest-first, and entry dates
+       usually have no year, so each goes in the year that puts it closest to ref (the draw's own date)."""
+    ref, best = ref or _today(), None
+    for when, text in note_entries(_txt(note)):
+        text = text.lstrip(";:,-–— ").strip()
+        if not when or not text:
+            continue
+        p = [int(x) for x in when.split("/")]
+        try:
+            d = (date(p[2] + (2000 if p[2] < 100 else 0), p[0], p[1]) if len(p) == 3 else
+                 min((date(y, p[0], p[1]) for y in (ref.year - 1, ref.year, ref.year + 1)),
+                     key=lambda x: abs((x - ref).days)))
+        except ValueError:
+            continue
+        if best is None or d > best[0]:
+            best = (d, text)
+    return best
+
+
+def _timeline(row: pd.Series, a) -> pd.DataFrame:
+    """What happened to a draw, in date order — only steps that were recorded: Land Gorilla's request and funding,
+       the Salesforce milestones that were filled in, the full-package date, and each approval with who gave it."""
+    req, wire = _d(row.get("_lg_req")), _d(row.get("_wire")) or _d(row.get(WIRE_FIELD))
+    sf_req = _d(row.get(REQ_FIELD))
+    if not req and sf_req and (not wire or sf_req < wire):        # Salesforce's own request date, unless it's just
+        req = sf_req                                               # the wire date copied over
+    ev = [(req, "Requested", _txt(row.get("_lg_by")))]
+    sub = _d(row.get("_lg_sub"))
+    if sub and sub != req:
+        ev.append((sub, "Submitted in Land Gorilla", ""))
+    ev += [(_d(row.get(field)), label, "") for label, field in MILESTONES[1:-2]]
+    ev.append((_d(row.get("_pkg")), "Full draw package received", ""))
+    steps = a.get("_steps") if a is not None else None
+    if isinstance(steps, (list, tuple)):
+        ev += [(d, step, who) for d, step, who in steps]
+    if a is not None and not any(s == "Approved" for _, s, _ in ev) and _d(a.get("Approved on")):
+        ev.append((_d(a.get("Approved on")), "Approved", _txt(a.get("Approved by"))))
+    ev.append((wire, "Wired", ""))
+    t = pd.DataFrame([(pd.Timestamp(d), s, w) for d, s, w in ev if d], columns=["Date", "Step", "By"])
+    return t.sort_values("Date", kind="stable").reset_index(drop=True)
+
+
+def _draw_names(df: pd.DataFrame) -> list:
+    """How each draw reads in a picker: 'Loan 12345 · Draw 3 · Maple Row LLC  (requested 9/2/2026, wired 9/12/2026)'."""
+    out = []
+    for loan, no, deal, req, wired in zip(_col(df, "Loan_Number__c"), _draw_nos(df), _col(df, "Deal__r.Name"),
+                                          _day(_col(df, "_lg_req")), _day(_col(df, "_wire"))):
+        when = ([f"requested {_mdy(req)}"] if pd.notna(req) else []) + ([f"wired {_mdy(wired)}"] if pd.notna(wired)
+                                                                          else [])
+        bits = [f"Loan {_txt(loan) or '?'}", f"Draw {no}"] + ([_txt(deal)] if _txt(deal) else [])
+        out.append(" · ".join(bits) + (f"  ({', '.join(when)})" if when else ""))
+    return out
+
+
 def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> pd.DataFrame:
     """The draws in plain, business-friendly columns (shown in the app and used for the Excel export)."""
     ids = _col(d, "Id")
     t = pd.DataFrame({
-        "Loan #": _col(d, "Loan_Number__c"), "Draw #": _col(d, "Loan_Advance_Number__c"),
-        "Property": _col(d, "Name"), "Deal": _col(d, "Deal__r.Name"), "Borrower": _col(d, "Borrower_Name_Text__c"),
+        "Loan #": _col(d, "Loan_Number__c"), "Draw #": pd.Series(_draw_nos(d), index=d.index, dtype=object),
+        "Deal": _col(d, "Deal__r.Name"), "Borrower": _col(d, "Borrower_Name_Text__c"),
         "Status": _col(d, "Status__c"), "Requested": _dates(_col(d, "_lg_req")),
         "Package received": _dates(_col(d, "_pkg")), "Wired": _dates(_col(d, "_wire")),
         "Turn-time (bd)": pd.to_numeric(_col(d, "_fund_bd"), errors="coerce"),
@@ -1326,8 +1938,7 @@ def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> p
     for c in ("Approved by", "Approved on", "Approval comments"):
         t[c] = ids.map(ap[c]) if ap is not None and c in ap else None
     t["Approved on"] = _dates(t["Approved on"])
-    if DELAY_REASONS:
-        t["Delay reasons"] = [delay_labels(n, a) for n, a in zip(_col(d, NOTES_FIELD), t["Approval comments"])]
+    t["Held up by"] = [delay_labels(n) for n in _col(d, NOTES_FIELD)]
     t["Coordinator"] = _col(d, "Advance_Coordinator__r.Name")
     t["Notes"] = _col(d, NOTES_FIELD)
     t["Salesforce"] = ids.map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None)
@@ -1348,7 +1959,8 @@ def _table_config() -> dict:
         "Request → wire (bd)": C.NumberColumn("Request → wire", format="%d bd"),
         "Funded ($)": C.NumberColumn("Funded", format="dollar", step=1),
         "Approved on": C.DateColumn(format="M/D/YYYY"),
-        "Delay reasons": C.ListColumn(help="What the notes and approval comments say held the draw up"),
+        "Held up by": C.ListColumn(help="What the draw's notes say it was waiting on"),
+        "What the notes say": C.TextColumn(width="large", help="The note entries behind those hold-ups"),
         "Approval comments": C.TextColumn(width="large"),
         "Notes": C.TextColumn(width="large"),
         "Salesforce": C.LinkColumn(display_text="Open", width="small"),
@@ -1359,8 +1971,8 @@ def _excel_table(fg: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
     """The turn-time data dump: every column in the table plus the milestone dates and the borrower-side numbers
        (kept out of the overview, but useful in a pivot by account)."""
     x = table.drop(columns=["Salesforce"]).copy()
-    if "Delay reasons" in x:
-        x["Delay reasons"] = x["Delay reasons"].map(lambda r: ", ".join(r) if r else None)
+    if "Held up by" in x:
+        x["Held up by"] = x["Held up by"].map(lambda r: ", ".join(r) if r else None)
     pos = x.columns.get_loc("Package received")
     for i, (label, field) in enumerate(MILESTONES[1:-2]):    # inspection ordered … internal review complete
         x.insert(pos + i, label, _dates(_col(fg, field)))
@@ -1496,8 +2108,9 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     ap = approvals_for(inst, tok, tuple(_col(fg, "Id").dropna()))
     table = _draw_table(fg, inst, ap)
 
-    t_sum, t_draws, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
-                                       ":material/fact_check: Package date check"])
+    t_sum, t_draws, t_detail, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
+                                                 ":material/manage_search: Draw & deal details",
+                                                 ":material/fact_check: Package date check"])
     with t_sum:
         left, right = st.columns([1, 1.3])
         with left:
@@ -1508,6 +2121,7 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                                                                                           format="dollar", step=1)})
         with right:
             _render_charts(roll, fg, feat, same_day)
+        _holdups_chart(fg, f"What held draws up · {feat}")
         with st.expander("How these numbers work"):
             st.markdown(
                 "- **Package received** — the *Full Draw Package Received* date in Salesforce: the day the borrower's "
@@ -1516,14 +2130,98 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                 "- **Turn-time** = package received → wired, in business days (weekends and federal holidays skipped).\n"
                 "- How long borrowers take to get to a full package is their responsibility, so it isn't an overview "
                 "number — see it by account or deal under **Find a draw**.\n"
+                "- **Held up by** — what a draw's notes say it was waiting on: lien waivers, invoices, title, the "
+                "inspection and so on.\n"
                 "- Draws without a package date, or with dates out of order, are left out of turn-time and listed on "
                 "the Package date check tab.")
     with t_draws:
         st.dataframe(table, hide_index=True, width="stretch", height=460, column_config=_table_config())
         _period_workbook(feat, _excel_table(fg, table),
                          roll.drop(columns="_raw").rename(columns={"Draws": "Draws funded"}))
+    with t_detail:
+        _draw_details(inst, tok, rt, sel, fg, ap, feat)
     with t_check:
         _package_check(fg, table, same_day)
+
+
+DEAL_FACTS = (("C", "Deal"), ("D", "Borrower"), ("E", "Sponsor"), ("J", "Project type"), ("AJ", "RM / LO"),
+              ("O", "Total loan commitment"), ("M", "Loan funded"), ("N", "Maturity"), ("AC", "Next payment due"),
+              ("AD", "Interest reserve left"), ("AH", "Warehouse line"))
+PROPERTY_FACTS = (("F", "Street"), ("G", "City"), ("H", "State"), ("I", "Property type"), ("K", "As-is value"),
+                  ("L", "As-complete value"), ("Q", "Initial funding"), ("AB", "Current UPB"))
+
+
+@sf_fragment
+def _draw_details(inst, tok, rt, sel, fg: pd.DataFrame, ap: pd.DataFrame, feat: str):
+    """Everything about one draw and the deal behind it, picked from the period's draws (most recent request first).
+       A fragment, so picking a draw doesn't reload the rest of the page."""
+    d = _by_date(fg)
+    d = d[_col(d, "Id").map(_txt) != ""]
+    names = dict(zip(d["Id"], _draw_names(d)))
+    pick = st.selectbox("Draw", list(names), index=None, format_func=lambda i: names.get(i, str(i)),
+                        key=f"detail_{feat}", placeholder="Pick a draw — type a loan #, deal or draw # to search",
+                        help="This period's draws, most recent request first.")
+    if pick is None:
+        st.info("Pick a draw to see its timeline, money, approvals and notes, and the deal behind it: terms, "
+                "property and construction progress.", icon=":material/manage_search:")
+        return
+    row = d[d["Id"] == pick].iloc[0]
+    with st.container(border=True):
+        _render_draw(row, ap, inst)
+    st.subheader("Deal", divider="gray")
+    cfg, loan = lg_config(), _txt(row.get("Loan_Number__c"))
+    with st.spinner("Loading the deal…"):
+        ov = _deal_details(inst, tok, rt, row)
+        cols = [f for f in ("Id", "Name", "Loan_Advance_Number__c", CONTAINER_FIELD) if f in sel.split(",")]
+        hist = run_soql(inst, tok, f"SELECT {','.join(cols)} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                                   f"AND Loan_Number__c='{soql_escape(loan)}'") if cfg and loan else None
+    if cfg and loan:
+        st.subheader("Construction progress", divider="gray")
+        if not ov:
+            st.caption(f"Land Gorilla has no loan record for loan {_md(loan)}, so there's no project progress to "
+                       "show — only the loan's draws.")
+        _render_lg_for_loan(cfg, ov or {}, hist if hist is not None and not hist.empty else row.to_frame().T)
+
+
+def _check_label(col: str) -> str:
+    """'chk:Completion LTC % — deal Max LTC' -> 'Max LTC' (the Salesforce field's own name)."""
+    return re.sub(r"^(?:deal|property)\s+", "", col[4:].split(" — ")[-1])
+
+
+def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
+    """The deal behind a draw — its terms and people, then each property — with Land Gorilla first where it has the
+       value, as in the funding-request file. Returns Land Gorilla's overview of the loan, if any."""
+    rid = _txt(row.get("Id"))
+    rows, ftypes, _ = funding_request_rows(inst, tok, rt, f"Id='{soql_escape(rid)}'") if rid else (pd.DataFrame(),
+                                                                                                    {}, [])
+    if rows.empty:
+        st.caption("Salesforce has no deal details for this draw.")
+        return None
+    merged, mtypes, lg = lg_overlay(rows, ftypes, lg_config())
+    first = merged.iloc[0]
+    facts = [(label, _show(first.get(col), mtypes.get(col))) for col, label in DEAL_FACTS]
+    facts.insert(1, ("Account", _show(row.get("Deal__r.Account.Name"))))
+    facts += [("Draw coordinator", _show(row.get("Advance_Coordinator__r.Name"))),
+              ("Draw analyst", _show(row.get("Advance_Analyst__r.Name")))]
+    facts += [(_check_label(c), _show(first.get(c), mtypes.get(c))) for c in merged.columns
+              if str(c).startswith("chk:") and c[4:] in DEAL_CHECKS]
+    facts = [(k, v) for k, v in facts if v]
+    if facts:
+        half = (len(facts) + 1) // 2
+        for col, part in zip(st.columns(2), (facts[:half], facts[half:])):
+            col.dataframe(pd.DataFrame(part, columns=["Detail", "Value"]), hide_index=True, width="stretch")
+    props = pd.DataFrame({label: [_show(v, ftypes.get(col)) for v in _col(rows, col)] for col, label in PROPERTY_FACTS})
+    if len(rows) > 1:
+        props["This draw"] = [_show(v, "currency") for v in _col(rows, "_pa_amount")]
+    for c in [c for c in rows.columns if str(c).startswith("chk:") and c[4:] in PROPERTY_CHECKS]:
+        props[_check_label(c)] = [_show(v, ftypes.get(c)) for v in rows[c]]
+    props = props.loc[:, props.notna().any()]
+    if len(props.columns):
+        st.markdown("**Properties**" if len(rows) > 1 else "**Property**")
+        st.dataframe(props, hide_index=True, width="stretch")
+    if any(x is True or x is np.True_ for x in _col(rows, "_multi_property")):
+        st.caption("Portfolio loan — this draw couldn't be matched to one property.")
+    return lg["loans"].get(_txt(first.get("B")) or _txt(row.get("Loan_Number__c")))
 
 
 def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int):
@@ -1588,11 +2286,11 @@ def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int):
     flagged = flagged[flagged["Issue"].isin(CHECK_EXCLUDED) | (flagged["Issue"] == "No package-received date")]
     if len(flagged):
         with st.expander(f"Draws to check ({len(flagged)})", icon=":material/rule:"):
-            st.dataframe(flagged[["Loan #", "Draw #", "Property", "Requested", "Package received", "Wired", "Issue",
+            st.dataframe(flagged[["Loan #", "Draw #", "Deal", "Requested", "Package received", "Wired", "Issue",
                                   "Salesforce"]], hide_index=True, width="stretch", column_config=_table_config())
 
 
-@st.fragment
+@sf_fragment
 def _period_funding_file(inst, tok, rt, feat, period_where, p_end):
     """Melanie's funding-request workbook for the period's wired draws. A fragment, so building it doesn't
        reload the whole page."""
@@ -1617,13 +2315,37 @@ def _period_funding_file(inst, tok, rt, feat, period_where, p_end):
             st.toast("Funding-request file is ready.", icon="✅")
 
 
-@st.fragment
+@sf_fragment
 def _period_workbook(feat, xtable, roll):
     if st.button("Build turn-time workbook (Excel)", icon=":material/table_view:", key=f"xls_{feat}"):
         with st.spinner("Building the workbook…"):
             xlsx = build_excel({"Summary": roll, "Draws": xtable})
         st.download_button("Download turn-time workbook", xlsx, mime=XLSX_MIME, icon=":material/download:",
                            file_name=f"Draw turn-time {feat}.xlsx", key=f"dl_{feat}", on_click="ignore")
+
+
+def _holdups_chart(d: pd.DataFrame, title: str):
+    """How often each hold-up shows up in these draws' notes (share of draws), coloured by who it was on."""
+    keys = [k for n in _col(d, NOTES_FIELD) for k in delay_keys(n) if k not in ROUTINE_REASONS]
+    st.markdown(f"**{title}**")
+    if not keys:
+        st.caption("Nothing in these draws' notes points to a hold-up.")
+        return
+    n = pd.Series(keys, dtype=object).value_counts()
+    data = pd.DataFrame({"Hold-up": [DELAY_REASONS[k][0] for k in n.index], "Draws": n.values,
+                         "Share": n.values / max(len(d), 1),
+                         "Waiting on": [WAITING_ON.get(DELAY_REASONS[k][1], "") for k in n.index]})
+    if alt is None:
+        st.bar_chart(data.set_index("Hold-up")["Share"])
+    else:
+        st.altair_chart(alt.Chart(data).mark_bar().encode(
+            x=alt.X("Share:Q", title="Share of draws", axis=alt.Axis(format="%")),
+            y=alt.Y("Hold-up:N", sort="-x", title=None),
+            color=alt.Color("Waiting on:N", legend=alt.Legend(orient="bottom", title="Waiting on")),
+            tooltip=["Hold-up", "Draws", alt.Tooltip("Share:Q", format=".0%"), "Waiting on"]),
+            width="stretch")
+    st.caption(f"Read from the notes of {len(d):,} draws; a draw can have more than one. Routine inspections are "
+               "left out unless they ran late.")
 
 
 def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: int):
@@ -1659,11 +2381,56 @@ def lg_filenumber(loan_no) -> str | None:
 
 def render_loan_detail(inst, tok, rt, sel, same_day):
     st.header("Find a draw")
-    t_search, t_accounts = st.tabs([":material/search: Search", ":material/groups: Who's falling short"])
+    t_search, t_open, t_accounts = st.tabs([":material/search: Search", ":material/pending_actions: Not wired yet",
+                                            ":material/groups: Who's falling short"])
     with t_search:
         _draw_search(inst, tok, rt, sel, same_day)
+    with t_open:
+        _open_draws(inst, tok, rt, sel, same_day)
     with t_accounts:
         _accounts_view(inst, tok, rt, sel, same_day)
+
+
+@sf_fragment
+def _open_draws(inst, tok, rt, sel, same_day):
+    """Every draw that isn't wired yet — its status, how long it's been open, and what its notes say it's waiting on
+       — most recent request first. A fragment, so loading it doesn't redraw the search results."""
+    st.caption("Draws that haven't been wired yet: where each one stands and what its notes say it's waiting on.")
+    data = st.session_state.get("open_data")                # built on request, then kept for the session
+    if st.button("Refresh" if data else "Show draws not wired yet", icon=":material/pending_actions:",
+                 key="open_build"):
+        with st.spinner("Loading open draws and Land Gorilla dates…"):
+            df = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
+            df = _by_date(apply_lg_correction(add_intervals(df), lg_config(), same_day)) if not df.empty else df
+        st.session_state["open_data"] = data = (df, pd.Timestamp.now(tz="America/New_York"))
+    if not data:
+        return
+    df, asof = data
+    if df.empty:
+        st.info("Every draw has been wired."); return
+    notes = _col(df, NOTES_FIELD)
+    req = _request_date(df)
+    latest = [latest_entry(n, w.date() if pd.notna(w) else None) for n, w in zip(notes, req)]
+    t = pd.DataFrame({
+        "Loan #": _col(df, "Loan_Number__c").values, "Draw #": _draw_nos(df), "Deal": _col(df, "Deal__r.Name").values,
+        "Status": _col(df, "Status__c").values, "Requested": req.values,
+        "Open (bd)": bdays(req, pd.Series(pd.Timestamp(_today()), index=df.index), same_day).values,
+        "Waiting on": [delay_labels(n) for n in notes],
+        "Latest note": [f"{_mdy(x[0])}: {x[1]}" if x else None for x in latest],
+        "Coordinator": _col(df, "Advance_Coordinator__r.Name").values,
+        "Salesforce": _col(df, "Id").map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i
+                                         else None).values,
+    })
+    by_status = _col(df, "Status__c").fillna("(none)").value_counts()
+    st.markdown(f"**{len(df):,} draws not wired yet** (as of {asof.strftime('%I:%M %p').lstrip('0')}) · "
+                + " · ".join(f"{_md(s)} {n}" for s, n in by_status.items()))
+    st.dataframe(t, hide_index=True, width="stretch", height=420, column_config={
+        **_table_config(),
+        "Open (bd)": st.column_config.NumberColumn("Open", format="%d bd",
+                                                   help="Business days since the draw was requested"),
+        "Waiting on": st.column_config.ListColumn(help="What the draw's notes say it's waiting on"),
+        "Latest note": st.column_config.TextColumn(width="large", help="The newest dated entry in the notes")})
+    _holdups_chart(df, "What open draws are waiting on")
 
 
 def _draw_search(inst, tok, rt, sel, same_day):
@@ -1677,38 +2444,59 @@ def _draw_search(inst, tok, rt, sel, same_day):
     searchable = [f for f in ["Loan_Number__c", "Deal__r.Name", "Borrower_Name_Text__c", "Name",
                               "Loan_Advance_Number__c", "Deal__r.Account.Name"] if f in sel.split(",")]
     ors = " OR ".join(f"{f} LIKE '%{q}%'" for f in searchable) or "Id != null"
+    order = "CreatedDate DESC" if "CreatedDate" in sel.split(",") else f"Loan_Number__c, {REQ_FIELD}"
     with st.spinner("Searching…"):
         df = add_intervals(run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
-                                               f"AND ({ors}) ORDER BY Loan_Number__c, {REQ_FIELD} "
-                                               f"LIMIT {SEARCH_LIMIT + 1}"))
+                                               f"AND ({ors}) ORDER BY {order} LIMIT {SEARCH_LIMIT + 1}"))
     if df.empty:
         st.warning("No matching draws."); return
     if len(df) > SEARCH_LIMIT:
         df = df.head(SEARCH_LIMIT)
-        st.warning(f"Showing the first {SEARCH_LIMIT} matching draws — narrow the search to see the rest.")
+        st.warning(f"Showing the {SEARCH_LIMIT} most recent matching draws — narrow the search to see older ones.")
     cfg = lg_config()
     with st.spinner("Loading draw history…"):
-        df = apply_lg_correction(df, cfg, same_day)
+        df = _newest_first(apply_lg_correction(df, cfg, same_day))
         ap = approvals_for(inst, tok, tuple(_col(df, "Id").dropna()))
-    nloans = df["Loan_Number__c"].nunique() if "Loan_Number__c" in df else len(df)
-    st.caption(f"{len(df)} draw(s) on {nloans} loan(s)")
+    nloans = df["Loan_Number__c"].nunique(dropna=False) if "Loan_Number__c" in df else len(df)
+    view = "By loan"
+    if nloans > 1:
+        view = st.segmented_control(
+            "Show", ["Newest first", "By loan"], default="Newest first", key="ld_view",
+            help="Newest first: every draw in request order, the most recent at the top. By loan: each loan's draws "
+                 "together, with the loan's track record and construction progress.") or "Newest first"
+    if view == "Newest first":
+        st.caption(f"{len(df)} draw(s) on {nloans} loans · most recent request at the top, earliest at the bottom")
+        for _, row in _by_date(df).iterrows():
+            with st.container(border=True):
+                who = [x for x in (_txt(row.get("Deal__r.Name")), _txt(row.get("Deal__r.Account.Name"))) if x]
+                st.caption(f"**Loan {_md(row.get('Loan_Number__c'))}**" + "".join(f" · {_md(x)}" for x in who))
+                _render_draw(row, ap, inst)
+        return
+
+    st.caption(f"{len(df)} draw(s) on {nloans} loan(s) · loans with the most recent request first, each loan's "
+               "latest draw on top")
+    groups = list(df.groupby("Loan_Number__c", dropna=False, sort=False))       # already newest first
+    if len(groups) > MAX_LOAN_SECTIONS:
+        st.warning(f"Showing the {MAX_LOAN_SECTIONS} loans with the most recent draws — narrow the search to see the "
+                   "rest.")
+        groups = groups[:MAX_LOAN_SECTIONS]
     tmpl = str((cfg or {}).get("template_id", LG_TEMPLATE_ID_DEFAULT))
     loans = {}
     if cfg:
         try:
             loans = lg_loans(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), tmpl,
-                             _col(df, "Loan_Number__c").tolist())
+                             [loan for loan, _ in groups])
         except Exception:
             loans = {}
 
-    for loan_no, g in df.groupby("Loan_Number__c", dropna=False):
+    for loan_no, g in groups:
         def first(col):
             return _txt(g[col].dropna().iloc[0]) if col in g and g[col].notna().any() else ""
         with st.container(border=True):
-            st.subheader(f"Loan {loan_no} · {first('Deal__r.Name')}")
-            sub = [x for x in (first("Deal__r.Account.Name"), first("Borrower_Name_Text__c")) if x]
+            st.subheader(f"Loan {_md(loan_no)} · {_md(first('Deal__r.Name'))}")
+            sub = [_md(x) for x in (first("Deal__r.Account.Name"), first("Borrower_Name_Text__c")) if x]
             st.caption("  ·  ".join(sub + [f"{len(g)} draw(s)"]))
-            _track_record(g, ap)
+            _track_record(g)
             for _, row in g.iterrows():
                 _render_draw(row, ap, inst)
             ov = loans.get(_txt(loan_no))
@@ -1717,33 +2505,31 @@ def _draw_search(inst, tok, rt, sel, same_day):
                     _render_lg_for_loan(cfg, ov, g)
 
 
-def _track_record(g: pd.DataFrame, ap: pd.DataFrame):
+def _track_record(g: pd.DataFrame):
     """How this loan's borrower does at getting to a full package — and what holds them up."""
     wait = pd.to_numeric(g["_wait_bd"], errors="coerce").dropna()
-    reasons = pd.Series([r for n, a in zip(_col(g, NOTES_FIELD), _col(g, "Id").map(
-        lambda i: ap["Approval comments"].get(i) if i in ap.index else None)) for r in delay_labels(n, a)])
-    m = st.columns(3 if DELAY_REASONS else 2)
+    top, _who, _n = _waiting_summary([delay_keys(n) for n in _col(g, NOTES_FIELD)])
+    m = st.columns(3)
     m[0].metric("Days to a full package", _bd(wait.mean()) if len(wait) else "—", border=True,
                 help="Average business days from the borrower's request to a complete package, for this loan's draws "
                      "with a package date.")
     m[1].metric("Draws measured", f"{len(wait)} of {len(g)}", border=True)
-    if DELAY_REASONS:
-        m[2].metric("Most common hold-up", reasons.value_counts().index[0] if len(reasons) else "—", border=True)
+    m[2].metric("Most common hold-up", top[0] if top else "None noted", border=True,
+                help="What this loan's draw notes most often say it was waiting on (routine inspections aside).")
 
 
 def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
-    draw_no = _txt(row.get("Loan_Advance_Number__c")) or _txt(row.get("Name")) or "draw"
+    """One draw: what it funded and how long it took, what held it up, its latest note, a timeline of what actually
+       happened (with each approver), the construction dollars, and the full notes."""
     rid = _txt(row.get("Id"))
     head = st.columns([4, 1])
     status = _txt(row.get("Status__c"))
-    prop = _txt(row.get("Name"))
-    head[0].markdown(f"**Draw {draw_no}**" + (f" · {prop}" if prop and prop != draw_no else "")
-                     + (f" &nbsp; :blue-badge[{status}]" if status else ""))
+    head[0].markdown(f"**Draw {_md(_draw_no(row))}**" + (f" &nbsp; :blue-badge[{_md(status)}]" if status else ""))
     if rid:
         head[1].link_button("Open in Salesforce", f"{inst.rstrip('/')}/{rid}", icon=":material/open_in_new:",
                             width="stretch")
     a = ap.loc[rid] if rid and rid in ap.index else None
-    reasons = delay_labels(row.get(NOTES_FIELD), a.get("Approval comments") if a is not None else None)
+    reasons = delay_labels(row.get(NOTES_FIELD))
     m = st.columns(4)
     m[0].metric("Funded", money(row.get(NET_FIELD)) if pd.notna(row.get(NET_FIELD)) else "—", border=True)
     m[1].metric("Turn-time", _bd(row.get("_fund_bd")), border=True,
@@ -1753,81 +2539,137 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str):
     m[3].metric("Request → wire", _bd(row.get("_days")), border=True)
     if reasons:
         st.markdown("**Held up by:** " + " ".join(f":orange-badge[{r}]" for r in reasons))
+    latest = latest_entry(row.get(NOTES_FIELD), _d(row.get("_wire")) or _d(row.get("_lg_req")))
+    if latest:
+        st.caption(f":material/history: **Latest note, {_mdy(latest[0])}:** {_md(latest[1])}")
+    lg = [f"{lbl} {money(row.get(col)).replace('$', chr(92) + '$')}" for lbl, col in
+          (("requested", "_lg_requested"), ("approved", "_lg_amount"))
+          if pd.notna(pd.to_numeric(row.get(col), errors="coerce"))]
+    lg += [f"status {_md(row.get('_lg_status'))}"] if _txt(row.get("_lg_status")) else []
+    payees = row.get("_lg_payees")
+    lg += [f"paid to {', '.join(_md(p) for p in payees)}"] if isinstance(payees, (list, tuple)) and payees else []
+    facts = (["**Land Gorilla:** " + " · ".join(lg)] if lg else []) + (
+        [f"**Inspection:** {_md(row.get('Inspection_Method__c'))}"] if _txt(row.get("Inspection_Method__c")) else [])
+    if facts:
+        st.caption("  ·  ".join(facts))
 
-    dates = {label: _d(row.get(field)) for label, field in MILESTONES}
-    dates["Requested"] = _d(row.get("_lg_req"))                 # Land Gorilla's request date
-    dates["Full draw package received"] = _d(row.get("_pkg"))
-    dates["Wired"] = _d(row.get("_wire"))                       # Land Gorilla's funding date
-    steps = pd.DataFrame({"Milestone": list(dates), "Date": pd.to_datetime(list(dates.values()))})
-    steps["Done"] = steps["Date"].notna()
-    st.dataframe(steps, hide_index=True, width="stretch",
-                 column_config={"Date": st.column_config.DateColumn(format="M/D/YYYY"),
-                                "Done": st.column_config.CheckboxColumn(width="small")})
+    tl = _timeline(row, a)
+    if len(tl):
+        st.dataframe(tl, hide_index=True, width="stretch",
+                     column_config={"Date": st.column_config.DateColumn(format="M/D/YYYY", width="small"),
+                                    "Step": st.column_config.TextColumn(width="medium"),
+                                    "By": st.column_config.TextColumn(help="Who did it, where the record says")})
     if _txt(row.get("_check")):
         st.caption(f":material/error: {row['_check']}")
-    if a is not None and _txt(a.get("Approved by")):
-        when = f" on {_mdy(a['Approved on'])}" if pd.notna(a.get("Approved on")) else ""
-        st.markdown(f":material/verified: **Approved by {a['Approved by']}**{when}")
-        if _txt(a.get("Approval comments")):
-            st.caption(_txt(a["Approval comments"]).replace("\n", "  \n"))
-    elif _txt(row.get("LastModifiedBy.Name")):
+    if a is not None and _txt(a.get("Approval comments")):
+        st.caption("**Approval comments:**  \n" + _md(a["Approval comments"]).replace("\n", "  \n"))
+    elif (a is None or not _txt(a.get("Approved by"))) and _txt(row.get("LastModifiedBy.Name")):
         when = _d(row.get("LastModifiedDate"))
-        st.caption(f"Last updated by {row['LastModifiedBy.Name']}" + (f" on {_mdy(when)}" if when else ""))
+        st.caption(f"Last updated by {_md(row['LastModifiedBy.Name'])}" + (f" on {_mdy(when)}" if when else ""))
     vals = pd.to_numeric(pd.Series([row.get(f) for f, _ in CONSTRUCTION_FIELDS]), errors="coerce")
     money_bits = [f"{lbl}: {money(v)}" for (_, lbl), v in zip(CONSTRUCTION_FIELDS, vals) if pd.notna(v) and v]
-    if money_bits:
-        st.caption("  ·  ".join(money_bits))
+    if money_bits:                                  # "$" escaped: two of them would turn the text between into math
+        st.caption("  ·  ".join(money_bits).replace("$", "\\$"))
     note = _txt(row.get(NOTES_FIELD))
     if note:
         with st.expander("Notes", icon=":material/sticky_note_2:"):
             st.text(note)
 
 
+@sf_fragment
 def _accounts_view(inst, tok, rt, sel, same_day):
-    """Which borrowers keep taking longest to get to a full package — a relationship view, not a KPI."""
-    st.caption("How long each account's borrowers take to get to a full draw package, and what usually holds them "
-               "up. Built from draws wired in the window you pick.")
+    """Which borrowers keep taking longest to get to a full package, and what their draws were waiting on — a
+       relationship view, not a KPI. A fragment, so picking an account doesn't redraw the search results."""
+    st.caption("How long each account's borrowers take to get to a full draw package, and what their draws were "
+               "waiting on. Built from draws wired in the window you pick.")
     c = st.columns([1.2, 1, 2])
     days = c[0].selectbox("Window", [30, 60, 90, 180], index=2, format_func=lambda d: f"Last {d} days",
                           key="acct_window")
     min_draws = c[1].number_input("At least this many draws", 1, 20, 3, key="acct_min")
-    if not c[2].button("Build the list", icon=":material/groups:", key="acct_build"):
+    params = (int(days), int(same_day))
+    if c[2].button("Build the list", icon=":material/groups:", key="acct_build"):
+        start = max(_today() - timedelta(days=int(days)), PKG_LAUNCH.date())
+        with st.spinner("Loading draws and Land Gorilla dates…"):
+            df = apply_lg_correction(add_intervals(run_soql(
+                inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                           f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={_today():%Y-%m-%d}")),
+                lg_config(), same_day)
+            out = []
+            if not df.empty:
+                df["_acct"] = _col(df, "Deal__r.Account.Name").map(_txt).replace("", "(no account)")
+                df["_keys"] = [delay_keys(n) for n in _col(df, NOTES_FIELD)]
+                for acct, g in df.groupby("_acct"):
+                    wait = pd.to_numeric(g["_wait_bd"], errors="coerce").dropna()
+                    total = pd.to_numeric(g["_days"], errors="coerce").dropna()
+                    top, who, _n = _waiting_summary(g["_keys"])
+                    out.append({"Account": acct, "Draws": len(g), "Loans": g["Loan_Number__c"].nunique(),
+                                "Days to a full package (avg)": round(wait.mean(), 1) if len(wait) else None,
+                                "Days to a full package (median)": wait.median() if len(wait) else None,
+                                "Over 5 days": (wait > 5).mean() if len(wait) else None,
+                                "Request → wire (median)": total.median() if len(total) else None,
+                                "Usual hold-ups": top, "Mostly waiting on": who})
+        st.session_state["acct_data"] = (params, start, df, pd.DataFrame(out))    # kept while you look around
+    data = st.session_state.get("acct_data")
+    if not data:
         return
-    start = max(_today() - timedelta(days=int(days)), PKG_LAUNCH.date())
-    with st.spinner("Loading draws and Land Gorilla dates…"):
-        df = apply_lg_correction(add_intervals(run_soql(
-            inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {WIRE_FIELD}>={start:%Y-%m-%d} "
-                       f"AND {WIRE_FIELD}<={_today():%Y-%m-%d}")), lg_config(), same_day)
+    if data[0] != params:
+        st.info("The window changed — click **Build the list** to rebuild it.", icon=":material/refresh:"); return
+    _, start, df, everyone = data
     if df.empty:
         st.info("No draws were wired in that window."); return
-    df["_acct"] = _col(df, "Deal__r.Account.Name").map(_txt).replace("", "(no account)")
-    df["_reasons"] = [delay_labels(n) for n in _col(df, NOTES_FIELD)]
-    out = []
-    for acct, g in df.groupby("_acct"):
-        wait = pd.to_numeric(g["_wait_bd"], errors="coerce").dropna()
-        if len(g) < min_draws:
-            continue
-        top = pd.Series([r for rs in g["_reasons"] for r in rs]).value_counts()
-        out.append({"Account": acct, "Draws": len(g), "Loans": g["Loan_Number__c"].nunique(),
-                    "Days to a full package (avg)": round(wait.mean(), 1) if len(wait) else None,
-                    "Days to a full package (median)": wait.median() if len(wait) else None,
-                    "Over 5 days": (wait > 5).mean() if len(wait) else None,
-                    **({"Usual hold-ups": list(top.index[:3])} if DELAY_REASONS else {})})
-    if not out:
+    res = everyone[everyone["Draws"] >= min_draws] if len(everyone) else everyone
+    if res.empty:
         st.info("No account has enough draws in that window."); return
-    res = pd.DataFrame(out).sort_values("Days to a full package (avg)", ascending=False, na_position="last")
-    st.caption(f"Since {_mdy(start)} · draws with a full-package date only (it began Aug 3, 2026).")
-    st.dataframe(res, hide_index=True, width="stretch", height=480, column_config={
+    res = res.sort_values(["Days to a full package (avg)", "Account"], ascending=[False, True], na_position="last")
+    st.caption(f"Since {_mdy(start)} · days to a full package count draws with a package date only (it began "
+               "Aug 3, 2026) · hold-ups come from the draw notes.")
+    st.dataframe(res, hide_index=True, width="stretch", height=420, column_config={
         "Days to a full package (avg)": st.column_config.NumberColumn(format="%.1f bd"),
         "Days to a full package (median)": st.column_config.NumberColumn(format="%d bd"),
         "Over 5 days": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1,
                                                        help="Share of the account's draws that took more than 5 "
                                                             "business days to reach a full package"),
-        "Usual hold-ups": st.column_config.ListColumn()})
+        "Request → wire (median)": st.column_config.NumberColumn(format="%d bd",
+                                                                 help="Business days from the request to the wire"),
+        "Usual hold-ups": st.column_config.ListColumn(help="What the account's draw notes most often say they were "
+                                                           "waiting on (routine inspections aside)"),
+        "Mostly waiting on": st.column_config.TextColumn(help="Who most of those hold-ups were on: the borrower, "
+                                                              "third parties (inspector, title), CoreVest, or "
+                                                              "loan changes (extension, payoff)")})
+    acct = st.selectbox("See an account's draws", list(res["Account"]), index=None,
+                        key=f"acct_pick_{days}_{min_draws}", placeholder="Pick an account to see what each draw "
+                                                                         "was waiting on")
+    if acct:
+        _account_draws(df[df["_acct"] == acct], acct, inst)
+
+
+def _account_draws(d: pd.DataFrame, acct: str, inst: str):
+    """One account's draws, most recent request first: how long each took and what it was waiting on."""
+    d = _by_date(d)
+    notes = _col(d, NOTES_FIELD)
+    t = pd.DataFrame({
+        "Loan #": _col(d, "Loan_Number__c").values, "Draw #": _draw_nos(d),
+        "Deal": _col(d, "Deal__r.Name").values, "Requested": _dates(_col(d, "_lg_req")).values,
+        "Package received": _dates(_col(d, "_pkg")).values, "Wired": _dates(_col(d, "_wire")).values,
+        "Days to a full package (bd)": pd.to_numeric(_col(d, "_wait_bd"), errors="coerce").values,
+        "Request → wire (bd)": pd.to_numeric(_col(d, "_days"), errors="coerce").values,
+        "Held up by": [delay_labels(n) for n in notes],
+        "What the notes say": [" · ".join(delay_evidence(n)) or None for n in notes],
+        "Salesforce": _col(d, "Id").map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i
+                                        else None).values,
+    })
+    _top, who, counts = _waiting_summary([delay_keys(n) for n in notes])
+    line = f"**{_md(acct)}** · {len(d)} draw(s)"
+    if who:
+        line += (f" · mostly waiting on **{who}** · usual hold-ups: "
+                 + ", ".join(f"{_md(r).lower()} ({n})" for r, n in counts.head(3).items()))
+    st.markdown(line)
+    st.dataframe(t, hide_index=True, width="stretch", column_config=_table_config())
 
 
 def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
-    m = st.columns(4)
+    has_metrics = any(ov.get(k) is not None for k in ("project_pct", "to_finish", "balance", "last_draw"))
+    m = st.columns(4) if has_metrics else [None] * 4          # (no metric is drawn when there are none)
     if ov.get("project_pct") is not None:
         pct = float(ov["project_pct"])
         m[0].metric("Project complete", f"{pct:.0f}%", border=True)
@@ -1838,17 +2680,22 @@ def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
         m[2].metric("Loan balance", money(ov["balance"]), border=True)
     if ov.get("last_draw"):
         m[3].metric("Last draw", _mdy(ov["last_draw"]), border=True)
-    bits = [f"**{lbl}:** {_mdy(ov[key]) if isinstance(ov[key], date) else ov[key]}"
+    bits = [f"**{lbl}:** {_mdy(ov[key]) if isinstance(ov[key], date) else _md(ov[key])}"
             for lbl, key in [("Status", "status"), ("Program", "program"), ("Funded", "funded_date"),
                              ("Due", "due_date")] if ov.get(key)]
-    loc = " ".join(x for x in [ov.get("city"), ov.get("state")] if x)
+    loc = " ".join(_txt(x) for x in [ov.get("city"), ov.get("state")] if x)
     if loc:
-        bits.append(f"**Location:** {loc}")
+        bits.append(f"**Location:** {_md(loc)}")
     if bits:
         st.caption("  ·  ".join(bits))
     if ov.get("risk"):
-        st.caption("**Risk:** " + " · ".join(ov["risk"]))
-    draws = lg_draws(cfg["user"], cfg["password"], bool(cfg.get("verify", True)), _col(g, CONTAINER_FIELD).tolist())
+        st.caption("**Risk:** " + " · ".join(_md(r) for r in ov["risk"]))
+    try:
+        draws = lg_draws(cfg["user"], cfg["password"], bool(cfg.get("verify", True)),
+                         _col(g, CONTAINER_FIELD).tolist())
+    except Exception as exc:          # no exception text: a malformed secret would be echoed to every viewer
+        st.caption(f"Land Gorilla's draw details are unavailable right now ({type(exc).__name__}).")
+        draws = {}
     rows_, payees = [], []
     for _, row in g.iterrows():
         det = draws.get(row.get(CONTAINER_FIELD)) if isinstance(row.get(CONTAINER_FIELD), str) else None
@@ -1864,6 +2711,7 @@ def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
         ddf = pd.DataFrame(rows_)
         for col in ("Requested", "Submitted", "Funded"):
             ddf[col] = _dates(ddf[col])
+        ddf = ddf.sort_values("Requested", ascending=False, na_position="last", kind="stable")   # newest first
         ddf["Amount"] = pd.to_numeric(ddf["Amount"], errors="coerce")
         dcol = st.column_config.DateColumn(format="M/D/YYYY")
         st.dataframe(ddf, hide_index=True, width="stretch",
@@ -1936,12 +2784,15 @@ def render_funding_request(inst, tok, rt):
     preview = pd.DataFrame({"Loan #": _col(rows, "B"), "Property": _col(rows, "F"), "Deal": _col(rows, "C"),
                             "Borrower": _col(rows, "D"), "Status": _col(rows, "Status__c"),
                             "Current draw": pd.to_numeric(_col(rows, "U"), errors="coerce"),
-                            "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name")})
+                            "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name"),
+                            "Held up by": [delay_labels(n) for n in _col(rows, "AF")]})
     st.dataframe(preview, hide_index=True, width="stretch", height=360,
-                 column_config={"Current draw": st.column_config.NumberColumn(format="dollar", step=1)})
+                 column_config={"Current draw": st.column_config.NumberColumn(format="dollar", step=1),
+                                "Held up by": st.column_config.ListColumn(help="What the draw's notes say it was "
+                                                                                "waiting on")})
 
 
-@st.fragment
+@sf_fragment
 def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope):
     if st.button(f"Build funding-request file ({len(rows):,} draws {scope})", type="primary",
                  icon=":material/build:", disabled=rows.empty, key="fr_build"):
@@ -2021,17 +2872,8 @@ def main():
         pg.run()
         st.session_state.pop("_sf_retried", None)
     except Exception as exc:
-        msg = str(exc)
-        if "INVALID_SESSION_ID" in msg or "Session expired" in msg:
-            try:
-                sf_login_credentials.clear()          # force a fresh login on the credentials path
-            except Exception:
-                pass
-            clear_sf_session()
-            if not st.session_state.get("_sf_retried"):  # reload once; a second failure stops with a message
-                st.session_state["_sf_retried"] = True
-                st.rerun()
-            st.warning("Your Salesforce session expired — refresh the page to log in again."); st.stop()
+        if _session_expired(exc):
+            _restart_session()
         raise
 
 
