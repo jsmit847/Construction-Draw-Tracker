@@ -22,9 +22,11 @@ Two lenses on the same data, plus an export:
   • Funding-request file — Melanie's weekly "Construction/Renovation Funding Request"
     workbook, filled from Salesforce into the committed template (Advance_template.xlsx).
 
-Secrets (.streamlit/secrets.toml): [salesforce] (username/password/security_token, or
-OAuth client_id/client_secret/redirect_uri/auth_host) and [landgorilla] (user, password,
-verify).  Run:  streamlit run draw_dashboard.py
+Secrets (.streamlit/secrets.toml — see .streamlit/secrets.toml.example): [salesforce]
+(username/password/security_token, or OAuth client_id/client_secret/redirect_uri/auth_host),
+[landgorilla] (user, password, verify), and — only on the deployment whose URL is the approved
+Salesforce callback, which runs this file — [relay] forward_to. The main deployment runs streamlit_app.py,
+which imports this file and so never relays.  Run:  streamlit run draw_dashboard.py
 """
 from __future__ import annotations
 
@@ -51,6 +53,25 @@ except Exception:
     alt = None
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from simple_salesforce import Salesforce
+
+# ─────────────── OAuth relay (only on the deployment Salesforce redirects back to) ───────────────
+# The Salesforce connected app approves one callback URL: the original deployment's. When that deployment has
+# a [relay] forward_to secret, it hands this app's logins (state starting OAUTH_STATE_PREFIX) on to forward_to,
+# which holds the PKCE verifier and exchanges the code itself. The destination comes only from secrets, never
+# from the request, so this can't be used as an open redirect. Deployments without [relay] skip it entirely, and
+# so does a deployment that imports this file instead of running it (streamlit_app.py).
+OAUTH_STATE_PREFIX = "cdt"
+if __name__ == "__main__":
+    try:
+        _forward_to = str(st.secrets.get("relay", {}).get("forward_to") or "").strip()
+    except Exception:                                   # no secrets.toml at all (e.g. a local checkout)
+        _forward_to = ""
+    _code, _state = st.query_params.get("code"), str(st.query_params.get("state") or "")
+    if _forward_to and _code and _state.startswith(OAUTH_STATE_PREFIX):
+        st.query_params.clear()                         # the unused code leaves the address bar; only the link has it
+        st.link_button("Open Construction Draw Tracker", _forward_to + ("&" if "?" in _forward_to else "?")
+                       + urlencode({"code": _code, "state": _state}))
+        st.stop()
 
 # ───────────────────────────── domain constants ─────────────────────────────
 CONSTRUCTION_DEV_NAME = "Construction_Advance"
@@ -149,7 +170,7 @@ def _pkce_pair() -> tuple[str, str]:
 
 
 def login_url(cfg: dict[str, str]) -> str:
-    state = secrets.token_urlsafe(24)
+    state = OAUTH_STATE_PREFIX + secrets.token_urlsafe(24)    # the prefix lets the callback deployment relay it
     verifier, challenge = _pkce_pair()
     store = _pkce_store(); store[state] = verifier
     if len(store) > 50:
