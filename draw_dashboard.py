@@ -4082,9 +4082,13 @@ def upcoming_draws(inst: str, tok: str, rt: str, after: date) -> tuple[pd.DataFr
     where = (f"Status__c != null AND Status__c NOT IN ({','.join(repr(s) for s in UPCOMING_EXCLUDE)}) "
              f"AND ({WIRE_FIELD}=null OR {WIRE_FIELD}>{after:%Y-%m-%d})")
     rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
-    one = _per_draw(rows)
+    return _draw_amounts(_per_draw(rows)), ftypes
+
+
+def _draw_amounts(one: pd.DataFrame) -> pd.DataFrame:
+    """One row per draw, at the approved draw total, else Land Gorilla's requested amount, else Salesforce's."""
     if one.empty:
-        return one, ftypes
+        return one
     asked, cfg = {}, lg_config()
     if cfg:
         try:
@@ -4098,24 +4102,43 @@ def upcoming_draws(inst: str, tok: str, rt: str, after: date) -> tuple[pd.DataFr
     sf_ask = pd.to_numeric(_col(one, "_pa_req"), errors="coerce")
     one["U"] = (gross.where(gross > 0, lg_ask.where(lg_ask > 0)).fillna(sf_ask.where(sf_ask > 0))
                 .fillna(pd.to_numeric(one["U"], errors="coerce")))
-    return one, ftypes
+    return one
 
 
-def _upcoming_picker(one: pd.DataFrame, key: str, tick_loc: bool = False) -> pd.DataFrame:
-    """Melanie's pick of upcoming draws for the top of the file — nothing is ticked to start (tick_loc ticks every
-       credit-line draw, which she usually puts on top). Credit lines come first. She labels each (Monday, next
-       week…), says whether it counts in this file's total, and can fix the amount, comment and bank."""
+def _draw_refs(text: str) -> list:
+    """'60429-8, 58064-10' -> [('60429', '8'), ('58064', '10')]: loan # and draw #, separated by '-', '#' or '/'."""
+    return list(dict.fromkeys(re.findall(r"(\d{3,})\s*[-#/]\s*(\d{1,3})(?!\d)", _txt(text))))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def draws_by_number(inst: str, tok: str, rt: str, refs: tuple) -> tuple[pd.DataFrame, dict]:
+    """The draws named by loan # and draw #, whatever their status — open, in approval or already wired — one row per
+       draw like upcoming_draws, for rebuilding a list whose top-row draws have moved on since."""
+    if not refs:
+        return pd.DataFrame(), {}
+    conds = " OR ".join(f"(Loan_Number__c='{soql_escape(loan)}' AND (Name='{soql_escape(no)}' OR "
+                        f"Loan_Advance_Number__c='{soql_escape(loan)}-{soql_escape(no)}' OR "
+                        f"Loan_Advance_Number__c='{soql_escape(no)}'))" for loan, no in refs)
+    rows, ftypes, _ = funding_request_rows(inst, tok, rt, f"({conds})")
+    return _draw_amounts(_per_draw(rows)), ftypes
+
+
+def _upcoming_picker(one: pd.DataFrame, key: str, tick_loc: bool = False, ticked=()) -> pd.DataFrame:
+    """Melanie's pick of upcoming draws for the top of the file — nothing is ticked to start except draws added by
+       number (ticked); tick_loc ticks every credit-line draw, which she usually puts on top. Credit lines come first.
+       She labels each (Monday, next week…), says whether it counts in this file's total, and can fix the amount,
+       comment and bank."""
     loans = _col(one, "B").map(_loan_key)
     loc = [_txt(k) == "LOC_Loan" for k in _col(one, "Deal_RecordType__c")]
     t = pd.DataFrame({
-        "Put on top": [bool(tick_loc and x) for x in loc],
+        "Put on top": [bool(tick_loc and x) or i in set(ticked) for x, i in zip(loc, _col(one, "Id"))],
         "Label": "", "Count in total": False, "Loan #": loans.values, "Draw #": _draw_nos(one),
         "Deal": _col(one, "C").values, "Stage": _col(one, "Status__c").values,
         "Planned wire": _dates(_col(one, WIRE_FIELD)).values,
         "Amount": pd.to_numeric(_col(one, "U"), errors="coerce").values, "Comment": "", "Funding to": "",
-        "Id": _col(one, "Id").values, "_loc": loc})
-    t = t.sort_values(["_loc", "Planned wire", "Loan #"], ascending=[False, True, True], na_position="last",
-                      kind="stable").drop(columns="_loc").reset_index(drop=True)
+        "Id": _col(one, "Id").values, "_loc": loc, "_add": [i in set(ticked) for i in _col(one, "Id")]})
+    t = t.sort_values(["_add", "_loc", "Planned wire", "Loan #"], ascending=[False, False, True, True],
+                      na_position="last", kind="stable").drop(columns=["_loc", "_add"]).reset_index(drop=True)
     C = st.column_config
     return st.data_editor(t, key=key, hide_index=True, width="stretch", height=min(420, 40 + 35 * len(t)),
                           column_order=[c for c in t.columns if c != "Id"],
@@ -4272,26 +4295,60 @@ def render_funding_request(inst, tok, rt, sel, same_day):
                     column_config={"Net": st.column_config.NumberColumn(format="dollar", help="Net funding")})
                 why[_col(rows, "Id").isin(set(back.loc[back["Add back"].astype(bool), "Id"]))] = ""
         rows = rows[why == ""].assign(_label="Funded")
+        if not rows.empty and "Id" in rows:                # draws she leaves off by choice
+            per = rows.groupby("Id", sort=False).agg(B=("B", "first"), C=("C", "first"),
+                                                       U=("U", lambda s: pd.to_numeric(s, errors="coerce").sum()))
+            nos = dict(zip(rows["Id"], _draw_nos(rows)))
+            wires = dict(zip(rows["Id"], _dates(_col(rows, WIRE_FIELD))))
+            leave = st.multiselect(
+                "Leave off wired draws (optional)", list(per.index), key=f"fr_leave_{where}",
+                placeholder="None — every wired draw above goes on the list",
+                format_func=lambda i: (f"{_loan_key(per.at[i, 'B'])}-{nos.get(i)} · {_txt(per.at[i, 'C'])} · "
+                                       f"{money(per.at[i, 'U'])}" + (f" · wired {_mdy(wires[i])}"
+                                                                      if pd.notna(wires.get(i)) else "")),
+                help="For wired draws Melanie leaves off by choice — say, ones wired after she sent the list (her 9/17 "
+                     "list left off four wired late that afternoon), or ones she already had on top of an earlier list.")
+            rows = rows[~rows["Id"].isin(set(leave))]
         one, otypes = upcoming_draws(inst, tok, rt, max(hi, today))     # a wire date already past isn't "planned"
         if not one.empty:                    # live requests, plus draws already given a wire date after the window
             one = one[one["Id"].isin(set(_col(live, "Id"))) | (_col(one, WIRE_FIELD).map(_txt) != "")]
-        if not one.empty:
-            past = sent < today
-            with st.expander(f"Upcoming draws for the top of the file ({len(one)} open draws to pick from)",
-                             icon=":material/upcoming:", expanded=not past):
-                if past:
-                    st.warning(f"These are draws open **today**, not on {_mdy(sent)}. To rebuild that week's list, "
-                               "leave them unticked — the draws Melanie had on top then have been wired since.",
-                               icon=":material/history:")
+        past, added = sent < today, pd.DataFrame()
+        with st.expander(f"Upcoming draws for the top of the file ({len(one)} open draws to pick from)",
+                         icon=":material/upcoming:", expanded=not past):
+            if past:
+                st.warning(f"These are draws open **today**, not on {_mdy(sent)}. To rebuild that week's list, leave "
+                           "them unticked and add the draws Melanie had on top by number below — they've moved on "
+                           "since.", icon=":material/history:")
+            _keep("fr_add", "")
+            refs = tuple(_draw_refs(_kept("fr_add", st.text_input(
+                "Add draws by number", key="fr_add", placeholder="e.g. 60429-8, 58064-10",
+                help="Loan # and draw # of any draw — open, in approval or already wired — to put it on top, one row "
+                     "per draw. For rebuilding an old list, or a draw the list below doesn't show."))))
+            if refs:
+                added, atypes = draws_by_number(inst, tok, rt, refs)
+                found = {(_loan_key(b), str(n)) for b, n in zip(_col(added, "B"), _draw_nos(added))}
+                missing = [f"{loan}-{no}" for loan, no in refs if (loan, no) not in found]
+                if missing:
+                    st.caption(f":orange[Not found in Salesforce: {', '.join(missing)}]")
+                if not added.empty:
+                    one = pd.concat([added, one[~_col(one, "Id").isin(set(added["Id"]))]], ignore_index=True)
+                    otypes = {**otypes, **atypes}
+            if one.empty:
+                st.caption("No open draws to pick from.")
+            else:
                 st.caption("Draw requests not wired yet, or with a planned wire date after the window — credit lines "
-                           "first. Nothing is ticked to start: tick the draws that go on top, one row each.")
+                           "first. Nothing is ticked to start (except draws added by number): tick the draws that go "
+                           "on top, one row each.")
                 tick_loc = st.toggle("Tick every credit-line draw", key="fr_tick_loc",
                                      help="Melanie usually puts credit-line draws on top. This ticks all of them to "
                                           "start; untick any she doesn't want.")
-                pick = _upcoming_picker(one, key=f"fr_up_{hi}_{int(tick_loc)}", tick_loc=tick_loc)
+                pick = _upcoming_picker(one, key=f"fr_up_{hi}_{int(tick_loc)}_{'_'.join('.'.join(r) for r in refs)}",
+                                        tick_loc=tick_loc, ticked=tuple(_col(added, "Id")))
+        if not one.empty:
             sel_ = pick[pick["Put on top"].astype(bool)]
             if len(sel_):
                 top = one.set_index("Id").loc[sel_["Id"]].reset_index()
+                rows = rows[~_col(rows, "Id").isin(set(top["Id"]))]         # a draw on top isn't repeated below
                 top["U"] = pd.to_numeric(sel_["Amount"], errors="coerce").values
                 top["_label"] = [(_txt(x) or "Upcoming") for x in sel_["Label"]]
                 top["_comment"] = [_txt(x) for x in sel_["Comment"]]
