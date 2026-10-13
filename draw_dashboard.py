@@ -1144,17 +1144,17 @@ def funded_by_quarter(inst: str, tok: str, rt: str, since: str, until: str) -> p
 
 
 def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame, as_of: date | None = None) -> dict:
-    """Figures for the workbook's Total Summary sheet: quarterly totals since 2021, this month to date, and this
+    """Figures for the running-totals block under the list: quarterly totals since 2021, this month to date, and this
        request's wired draws — each with the FNF (single-asset bridge) share, all at gross approved amounts. As of
        the list's submitted date (default today), so a rebuilt old list shows that month."""
     today = as_of or _today()
     quarters = funded_by_quarter(inst, tok, rt, "2021-01-01", f"{today:%Y-%m-%d}")
     month = funded_by_quarter(inst, tok, rt, f"{today.replace(day=1):%Y-%m-%d}", f"{today:%Y-%m-%d}")
     u = pd.to_numeric(_col(rows, "U"), errors="coerce").fillna(0)
-    label = _col(rows, "_label").map(_txt)
-    if label.ne("").any():          # the weekly list: wired rows say Funded; upcoming ones count only if she said so
-        wired = label.str.startswith("Funded")
-        pending = ~wired & _col(rows, "_count").map(lambda x: x is True or x is np.True_)
+    top = _col(rows, "_top").map(lambda x: x is True or x is np.True_).astype(bool)
+    if top.any() or _col(rows, "_label").map(_txt).str.startswith("Funded").any():
+        wired = ~top                 # the weekly list: draws put on top count only if ticked "Count in total"
+        pending = top & _col(rows, "_count").map(lambda x: x is True or x is np.True_).astype(bool)
     else:
         wired = _col(rows, WIRE_FIELD).map(_txt) != ""
         pending = ~wired
@@ -1166,55 +1166,70 @@ def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame, as_of: date |
             "req_fnf": float(u[wired & fnf].sum()), "req_fnf_n": int(ids[wired & fnf].nunique())}
 
 
-def _write_total_summary(wb, summary: dict) -> None:
-    """Replace the template's hard-coded 2024 ledger with figures computed from Salesforce, at gross approved amounts
-       (as her running totals are), with the FNF (single-asset bridge) share beside each."""
-    from openpyxl.styles import Font
-    if "Total Summary" not in wb.sheetnames:
-        return
-    ws = wb["Total Summary"]
-    money_fmt = ws["D6"].number_format or '"$"#,##0'
-    if money_fmt == "General":
-        money_fmt = '"$"#,##0'
-    for row in ws.iter_rows(min_row=1, max_row=max(ws.max_row, 60), max_col=12):
-        for c in row:
-            c.value = None
-    today = summary.get("as_of") or _today()
-    now = (today.year, (today.month - 1) // 3 + 1)
-    bold = Font(bold=True)
+def _write_totals_block(ws, top: int, summary: dict) -> int:
+    """Her running-totals block under the list, as in every one of her weekly files: "This Month" (this file's Total
+       plus the month's earlier wires), then per year a Q1–Q4 / TOTAL grid and, from 2024, the FNF grid — figures from
+       Salesforce (by wire date, gross approved amounts). Returns the last row written."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    f, fb = Font(name="Calibri", size=10), Font(name="Calibri", size=10, bold=True)
+    fbu = Font(name="Calibri", size=10, bold=True, underline="single")
+    thin = Side(style="thin")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    grey = PatternFill("solid", fgColor="F2F2F2")
+    C, R, L = Alignment(horizontal="center"), Alignment(horizontal="right"), Alignment(horizontal="left")
 
-    def line(r, label, n, amt, fnf_n, fnf_amt):
-        ws.cell(r, 2, label)
-        ws.cell(r, 3, n)
-        ws.cell(r, 4, amt).number_format = money_fmt
-        ws.cell(r, 5, fnf_n)
-        ws.cell(r, 6, fnf_amt).number_format = money_fmt
-    for c, title in zip(range(2, 7), ("This Month", "Draws", "Funded", "FNF draws", "FNF funded")):
-        ws.cell(2, c, title).font = bold
-    pend = summary.get("pending", 0.0)
-    line(3, "Month to date" + (" + pending" if pend else ""), summary.get("mtd_n", 0), summary["mtd"] + pend,
-         summary.get("mtd_fnf_n", 0), summary.get("mtd_fnf", 0.0))
-    line(4, "This request (wired)", summary.get("req_n", 0), summary.get("req", 0.0), summary.get("req_fnf_n", 0),
-         summary.get("req_fnf", 0.0))
+    def put(r, c, v=None, font=f, al=None, nf=None, border=None, fill=None):
+        cell = ws.cell(r, c)
+        if v is not None:
+            cell.value = v
+        cell.font = font
+        for attr, val in (("alignment", al), ("number_format", nf), ("border", border), ("fill", fill)):
+            if val is not None:
+                setattr(cell, attr, val)
+
+    def plus(x):
+        return f"{x:+.2f}" if abs(x) >= 0.005 else ""
+    as_of = summary.get("as_of") or _today()
+    now = (as_of.year, (as_of.month - 1) // 3 + 1)
     q = summary["quarters"]
-    years = sorted({int(y) for y in q["y"]} | {today.year}, reverse=True)
-    r = 6
-    for y in years:
-        for c, title in zip(range(2, 7), (f"{y} TOTALS", "Draws", "Funded", "FNF draws", "FNF funded")):
-            ws.cell(r, c, title).font = bold
+
+    def qv(y, n, col):
+        m = q[(q["y"] == y) & (q["q"] == n)]
+        return float(m[col].sum()) if col.endswith("amt") else int(m[col].sum())
+    put(top, 2, "This Month", fbu, C)
+    earlier = summary["mtd"] - summary["req"]                 # this month's wires that aren't on this list
+    put(top + 1, 2, "=E6" + plus(earlier) if earlier > -0.005 else summary["mtd"] + summary.get("pending", 0.0),
+        fb, C, _ACCT)
+    r = top + 3
+    for y in sorted({int(y) for y in q["y"]} | {as_of.year}, reverse=True):
+        put(r, 2, f"{y} TOTALS", fb, C)
         for n in range(1, 5):
-            ws.cell(r + n, 2, f"Q{n}" + (" (running)" if (y, n) == now else ""))
-            if (y, n) <= now:
-                m = q[(q["y"] == y) & (q["q"] == n)]
-                line(r + n, f"Q{n}" + (" (running)" if (y, n) == now else ""), int(m["n"].sum()),
-                     float(m["amt"].sum()), int(m["fnf_n"].sum()), float(m["fnf_amt"].sum()))
-        ws.cell(r + 5, 2, "TOTAL").font = bold
-        for c in range(3, 7):
-            col = "CDEF"[c - 3]
-            ws.cell(r + 5, c, f"=SUM({col}{r + 1}:{col}{r + 4})").number_format = (money_fmt if col in "DF"
-                                                                                  else "General")
-        r += 8
-    ws.cell(r, 2, "Amounts are gross approved draw amounts. FNF = draws on single-asset bridge loans.")
+            put(r + n, 2, f"Q{n}", f, C, border=box)
+            put(r + n, 3, "(running total)" if (y, n) == now else None, f, R, border=box)
+            v = (f"=B{top + 1}" + plus(qv(y, n, "amt") - summary["mtd"]) if (y, n) == now
+                 else qv(y, n, "amt") if (y, n) < now else None)
+            put(r + n, 4, v, f, None, _ACCT, box)
+        put(r + 5, 2, "TOTAL", fb, C, border=box)
+        put(r + 5, 3, None, fb, border=box)
+        put(r + 5, 4, f"=SUM(D{r + 1}:D{r + 4})", fb, None, _ACCT, box)
+        r += 7
+        if y >= 2024:                                          # her FNF grids start in 2024
+            put(r, 2, f"{y} TOTALS", fb, C, fill=grey)
+            put(r, 3, "FNF Included in the above total", fb, L, fill=grey)
+            put(r, 4, None, fb, None, _ACCT, fill=grey)
+            for n in range(1, 5):
+                past = (y, n) <= now
+                put(r + n, 2, f"Q{n}" + (" (running)" if (y, n) == now else ""), f, C, border=box, fill=grey)
+                put(r + n, 3, qv(y, n, "fnf_n") if past else None, f, None, "General", box, grey)
+                put(r + n, 4, qv(y, n, "fnf_amt") if past else None, f, None, _ACCT, box, grey)
+            put(r + 5, 2, "TOTAL", fb, C, border=box, fill=grey)
+            put(r + 5, 3, f"=SUM(C{r + 1}:C{r + 4})", fb, None, "General", box, grey)
+            put(r + 5, 4, f"=SUM(D{r + 1}:D{r + 4})", fb, None, _ACCT, box, grey)
+            r += 7
+    put(r, 2, "Amounts are gross approved draw amounts from Salesforce. FNF = draws on single-asset bridge loans.", f)
+    for rr in range(top - 1, r + 1):
+        ws.row_dimensions[rr].height = 12.0
+    return r
 
 
 LG_COLUMNS = ("U", "AG", "M", "N", "Y")       # columns Land Gorilla can fill where Salesforce has nothing
@@ -1306,15 +1321,17 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
                           funding_date: date, summary: dict | None = None, prep: pd.DataFrame | None = None,
                           window: str | None = None, total_from: int | None = None, notes: bool = False,
                           submitted_on: date | None = None) -> bytes:
-    """Open the committed template, fill the title block, and write one row per draw in its own column order.
-       The other sheets are brought up to date too: Total Summary from Salesforce, the Cap Partners title
-       blocks from this request, the template's stale hidden reference sheet removed, and a Prep worksheet
-       added with everything needed to finish the columns no system holds.
+    """Open the committed template, fill the title block, and write one row per draw in its own column order, laid
+       out the way Melanie's own weekly files are (_melanie_look), with her running-totals block under the list. The
+       Cap Partners title blocks mirror this request, the template's stale reference sheet and Total Summary tab are
+       removed (her workbooks have neither), and a Prep worksheet is added with everything needed to finish the
+       columns no system holds.
        window = the wire window for F4 ('8/13-8/19'); total_from = the first row E6 adds up (rows above it are
        upcoming draws left out of the total); notes = also fill Comments and Funding to from Salesforce's notes and
        Land Gorilla's payees (Melanie clears them). Per-row extras for upcoming draws: _label (column A), _comment and
        _funding_to."""
     import openpyxl
+    from openpyxl.styles import PatternFill
     from openpyxl.utils import column_index_from_string as ci
     wb = openpyxl.load_workbook(template)
     ws = wb[TEMPLATE_SHEET]
@@ -1324,12 +1341,13 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
             wb[name]["D4"] = f"='{TEMPLATE_SHEET}'!E4"
             wb[name]["D5"] = f"='{TEMPLATE_SHEET}'!E5"
             wb[name]["D4"].number_format = wb[name]["D5"].number_format = MEL_DATE
-    if "Sheet1" in wb.sheetnames:                                            # March-2024 servicer data, unused
-        del wb["Sheet1"]
-    if summary:
-        _write_total_summary(wb, summary)
+    for name in ("Sheet1", "Total Summary"):          # March-2024 servicer data; Salesforce's ledger tab (hers has none)
+        if name in wb.sheetnames:
+            del wb[name]
     ws["E4"], ws["E5"] = submitted_on or _today(), funding_date             # submitted date (default today, ET)
     ws["E4"].number_format = ws["E5"].number_format = MEL_DATE
+    for ref in ("E3", "E4", "E5"):
+        ws[ref].fill = PatternFill(fill_type=None)                          # no yellow placeholder, as hers
     if window:
         ws["F4"] = window                                                    # the wire window, as she writes it
     _current_layout(ws)
@@ -1341,8 +1359,6 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
             v = _xl(row.get(col), ftypes.get(col))
             if v is not None:
                 _put(ws, r, ci(col), v)
-                if isinstance(v, date):
-                    ws.cell(r, ci(col)).number_format = "m/d/yyyy"
         for col, key in (("AF", "_comment"), ("AG", "_funding_to")):
             v = row.get(key)
             if isinstance(v, str) and v.strip():
@@ -1350,48 +1366,57 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         maturity = _d(row.get("N"))
         if maturity:                                                         # Estimated Completion Date
             ws.cell(r, ci("AA")).value = maturity - timedelta(days=ESTIMATED_COMPLETION_DAYS)
-            ws.cell(r, ci("AA")).number_format = "m/d/yyyy"
         ws.cell(r, ci("Z")).value = 1                                        # Borrower EC % — 100%, as Salesforce's file
-        label = row.get("_label")
-        if isinstance(label, str) and label.strip():
+        label = row.get("_label")                     # column A holds the row label only (an unmatched portfolio
+        if isinstance(label, str) and label.strip():  # property is flagged on the Prep worksheet)
             _put(ws, r, ci("A"), _xl_text(label.strip()))
-        elif bool(row.get("_multi_property", False)):
-            ws.cell(r, ci("A")).value = "Portfolio loan — couldn't match this draw to one property"
         for col, pattern in MELANIE_FORMULAS.items():     # every input filled and non-zero (no #DIV/0!)
             if all(ws.cell(r, ci(c)).value not in (None, "", 0) for c in re.findall(r"([A-Z]+)\{r\}", pattern)):
                 ws.cell(r, ci(col)).value = pattern.format(r=r)
     first = TEMPLATE_HEADER_ROW + 1
-    last = max(first + len(rows) - 1, total_from or first)
+    n_last = first + len(rows) - 1
+    last = max(n_last, total_from or first)
     ws["E6"] = f"=SUM(U{total_from if total_from and total_from > first else first}:U{last})"   # upcoming draws
-    _melanie_look(ws, first, first + len(rows) - 1)                                          # above it left out
+    _melanie_look(ws, first, n_last)                                                         # above it left out
+    if summary:
+        _write_totals_block(ws, n_last + 2, summary)           # after _melanie_look, which clears the rows below
+    sel = ws.sheet_view.selection[0]
+    sel.activeCell = sel.sqref = f"A{first}"                    # opens on the first list row
     if prep is not None and not prep.empty:
         _write_prep_sheet(wb, prep)
     buf = io.BytesIO(); wb.save(buf)
     return buf.getvalue()
 
 
-# Melanie's own weekly files (7/22, 8/20, 10/02 checked) share every column width, number format and alignment on the
-# request sheet, Calibri 10, a 42.75pt header row and compact data rows; the template came from Salesforce's file.
-MEL_DATE, _MONEY = "mm-dd-yy", r"\$#,##0"
+# Melanie's own weekly files (all six checked: 04.24 through 10.02) share every column width, number format, alignment
+# and hidden column on the request sheet, Calibri 10, her header row and compact data rows; the template came from
+# Salesforce's Generate File, which differs.
+MEL_DATE, _MONEY = "mm-dd-yy", r"\$#,##0"          # E4/E5: Excel's built-in short date (format 14), exactly hers
+LIST_DATE = "mm/dd/yyyy"                           # list dates read 08/19/2026, like the Salesforce text she pastes
 _ACCT = '_("$"* #,##0_);_("$"* \\(#,##0\\);_("$"* "-"??_);_(@_)'
+_ACCT2 = '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);_("$"* "-"??_);_(@_)'
 MEL_WIDTHS = {"A": 14.43, "B": 16.14, "C": 38.57, "D": 23.0, "E": 15.57, "F": 21.86, "G": 14.0, "H": 3.86, "I": 10.43,
-              "J": 13.0, "K": 13.86, "L": 14.43, "M": 16.0, "N": 12.43, "O": 13.14, "P": 16.0, "Q": 13.57, "R": 7.86,
+              "J": 10.43, "K": 13.86, "L": 14.43, "M": 16.0, "N": 12.43, "O": 13.14, "P": 16.0, "Q": 13.57, "R": 7.86,
               "S": 10.43, "T": 13.0, "U": 13.0, "V": 15.0, "W": 14.57, "X": 12.86, "Y": 11.86, "Z": 10.43, "AA": 12.43,
               "AB": 1.57, "AC": 11.14, "AD": 11.57, "AE": 15.14, "AF": 28.57, "AG": 27.71, "AH": 19.29, "AI": 14.57,
-              "AJ": 12.86, "AK": 11.86, "AL": 12.57, "AM": 13.0, "AN": 9.43}   # AB (Current UPB): she keeps it narrow
-MEL_FORMATS = {**dict.fromkeys(("K", "L", "O", "P", "Q", "U", "AD"), _MONEY), **dict.fromkeys(("M", "N", "AA", "AC"), MEL_DATE),
-               **dict.fromkeys(("R", "S", "T", "X", "Y", "Z"), "0%"), **dict.fromkeys(("V", "W", "AB"), _ACCT),
-               "AE": '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);_("$"* "-"??_);_(@_)'}
+              "AJ": 12.86, "AK": 11.86, "AL": 12.57, "AM": 12.57, "AN": 9.43}
+MEL_FORMATS = {**dict.fromkeys(("K", "L", "O", "P", "Q", "U", "AD", "AB"), _MONEY),
+               **dict.fromkeys(("M", "N", "AA", "AC"), LIST_DATE), **dict.fromkeys(("R", "S", "T", "X", "Y", "Z"), "0%"),
+               **dict.fromkeys(("V", "W"), _ACCT), "AE": _ACCT2}
 MEL_ALIGN = {**dict.fromkeys(("B", "H", "I", "J", "K", "L", "M", "N", "O", "Q", "R", "S", "T", "U", "V", "W", "X", "Y",
                               "Z", "AA", "AH"), "center"), "C": "left", "AD": "right"}
 MEL_WRAP = {"I", "J", "AF", "AJ"}
+MEL_HIDDEN = ("K", "L", "M", "P", "Q", "R", "S", "T", "Z", "AA", "AB")   # hidden in her files (data stays in them)
+HEADER_ALIGN = {"AF": ("center", False), "AI": ("center", True), "AJ": ("left", False), "AK": ("left", True),
+                "AL": ("left", False), "AM": ("left", False), "AN": ("center", True)}   # her row-7 header cells
 
 
 def _melanie_look(ws, first: int, last: int) -> None:
-    """Format the request sheet the way Melanie's own files are: her column widths, number formats and alignment on
-       the data rows, a 42.75pt header row, her mm-dd-yy dates, 15.75pt rows (taller where a comment wraps), and the
-       template's thousand empty formatted rows below the list removed."""
+    """Format the request sheet the way Melanie's own files are: her column widths, hidden columns, number formats and
+       alignment on the data rows, a 42.75pt header row, 15.75pt rows (taller where a comment wraps on a row put on
+       top), gray banding on the list only, and the template's thousand empty formatted rows below the list removed."""
     import math
+    from openpyxl.formatting.formatting import ConditionalFormattingList
     from openpyxl.styles import Alignment
     from openpyxl.utils import column_index_from_string as ci
     for col, width in MEL_WIDTHS.items():
@@ -1413,6 +1438,15 @@ def _melanie_look(ws, first: int, last: int) -> None:
                     for c in row):
         ws.delete_rows(tail.start, len(tail))
     ws.freeze_panes = f"A{first}"
+    for col in MEL_HIDDEN:
+        ws.column_dimensions[col].hidden = True
+    rules = [rule for cf in ws.conditional_formatting for rule in cf.rules]     # the template bands B8:AM1100; hers
+    ws.conditional_formatting = ConditionalFormattingList()                     # stops at the list
+    if last >= first:
+        for rule in rules:
+            ws.conditional_formatting.add(f"B{first}:AM{last}", rule)
+    ws.sheet_format.defaultRowHeight = 12.75
+    ws.row_dimensions[2].height, ws.row_dimensions[6].height = 15.0, 12.75
 
 
 # Melanie's current workbook (her weekly files from Jul 2026 on) adds "Construction Manager" at AK, which moves the
@@ -1422,31 +1456,59 @@ CURRENT_TAIL = {"AK": "Construction Manager", "AL": "Asset Manager 1", "AM": "As
 
 
 def _current_layout(ws) -> None:
-    """Rewrite the request sheet's last header cells to Melanie's current layout, styled like their neighbours."""
+    """Rewrite the request sheet's last header cells to Melanie's current layout, styled and aligned like hers."""
     from copy import copy
+    from openpyxl.styles import Alignment
     from openpyxl.utils import column_index_from_string as ci
     style = ws.cell(TEMPLATE_HEADER_ROW, ci("AJ"))
     for col, title in CURRENT_TAIL.items():
         cell = ws.cell(TEMPLATE_HEADER_ROW, ci(col))
         cell.value = title
         cell.font, cell.fill, cell.border = copy(style.font), copy(style.fill), copy(style.border)
-        cell.alignment, cell.number_format = copy(style.alignment), style.number_format
-    width = ws.column_dimensions["AM"].width or ws.column_dimensions["AJ"].width or 14
-    ws.column_dimensions["AN"].width = width
+        cell.number_format = style.number_format
+    for col, (h, wrap) in HEADER_ALIGN.items():
+        ws[f"{col}{TEMPLATE_HEADER_ROW}"].alignment = Alignment(horizontal=h, wrap_text=wrap)
+    ws[f"W{TEMPLATE_HEADER_ROW}"].font = copy(ws[f"V{TEMPLATE_HEADER_ROW}"].font)   # no underline, as hers
+
+
+PREP_WRAP = ("Notes", "Approval comments", "Paid to", "Risk flags", "IC", "Team on the loan")
 
 
 def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
-    """Append the Prep worksheet: a formatted helper table (header band, filters, frozen header)."""
+    """Append the Prep worksheet: a formatted helper table (header band, filters, frozen header), each column as wide
+       as what Excel shows, long text wrapped, and rows at most five lines tall (the full text stays in the cell).
+       Columns with nothing in them are left out."""
+    import math
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
+    prep = prep[[c for c in prep.columns if prep[c].map(lambda v: _txt(v) != "").any() or c in ("Row", "CV Loan #")]]
     ws = wb.create_sheet("Prep worksheet")
     head, band = Font(name="Calibri", size=10, bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F3864")
+    widths = {}
+    for col in prep.columns:
+        s = prep[col]
+        if col.endswith("($)"):
+            shown = [len(f"${float(v):,.0f}") for v in pd.to_numeric(s, errors="coerce").dropna()]
+        elif col.endswith("%"):
+            shown = [len(f"{float(v):.0%}") for v in pd.to_numeric(s, errors="coerce").dropna()]
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            shown = [10]
+        else:
+            shown = [len(_txt(v)) for v in s]
+        w = max([math.ceil(len(col) / 2) + 3, 8] + [n + 2 for n in shown[:200]])
+        widths[col] = min(60 if col in ("Notes", "Approval comments") else 40, w)
     for j, col in enumerate(prep.columns, 1):
         c = ws.cell(1, j, col)
         c.font, c.fill = head, band
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(j)].width = widths[col]
+    body = Font(name="Calibri", size=10)
     for i, (_, row) in enumerate(prep.iterrows(), 2):
+        lines = 1
         for j, (col, v) in enumerate(row.items(), 1):
+            cell = ws.cell(i, j)
+            cell.font = body
+            cell.alignment = Alignment(vertical="top", wrap_text=col in PREP_WRAP)
             try:
                 if v is None or pd.isna(v):
                     continue
@@ -1457,21 +1519,16 @@ def _write_prep_sheet(wb, prep: pd.DataFrame) -> None:
             if isinstance(v, np.generic):
                 v = v.item()
             _put(ws, i, j, _xl_text(v) if isinstance(v, str) else v)
-            cell = ws.cell(i, j)
-            cell.font = Font(name="Calibri", size=10)
             if isinstance(v, date):
                 cell.number_format = "m/d/yyyy"
             elif col.endswith("($)"):
                 cell.number_format = '"$"#,##0'
             elif col.endswith("%"):
                 cell.number_format = "0%"
-            if col in ("Notes", "Approval comments"):
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-    for j, col in enumerate(prep.columns, 1):                     # wide enough for what's in the column
-        sample = [len(_txt(v)) for v in prep[col].head(200)]
-        width = 48 if col in ("Notes", "Approval comments") else min(40, max([12, len(col) * 0.9 + 2]
-                                                                              + [n + 2 for n in sample]))
-        ws.column_dimensions[get_column_letter(j)].width = width
+            if col in PREP_WRAP and isinstance(v, str):
+                per = max(1.0, widths[col] * 1.15)
+                lines = max(lines, sum(max(1, math.ceil(len(p) / per)) for p in v.split("\n")))
+        ws.row_dimensions[i].height = min(12.75 * lines + 1.5, 65.25)
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "C2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(prep.columns))}{len(prep) + 1}"
@@ -4034,8 +4091,8 @@ def _next_business_day(d: date) -> date:
 
 
 def _window_text(lo: date, hi: date) -> str:
-    """'8/13-8/19', the way she writes the wire window next to the submitted date."""
-    return f"{lo.month}/{lo.day}" + ("" if lo == hi else f"-{hi.month}/{hi.day}")
+    """'8/13-8/19', the way she writes the wire window next to the submitted date ('7/1-7/1' for a single day)."""
+    return f"{lo.month}/{lo.day}-{hi.month}/{hi.day}"
 
 
 def _loan_key(v) -> str:
@@ -4126,13 +4183,16 @@ def draws_by_number(inst: str, tok: str, rt: str, refs: tuple) -> tuple[pd.DataF
 def _upcoming_picker(one: pd.DataFrame, key: str, tick_loc: bool = False, ticked=()) -> pd.DataFrame:
     """Melanie's pick of upcoming draws for the top of the file — nothing is ticked to start except draws added by
        number (ticked); tick_loc ticks every credit-line draw, which she usually puts on top. Credit lines come first.
-       She labels each (Monday, next week…), says whether it counts in this file's total, and can fix the amount,
-       comment and bank."""
+       She labels each (Monday, next week… — the planned wire's weekday to start, where there is one), says whether
+       it counts in this file's total (ticked to start: hers usually does), and can fix the amount, comment and bank."""
     loans = _col(one, "B").map(_loan_key)
     loc = [_txt(k) == "LOC_Loan" for k in _col(one, "Deal_RecordType__c")]
+    planned = _dates(_col(one, WIRE_FIELD))
     t = pd.DataFrame({
         "Put on top": [bool(tick_loc and x) or i in set(ticked) for x, i in zip(loc, _col(one, "Id"))],
-        "Label": "", "Count in total": False, "Loan #": loans.values, "Draw #": _draw_nos(one),
+        "Label": [d.strftime("%A") if pd.notna(d) and i not in set(ticked) else ""      # not on draws added by
+                  for d, i in zip(planned, _col(one, "Id"))], "Count in total": True,    # number (often wired)
+        "Loan #": loans.values, "Draw #": _draw_nos(one),
         "Deal": _col(one, "C").values, "Stage": _col(one, "Status__c").values,
         "Planned wire": _dates(_col(one, WIRE_FIELD)).values,
         "Amount": pd.to_numeric(_col(one, "U"), errors="coerce").values, "Comment": "", "Funding to": "",
@@ -4350,7 +4410,8 @@ def render_funding_request(inst, tok, rt, sel, same_day):
                 top = one.set_index("Id").loc[sel_["Id"]].reset_index()
                 rows = rows[~_col(rows, "Id").isin(set(top["Id"]))]         # a draw on top isn't repeated below
                 top["U"] = pd.to_numeric(sel_["Amount"], errors="coerce").values
-                top["_label"] = [(_txt(x) or "Upcoming") for x in sel_["Label"]]
+                top["_label"] = [_txt(x) for x in sel_["Label"]]       # column A: her label, else blank as hers
+                top["_top"] = True
                 top["_comment"] = [_txt(x) for x in sel_["Comment"]]
                 top["_funding_to"] = [_txt(x) for x in sel_["Funding to"]]
                 counted = sel_["Count in total"].map(lambda x: x is True or x is np.True_).values
@@ -4405,8 +4466,10 @@ def render_funding_request(inst, tok, rt, sel, same_day):
     if len(reqs) and "Id" in rows:
         asked_on = asked_on.fillna(_dates(_col(rows, "Id").map(reqs.drop_duplicates("Id").set_index("Id")["_req_day"])))
     amount = "Current draw" if mode == "Wired" else "Amount requested"
+    on_top = _col(rows, "_top").map(lambda x: x is True or x is np.True_).astype(bool)
     preview = pd.DataFrame({
-        "Row": _col(rows, "_label"), "Loan #": _col(rows, "B"), "Draw #": pd.Series(_draw_nos(rows), index=rows.index),
+        "Row": [_txt(lab) or ("On top" if t else "") for lab, t in zip(_col(rows, "_label"), on_top)],
+        "Loan #": _col(rows, "B"), "Draw #": pd.Series(_draw_nos(rows), index=rows.index),
         "Salesforce": _col(rows, "Id").map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None),
         "Property": _col(rows, "F"), "Deal": _col(rows, "C"), "Status": _col(rows, "Status__c"),
         "Requested": asked_on, "Wired": _dates(_col(rows, WIRE_FIELD)),
@@ -4433,7 +4496,7 @@ def _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope, layou
             xlsx, n = build_funding_file(inst, tok, rt, tpl, rows, ftypes, who, fdate, **(layout or {}))
         st.download_button(f"Download funding-request file ({n:,} rows)", xlsx, mime=XLSX_MIME, type="primary",
                            icon=":material/download:", on_click="ignore", key="fr_dl",
-                           file_name=f"Construction-Renovation Funding Request {fdate.month}_{fdate.day}_{fdate.year}.xlsx")
+                           file_name=f"Construction-Renovation Funding Request {fdate:%m.%d.%Y}.xlsx")   # her naming
         st.toast("Funding-request file is ready.", icon="✅")
 
 
