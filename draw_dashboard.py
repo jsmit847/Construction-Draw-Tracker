@@ -41,7 +41,6 @@ import os
 import json
 import re
 import secrets
-import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
@@ -117,9 +116,8 @@ WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
         + [f for f, _ in CONSTRUCTION_FIELDS] + [m[1] for m in MILESTONES])
 TERMINAL = ["Completed", "Cancelled", "Rescinded", "Rejected by Capital Partner"]
 # Not wired and still in play. A blank status is a cancelled or abandoned draw (staff clear the status rather than use
-# Cancelled), and SOQL's NOT IN lets blanks through, so they're excluded here and listed on their own.
+# Cancelled), and SOQL's NOT IN lets blanks through, so they're excluded here (open_requests sets them aside by name).
 OPEN_WHERE = f"{WIRE_FIELD}=null AND Status__c != null AND Status__c NOT IN ({','.join(repr(s) for s in TERMINAL)})"
-NO_STATUS_WHERE = f"{WIRE_FIELD}=null AND Status__c=null"
 # Status__c stages a weekly funding request covers (approval through release) — the export's default filter.
 FUNDING_STAGES = ("Pending Approval", "Approved", "Pending Capital Partner Release", "Pending Release")
 SEARCH_LIMIT = 200    # loan-detail search: most draws rendered (and dated in Land Gorilla) per query
@@ -1265,8 +1263,8 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
        added with everything needed to finish the columns no system holds.
        window = the wire window for F4 ('8/13-8/19'); total_from = the first row E6 adds up (rows above it are
        upcoming draws left out of the total); notes = also fill Comments and Funding to from Salesforce's notes and
-       Land Gorilla's payees (Melanie clears them). Per-row extras: _label (column A), _comment, _funding_to, and the
-       hand-kept _cm / _am1 / _am2 / _deposit carried over from last week's file."""
+       Land Gorilla's payees (Melanie clears them). Per-row extras for upcoming draws: _label (column A), _comment and
+       _funding_to."""
     import openpyxl
     from openpyxl.utils import column_index_from_string as ci
     wb = openpyxl.load_workbook(template)
@@ -1296,8 +1294,7 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
                 _put(ws, r, ci(col), v)
                 if isinstance(v, date):
                     ws.cell(r, ci(col)).number_format = "m/d/yyyy"
-        for col, key in (("AF", "_comment"), ("AG", "_funding_to"), ("AK", "_cm"), ("AL", "_am1"), ("AM", "_am2"),
-                         ("AN", "_deposit")):
+        for col, key in (("AF", "_comment"), ("AG", "_funding_to")):
             v = row.get(key)
             if isinstance(v, str) and v.strip():
                 _put(ws, r, ci(col), _xl_text(v.strip()))
@@ -2533,7 +2530,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     with st.spinner("Loading draws…"):
         done = run_soql(inst, tok, f"SELECT {span} FROM Advance__c WHERE RecordTypeId='{rt}' "
                                    f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d}")
-        flight = run_soql(inst, tok, f"SELECT Id,Status__c FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
+        flight = open_requests(inst, tok, rt, sel, same_day)[0]       # live draw requests only, as on Find a draw
+        flight = flight[flight["_why"] == ""]
     if done.empty:
         st.info("No draws were wired in this range."); return
     done["Period"] = _period_key(pd.to_datetime(done[WIRE_FIELD]), gi)
@@ -2584,7 +2582,9 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     k2[0].metric(f"Draws funded · {feat}", f"{len(fg):,}", money(funded) if funded is not None else None,
                  delta_color="off", delta_arrow="off", border=True)
     k2[1].metric("Open draws now", f"{len(flight):,}", f"{holds} on hold or waiting" if holds else None,
-                 delta_color="off", delta_arrow="off", border=True)
+                 delta_color="off", delta_arrow="off", border=True,
+                 help="Live draw requests not wired yet. Paid-off loans, cancelled draws, $0 requests and records "
+                      f"with no activity in {STALE_BD} business days aren't counted (see Find a draw → Not wired yet).")
     if s["n"]:
         st.caption(f"In **{feat}**, once a full draw package was in, draws were wired in **{_bd(s['turn'].mean())}** "
                    f"on average" + (f" — **{s['same']:.0f}% the same day**" if s["same"] else "") + ".")
@@ -2967,6 +2967,75 @@ STATUS_P90 = {"Received": 3, "Pending Inspection": 5, "Pending Borrower Response
               "Pending Inspection Report Revision": 3, "Hold": 12, "Pending Approval": 1, "Pending Release": 0,
               "Approved": 0}
 STALE_BD = 20          # no status change, dated note or new record in this many business days: probably dead
+# Why a not-wired record isn't a live draw request, checked in this order (blank = it is one). Set-aside records stay
+# out of every open-draws count and list unless picked under "Also show".
+SET_ASIDE = ("Cancelled (no status)", "Loan paid off", "Cancelled in Land Gorilla", "Not submitted in Land Gorilla yet",
+             "Nothing requested ($0)", f"No activity in {STALE_BD} business days")
+# Fields that tell a live request from the rest, each checked on its own so a missing one just drops out.
+OPEN_EXTRA = (GROSS_APPROVED, "Deal__r.StageName", "Deal__r.Servicer_Status__c", "Deal__r.Payoff_Date__c",
+              "Deal__r.Updated_Loan_Maturity_Date__c")
+
+
+def _open_select(inst: str, tok: str, sel: str) -> str:
+    have = sel.split(",")
+    return ",".join(dict.fromkeys(have + [p for p in OPEN_EXTRA if p not in have
+                                          and _usable(resolve_path(inst, tok, "Advance__c", p))]))
+
+
+def _requested_amount(df: pd.DataFrame) -> pd.Series:
+    """What each draw asks for: Land Gorilla's requested total, else Salesforce's approved total (blank if neither)."""
+    lg_req = pd.to_numeric(_col(df, "_lg_requested"), errors="coerce")
+    return lg_req.where(lg_req.notna(), pd.to_numeric(_col(df, GROSS_APPROVED), errors="coerce"))
+
+
+def _quiet_bd(r: pd.Series, trail: list, today: date) -> int | None:
+    """Business days since anything last happened to a draw: its last status change, newest dated note, or creation."""
+    made = pd.to_datetime(r.get("CreatedDate"), errors="coerce", utc=True)
+    req = r.get("_req_day")
+    newest = latest_entries(r.get(NOTES_FIELD), req.date() if isinstance(req, pd.Timestamp) and pd.notna(req) else None)
+    when = [trail[-1][0] if trail else None, newest[0] if newest else None,
+            made.tz_convert("America/New_York") if pd.notna(made) else None]
+    gaps = [g for g in (_bd_between(w, today) for w in when if w is not None) if g is not None]
+    return min(gaps) if gaps else None
+
+
+def _set_aside(df: pd.DataFrame, hist: dict, today: date) -> pd.Series:
+    """Why each not-wired record isn't a live draw request (SET_ASIDE, first that applies), blank when it is: a cleared
+       status (how staff cancel a draw), a paid-off loan, a draw cancelled — or never submitted — in Land Gorilla,
+       nothing asked for, or nothing happening for STALE_BD business days."""
+    why = pd.Series("", index=df.index, dtype=object)
+    status = _col(df, "Status__c").map(_txt)
+    lg_status = _col(df, "_lg_status").map(lambda s: _txt(s).lower())
+    payoff = _dates(_col(df, "Deal__r.Payoff_Date__c"))
+    asked = pd.to_numeric(_col(df, "_amount"), errors="coerce")
+    quiet = pd.Series([_quiet_bd(r, _status_trail(hist.get(r.get("Id"))), today) for _, r in df.iterrows()],
+                      index=df.index, dtype=float)
+    rules = (status.eq(""),
+             _col(df, "Deal__r.StageName").map(_txt).eq("Paid Off") | (payoff.notna() & (payoff <= pd.Timestamp(today))),
+             lg_status.str.contains("cancel"),
+             status.eq("Received") & lg_status.str.contains("unsubmitted") & _col(df, "_lg_sub").isna(),
+             pd.to_numeric(_col(df, "_lg_requested"), errors="coerce").notna() & asked.fillna(0).eq(0),
+             quiet.gt(STALE_BD))
+    for mask, label in zip(rules, SET_ASIDE):
+        why[(why == "") & mask.fillna(False).astype(bool)] = label
+    return why
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def open_requests(inst: str, tok: str, rt: str, sel: str, same_day: int) -> tuple[pd.DataFrame, dict]:
+    """Every record not wired yet — open statuses and cleared ones — most recent request first, with Land Gorilla's
+       dates and amounts, _amount (what it asks for) and _why (blank for a live draw request, else SET_ASIDE's reason);
+       plus the status history by draw. Every open-draws view uses this, so they all count the same draws."""
+    terminal = ",".join(repr(s) for s in TERMINAL)
+    df = run_soql(inst, tok, f"SELECT {_open_select(inst, tok, sel)} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                             f"AND {WIRE_FIELD}=null AND (Status__c=null OR Status__c NOT IN ({terminal}))")
+    if df.empty:
+        return df.assign(_why=pd.Series(dtype=object), _amount=pd.Series(dtype=float)), {}
+    df = _by_date(apply_lg_correction(add_intervals(df), lg_config(), same_day))
+    hist = _history_by_draw(draw_history(inst, tok, tuple(_col(df, "Id").dropna())))
+    df["_amount"] = _requested_amount(df).values
+    df["_why"] = _set_aside(df, hist, _today()).values
+    return df, hist
 
 
 def _stage_text(row) -> str:
@@ -2984,7 +3053,7 @@ def _stage_text(row) -> str:
 
 
 def _open_row(r: pd.Series, a, trail: list, today: date, inst: str) -> dict:
-    """One open draw for the Not wired yet table, plus _stale (nothing has happened in STALE_BD business days)."""
+    """One not-wired draw for the Not wired yet table."""
     made = pd.to_datetime(r.get("CreatedDate"), errors="coerce", utc=True)
     made = made.tz_convert("America/New_York") if pd.notna(made) else None
     since, moved_by = (trail[-1][0], trail[-1][3]) if trail else (made, "")
@@ -2994,7 +3063,6 @@ def _open_row(r: pd.Series, a, trail: list, today: date, inst: str) -> dict:
     newest = latest_entries(note, ref)
     now = now_keys(note, ref)
     now_labels = _key_labels(now) + (["Sent back to Unsubmitted"] if sent_back(note, ref) else [])
-    earlier = [x for x in _key_labels(delay_keys(note)) if x not in now_labels]
     status, in_stage = _txt(r.get("Status__c")), _bd_between(since, today)
     usual = STATUS_P90.get(status)
     ic = _txt(a.get("_ic_label")) if a is not None else ""
@@ -3002,92 +3070,97 @@ def _open_row(r: pd.Series, a, trail: list, today: date, inst: str) -> dict:
     if ic.startswith("IC approved"):
         ic += " · waiting on the wire" + (" (approved after 5 pm: usually wired the next business day)"
                                           if isinstance(at, pd.Timestamp) and pd.notna(at) and at.hour >= 17 else "")
-    quiet = [x for x in (in_stage, _bd_between(newest[0], today) if newest else None,
-                         _bd_between(made, today) if made is not None else None) if x is not None]
     rid = r.get("Id")
     return {"Loan #": r.get("Loan_Number__c"), "Draw #": _draw_no(r), "Deal": r.get("Deal__r.Name"),
-            "Stage": _stage_text(r) or "(none)", "In this stage (bd)": in_stage,
+            "Amount requested": pd.to_numeric(r.get("_amount"), errors="coerce"),
+            "Stage": _stage_text(r) or "(no status)", "In this stage (bd)": in_stage,
             "Longer than usual": bool(in_stage is not None and usual is not None and in_stage > usual),
-            "Now": now_labels, "Latest note": f"{_mdy(newest[0])}: {newest[1][0]}" if newest else None,
+            "Now": now_labels, "Held up by": delay_labels(note),
+            "Latest note": f"{_mdy(newest[0])}: {newest[1][0]}" if newest else None,
             "IC": ic or None, "Land Gorilla status": _txt(r.get("_lg_status")) or None, "Requested": req,
-            "Open (bd)": _bd_between(req, today), "Raised earlier": earlier, "Moved here by": moved_by or None,
+            "Open (bd)": _bd_between(req, today), "Moved here by": moved_by or None,
             "Coordinator": r.get("Advance_Coordinator__r.Name"),
             "Salesforce": f"{inst.rstrip('/')}/{rid}" if isinstance(rid, str) and rid else None,
-            "_stale": bool(quiet) and min(quiet) > STALE_BD, "_now": now}
+            "Set aside because": _txt(r.get("_why")) or None, "_group": _stage(status), "_now": now}
 
 
 @sf_fragment
 def _open_draws(inst, tok, rt, sel, same_day):
-    """Every draw that isn't wired yet: where it stands, how long it's been there (flagged when that's longer than
-       usual), where its IC approval is, and what its newest notes say it's waiting on — most recent request first.
-       Draws with no status, or with nothing happening in STALE_BD business days, are set apart and left out of the
-       counts. A fragment, so loading it doesn't redraw the search results."""
-    st.caption("Draws that haven't been wired yet: where each one stands, how long it's been there, and what's "
-               "holding it up now.")
+    """Every live draw request not wired yet: what it asks for, where it stands, how long it's been there (flagged when
+       that's longer than usual), where its IC approval is, and what its notes say it's waiting on — most recent request
+       first. Filters by stage, by what the notes say it's held up by, and — under Also show — the not-wired records
+       that aren't live requests, by reason (they're out of the counts otherwise). A fragment, so loading it doesn't
+       redraw the search results."""
+    st.caption("Draw requests that haven't been wired yet: what each asks for, where it stands, how long it's been "
+               "there, and what's holding it up.")
     data = st.session_state.get("open_data")                # built on request, then kept for the session
     if st.button("Refresh" if data else "Show draws not wired yet", icon=":material/pending_actions:",
                  key="open_build"):
         with st.spinner("Loading open draws, their status history and Land Gorilla dates…"):
-            df = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {OPEN_WHERE}")
-            df = _by_date(apply_lg_correction(add_intervals(df), lg_config(), same_day)) if not df.empty else df
-            blank = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {NO_STATUS_WHERE}")
-            blank = _by_date(blank) if not blank.empty else blank
-            ids = tuple(_col(df, "Id").dropna())
-            ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
-        st.session_state["open_data"] = data = (df, blank, ap, hist, pd.Timestamp.now(tz="America/New_York"))
+            df, hist = open_requests(inst, tok, rt, sel, same_day)
+            ap = approvals_for(inst, tok, tuple(_col(df, "Id").dropna()))
+        st.session_state["open_data"] = data = (df, hist, ap, pd.Timestamp.now(tz="America/New_York"))
     if not data:
         return
-    df, blank, ap, hist, asof = data
-    if df.empty and blank.empty:
+    df, hist, ap, asof = data
+    if df.empty:
         st.info("Every draw has been wired."); return
     today = _today()
-    rows = [_open_row(r, ap.loc[r["Id"]] if r.get("Id") in ap.index else None, _status_trail(hist.get(r.get("Id"))),
-                      today, inst) for _, r in df.iterrows()]
-    t = pd.DataFrame(rows, columns=list(rows[0]) if rows else ["_stale", "_now"])
-    live, stale = t[~t["_stale"].astype(bool)], t[t["_stale"].astype(bool)]
-    stages = live["Stage"].map(lambda s: s.split(" · ")[0]).value_counts() if len(live) else pd.Series(dtype=int)
-    st.markdown(f"**{len(live):,} draws not wired yet** (as of {asof.strftime('%I:%M %p').lstrip('0')})"
-                + "".join(f" · {_md(s)} {n}" for s, n in stages.items())
+    t = pd.DataFrame([_open_row(r, ap.loc[r["Id"]] if r.get("Id") in ap.index else None,
+                                _status_trail(hist.get(r.get("Id"))), today, inst) for _, r in df.iterrows()])
+    live = t[t["Set aside because"].isna()]
+    aside = t[t["Set aside because"].notna()]
+    groups = live["_group"].value_counts()
+    st.markdown(f"**{len(live):,} draw requests not wired yet** (as of {asof.strftime('%I:%M %p').lstrip('0')})"
+                + "".join(f" · {_md(g)} {groups[g]}" for g in STAGE_ORDER if g in groups)
                 + (f" · **{int(live['Longer than usual'].sum())} longer than usual**"
-                   if len(live) and live["Longer than usual"].any() else ""))
-    if len(live):
-        C = st.column_config
-        st.dataframe(live.drop(columns=["_stale", "_now"]), hide_index=True, width="stretch", height=420,
-                     column_config={
-            **_table_config(),
-            "Stage": C.TextColumn(help="The draw's status in Salesforce (and, in inspection, where the inspection "
-                                       "stands)"),
-            "In this stage (bd)": C.NumberColumn("In this stage", format="%d bd",
-                                                 help="Business days since the draw moved to this status"),
-            "Longer than usual": C.CheckboxColumn(help="In this status longer than 9 in 10 draws usually are"),
-            "Now": C.ListColumn("Waiting on now", help="What the newest dated note entries say it's waiting on"),
-            "Latest note": C.TextColumn(width="large", help="The newest dated entry in the notes"),
-            "IC": C.TextColumn(help="Where the draw's IC approval stands"),
-            "Land Gorilla status": C.TextColumn(help="The draw's status in Land Gorilla"),
-            "Open (bd)": C.NumberColumn("Open", format="%d bd", help="Business days since the draw was requested"),
-            "Raised earlier": C.ListColumn(help="Hold-ups older note entries mention — often already resolved"),
-            "Moved here by": C.TextColumn(help="Who moved the draw to its current status")})
-        _holdups_chart(live, "What open draws are waiting on now", keys_per_draw=list(live["_now"]),
-                       note=f"Read from the newest dated note entries of {len(live):,} open draws — what each is "
-                            "waiting on now; a draw can have more than one. Routine inspections are left out unless "
+                   if len(live) and live["Longer than usual"].any() else "")
+                + (f" · {money(live['Amount requested'].sum())} requested".replace("$", "\\$")
+                   if live["Amount requested"].notna().any() else ""))
+    reasons = aside["Set aside because"].value_counts()
+    options = sorted(groups.index, key=lambda g: (STAGE_ORDER.index(g) if g in STAGE_ORDER else 99, g))
+    stage = st.pills("Stage", options, selection_mode="multi", default=options,
+                     format_func=lambda g: f"{g} ({int(groups.get(g, 0))})", key="open_stage", help=STAGE_HELP)
+    held_n = pd.Series([x for xs in live["Held up by"] for x in xs], dtype=object).value_counts()
+    held = st.pills("Held up by", list(held_n.index), selection_mode="multi", default=[],
+                    format_func=lambda h: f"{h} ({held_n[h]})", key="open_held",
+                    help="Show only draws whose notes mention any of these (pick none to see all)")
+    also = st.pills("Also show", list(reasons.index), selection_mode="multi", default=[],
+                    format_func=lambda w: f"{w} ({reasons[w]})", key="open_also",
+                    help="Not-wired records that aren't live draw requests, left out of the counts above. Pick a "
+                         "reason to list them too.") if len(reasons) else []
+    pool = pd.concat([live[live["_group"].isin(stage or [])], aside[aside["Set aside because"].isin(also or [])]])
+    if held:
+        pool = pool[pool["Held up by"].map(lambda xs: bool(set(xs) & set(held)))]
+    if len(pool) != len(live):
+        st.caption(f"Showing {len(pool):,} draw{'s' if len(pool) != 1 else ''}.")
+    if pool.empty:
+        st.info("No draws match these filters."); return
+    C = st.column_config
+    shown = pool.drop(columns=["_group", "_now"] + ([] if pool["Set aside because"].notna().any()
+                                                    else ["Set aside because"]))
+    st.dataframe(shown, hide_index=True, width="stretch", height=420, column_config={
+        **_table_config(),
+        "Amount requested": C.NumberColumn(format="dollar", help="What the draw asks for: Land Gorilla's requested "
+                                                                 "total, else Salesforce's approved total"),
+        "Stage": C.TextColumn(help="The draw's status in Salesforce (and, in inspection, where the inspection stands)"),
+        "In this stage (bd)": C.NumberColumn("In this stage", format="%d bd",
+                                             help="Business days since the draw moved to this status"),
+        "Longer than usual": C.CheckboxColumn(help="In this status longer than 9 in 10 draws usually are"),
+        "Now": C.ListColumn("Waiting on now", help="What the newest dated note entries say it's waiting on"),
+        "Held up by": C.ListColumn(help="Every hold-up the draw's notes mention, older ones included"),
+        "Latest note": C.TextColumn(width="large", help="The newest dated entry in the notes"),
+        "IC": C.TextColumn(help="Where the draw's IC approval stands"),
+        "Land Gorilla status": C.TextColumn(help="The draw's status in Land Gorilla"),
+        "Open (bd)": C.NumberColumn("Open", format="%d bd", help="Business days since the draw was requested"),
+        "Moved here by": C.TextColumn(help="Who moved the draw to its current status"),
+        "Set aside because": C.TextColumn(help="Why this record isn't counted as a live draw request")})
+    lives = pool[pool["Set aside because"].isna()]
+    if len(lives):
+        _holdups_chart(lives, "What open draws are waiting on now", keys_per_draw=list(lives["_now"]),
+                       note=f"Read from the newest dated note entries of {len(lives):,} open draw requests — what each "
+                            "is waiting on now; a draw can have more than one. Routine inspections are left out unless "
                             "they ran late.")
-    gone = [(x["Loan #"], x["Draw #"], x["Deal"], x["Stage"], x["Requested"], x["Latest note"], x["Coordinator"],
-             x["Salesforce"]) for _, x in stale.iterrows()]
-    for _, r in blank.iterrows():
-        newest = latest_entry(r.get(NOTES_FIELD))
-        req = r.get("_req_day")
-        gone.append((r.get("Loan_Number__c"), _draw_no(r), r.get("Deal__r.Name"), "(no status)",
-                     req if isinstance(req, pd.Timestamp) and pd.notna(req) else None,
-                     f"{_mdy(newest[0])}: {newest[1]}" if newest else None, r.get("Advance_Coordinator__r.Name"),
-                     f"{inst.rstrip('/')}/{r['Id']}" if _txt(r.get("Id")) else None))
-    if gone:
-        with st.expander(f"Stale or cancelled — confirm in Land Gorilla ({len(gone)})", icon=":material/inventory_2:"):
-            st.caption(f"No status (staff clear it when a draw is cancelled), or nothing in {STALE_BD} business days: "
-                       "no status change, no dated note, no new record. Left out of the counts and the chart above.")
-            st.dataframe(pd.DataFrame(gone, columns=["Loan #", "Draw #", "Deal", "Stage", "Requested", "Latest note",
-                                                     "Coordinator", "Salesforce"]),
-                         hide_index=True, width="stretch", column_config={
-                             **_table_config(), "Latest note": st.column_config.TextColumn(width="large")})
 
 
 def _draw_search(inst, tok, rt, sel, same_day):
@@ -3398,13 +3471,11 @@ def _render_lg_for_loan(cfg: dict, ov: dict, g: pd.DataFrame):
 # ───────────────────────────── Funding request (weekly file) ────────────────
 # Melanie's weekly request, as her Jul–Oct 2026 files and Salesforce's Generate File show it: a few upcoming draws she
 # wants the team to OK on top (her pick, mostly credit-line loans), then every draw wired since her last request — one
-# row per property at the gross approved amount. She leaves off draws where no money moved (net $0 or less), draws
-# with no IC approval batch, and draws already on an earlier list. Her windows run Thursday to the Wednesday she sends
-# the file, and start over on the 1st of the month.
-RANGE_PRESETS = ("Since last request", "Last 7 days", "Month to date", "Custom")
+# row per property at the gross approved amount. She leaves off draws where no money moved (net $0 or less) and draws
+# with no IC approval batch. Her windows run Thursday to the Wednesday she sends the file, and start over on the 1st of
+# the month.
+RANGE_PRESETS = ("Since last Thursday", "Last 7 days", "Month to date", "Custom")
 UPCOMING_EXCLUDE = TERMINAL + ["Pending"]                  # a reopened ("Pending") record was funded already
-SCOREBOARD = re.compile(r"^\s*(?:this month|\d{4}\s+totals|q[1-4]\b|total\b|fnf\b)", re.IGNORECASE)
-CARRIED = ("cm", "am1", "am2", "deposit")                 # her hand-kept AK–AN, carried over by loan
 # Salesforce's draw statuses grouped into the stages a draw actually moves through (Advance__History: every draw starts
 # Received; the approval, release and approved steps almost always finish the same day; "Pending" only appears when a
 # completed record is reopened; a blank status is a cancelled draw).
@@ -3440,130 +3511,21 @@ def _window_text(lo: date, hi: date) -> str:
     return f"{lo.month}/{lo.day}" + ("" if lo == hi else f"-{hi.month}/{hi.day}")
 
 
-def _norm_head(v) -> str:
-    return " ".join(re.sub(r"[^a-z0-9#?/]+", " ", _txt(v).lower()).split())
-
-
 def _loan_key(v) -> str:
     """A loan number as text, whether the sheet stored it as 60746, 60746.0 or '60746'."""
     s = _txt(v)
     return str(int(float(s))) if re.fullmatch(r"\d+(\.0+)?", s) else s
 
 
-_XLSX_LOCK = threading.Lock()
-
-
-def _open_values(data: bytes):
-    """A workbook opened for its values only. Salesforce's own Generate File has a stylesheet openpyxl rejects; values
-       don't need styles, so on that error the workbook is opened again without them."""
-    import openpyxl
-    import openpyxl.reader.excel as rx
-    try:
-        return openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except TypeError:
-        with _XLSX_LOCK:                  # other sessions may be opening workbooks at the same moment
-            keep = rx.apply_stylesheet
-            rx.apply_stylesheet = lambda archive, wb: None
-            try:
-                return openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-            finally:
-                rx.apply_stylesheet = keep
-
-
-def read_last_request(data: bytes) -> dict:
-    """Last week's request workbook, read from its main sheet: who sent it, the last day it covered (the later of its
-       submitted date and the end of its wire window), and its draw rows — loan, amount, column-A label, comment,
-       funding to, and the hand-kept managers and deposit answer, found by their headers (her 40-column layout or
-       Salesforce's 39). The running totals under the draws are skipped."""
-    wb = _open_values(data)
-    try:
-        ws = wb[TEMPLATE_SHEET] if TEMPLATE_SHEET in wb.sheetnames else wb.worksheets[0]
-        grid = [list(r) for r in ws.iter_rows(min_row=1, max_row=3000, max_col=45, values_only=True)]
-    finally:
-        wb.close()
-
-    def cell(r, c):
-        return grid[r - 1][c - 1] if c and r <= len(grid) and c <= len(grid[r - 1]) else None
-    head = {}
-    for j, v in enumerate(grid[TEMPLATE_HEADER_ROW - 1] if len(grid) >= TEMPLATE_HEADER_ROW else [], 1):
-        head.setdefault(_norm_head(v), j)
-
-    def col(name):
-        return head.get(_norm_head(name))
-    sent, window = _d(cell(4, 5)), _txt(cell(4, 6))
-    ends = [sent] if sent else []
-    m = re.search(r"(\d{1,2})/(\d{1,2})\s*$", window)
-    if m:
-        ref = sent or _today()
-        try:
-            end = date(ref.year, int(m.group(1)), int(m.group(2)))
-            ends.append(date(ref.year - 1, end.month, end.day) if end > ref + timedelta(days=60) else end)
-        except ValueError:
-            pass
-    rows, blank, c_loan = [], 0, col("CV Loan #") or 2
-    c_cm, c_am1 = col("Construction Manager"), col("Asset Manager 1")
-    if c_cm is None:                       # Salesforce's 39-column file: its "Asset Manager 1" holds the people she
-        c_cm, c_am1 = c_am1, None          # lists as Construction Manager
-    for r in range(TEMPLATE_HEADER_ROW + 1, len(grid) + 1):
-        loan = _loan_key(cell(r, c_loan))
-        if not loan:
-            blank += 1
-            if blank >= 5:
-                break
-            continue
-        blank = 0
-        if SCOREBOARD.match(loan):
-            break
-        rows.append({"loan": loan, "amount": pd.to_numeric(cell(r, col("Current Draw Amount")), errors="coerce"),
-                     "label": _txt(cell(r, col("Notes"))), "comment": _txt(cell(r, col("Comments"))),
-                     "funding_to": _txt(cell(r, col("Funding to"))), "cm": _txt(cell(r, c_cm)),
-                     "am1": _txt(cell(r, c_am1)), "am2": _txt(cell(r, col("Asset Manager 2"))),
-                     "deposit": _txt(cell(r, col("Deposit for materials? Y/N")))})
-    return {"by": _txt(cell(3, 5)), "sent": sent, "window": window, "last_day": max(ends) if ends else None,
-            "rows": rows}
-
-
-def _is_top(r: dict) -> bool:
-    """An upcoming row of hers (labelled Monday / next week / Carry Over, or commented), not a wired one."""
-    return not r["label"].lower().startswith("funded") and bool(r["label"] or r["comment"])
-
-
-def _last_request() -> dict | None:
-    """The optional upload of last week's request, read once per file and kept for this session only."""
-    up = st.file_uploader("Last week's request (optional)", type=["xlsx"], key="fr_last",
-                          help="The last file you sent. The wire window then starts from the last day it covered, "
-                               "draws already on it are left off, and its hand-filled columns carry over: "
-                               "Construction Manager, Asset Manager 1 and 2, and the labels and comments of its "
-                               "upcoming draws. Nothing is saved.")
-    if up is None:
-        return None
-    key = f"fr_last_{up.file_id}"
-    if key not in st.session_state:
-        try:
-            st.session_state[key] = read_last_request(up.getvalue())
-        except Exception as exc:             # no exception text: it could echo the file's contents
-            st.warning(f"Couldn't read that file ({type(exc).__name__}). Is it a funding-request workbook?")
-            st.session_state[key] = None
-        got = st.session_state[key]
-        if got and got.get("by") and not st.session_state.get("fr_by"):
-            st.session_state["fr_by"] = got["by"]
-    return st.session_state[key]
-
-
-def _left_off(rows: pd.DataFrame, last: dict | None) -> pd.Series:
-    """Why each row's draw stays off the list (blank = it goes on), as Melanie and Salesforce's Generate File do:
-       no money moved (net $0 or less), or no IC approval batch; and, given last week's file, already on it. Judged per
-       draw, so a $0 property inside a draw that moved money stays."""
+def _left_off(rows: pd.DataFrame) -> pd.Series:
+    """Why each row's draw stays off the list (blank = it goes on), as Melanie and Salesforce's Generate File do: no
+       money moved (net $0 or less), or no IC approval batch. Judged per draw, so a $0 property inside a draw that moved
+       money stays."""
     why = pd.Series("", index=rows.index, dtype=object)
     if NET_FIELD in rows:
         why[pd.to_numeric(rows[NET_FIELD], errors="coerce").fillna(0) <= 0] = "$0 or negative net (no money moved)"
     if "Batch_Approval__c" in rows:
         why[(why == "") & (rows["Batch_Approval__c"].map(_txt) == "")] = "No IC approval batch"
-    if last and last.get("rows"):
-        seen = {(r["loan"], round(float(r["amount"]), 2)) for r in last["rows"] if pd.notna(r["amount"])}
-        amounts = pd.to_numeric(_col(rows, "U"), errors="coerce")
-        hit = [pd.notna(u) and (_loan_key(b), round(float(u), 2)) in seen for b, u in zip(_col(rows, "B"), amounts)]
-        why[(why == "") & _col(rows, "Id").isin(set(_col(rows, "Id")[hit]))] = "Already on last week's file"
     return why
 
 
@@ -3610,23 +3572,17 @@ def upcoming_draws(inst: str, tok: str, rt: str, after: date) -> tuple[pd.DataFr
     return one, ftypes
 
 
-def _upcoming_picker(one: pd.DataFrame, last: dict | None, key: str) -> pd.DataFrame:
-    """Melanie's pick of upcoming draws for the top of the file: credit-line loans and last week's upcoming loans are
-       ticked to start; she labels each (Monday, next week…), says whether it counts in this file's total, and can fix
-       the amount, comment and receiving bank."""
-    tops = {}
-    for r in (last or {}).get("rows", []):
-        if _is_top(r):
-            tops.setdefault(r["loan"], r)
+def _upcoming_picker(one: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Melanie's pick of upcoming draws for the top of the file: credit-line loans are ticked to start; she labels each
+       (Monday, next week…), says whether it counts in this file's total, and can fix the amount, comment and bank."""
     loans = _col(one, "B").map(_loan_key)
     t = pd.DataFrame({
-        "Put on top": [_txt(k) == "LOC_Loan" or ln in tops for k, ln in zip(_col(one, "Deal_RecordType__c"), loans)],
-        "Label": [tops.get(ln, {}).get("label", "") for ln in loans],
-        "Count in total": False, "Loan #": loans.values, "Draw #": _draw_nos(one), "Deal": _col(one, "C").values,
-        "Stage": _col(one, "Status__c").values, "Planned wire": _dates(_col(one, WIRE_FIELD)).values,
-        "Amount": pd.to_numeric(_col(one, "U"), errors="coerce").values,
-        "Comment": [tops.get(ln, {}).get("comment", "") for ln in loans],
-        "Funding to": [tops.get(ln, {}).get("funding_to", "") for ln in loans], "Id": _col(one, "Id").values})
+        "Put on top": [_txt(k) == "LOC_Loan" for k in _col(one, "Deal_RecordType__c")],
+        "Label": "", "Count in total": False, "Loan #": loans.values, "Draw #": _draw_nos(one),
+        "Deal": _col(one, "C").values, "Stage": _col(one, "Status__c").values,
+        "Planned wire": _dates(_col(one, WIRE_FIELD)).values,
+        "Amount": pd.to_numeric(_col(one, "U"), errors="coerce").values, "Comment": "", "Funding to": "",
+        "Id": _col(one, "Id").values})
     t = t.sort_values(["Put on top", "Planned wire", "Loan #"], ascending=[False, True, True], na_position="last",
                       kind="stable").reset_index(drop=True)
     C = st.column_config
@@ -3645,24 +3601,7 @@ def _upcoming_picker(one: pd.DataFrame, last: dict | None, key: str) -> pd.DataF
                               "Funding to": C.TextColumn(help="The receiving bank")})
 
 
-def _carry_over(rows: pd.DataFrame, last: dict | None) -> pd.DataFrame:
-    """Last week's hand-filled Construction Manager, Asset Manager 1 and 2 and deposit answer, by loan."""
-    if not last or rows.empty:
-        return rows
-    keep: dict = {}
-    for r in last["rows"]:
-        k = keep.setdefault(r["loan"], {})
-        for f in CARRIED:
-            if r[f] and f not in k:
-                k[f] = r[f]
-    rows = rows.copy()
-    loans = _col(rows, "B").map(_loan_key)
-    for f in CARRIED:
-        rows[f"_{f}"] = loans.map(lambda ln, f=f: keep.get(ln, {}).get(f, "")).values
-    return rows
-
-
-def render_funding_request(inst, tok, rt):
+def render_funding_request(inst, tok, rt, sel, same_day):
     st.header("Funding request")
     st.caption("Melanie's weekly *Construction/Renovation Funding Request*: upcoming draws for the team to OK on top, "
                "and every draw wired since the last request below — Salesforce's values, with Land Gorilla for gaps.")
@@ -3671,7 +3610,6 @@ def render_funding_request(inst, tok, rt):
         st.error("The funding-request template is missing from the app."); return
     today = _today()
     with st.container(border=True):
-        last = _last_request()
         c = st.columns([1.2, 1, 1.8])
         who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name (E3)")
         fdate = c[1].date_input("Scheduled funding date", value=_next_business_day(today), key="fr_date")
@@ -3680,8 +3618,8 @@ def render_funding_request(inst, tok, rt):
         window = None
         if mode == "Wired":
             r = st.columns([2, 1.4])
-            preset = r[0].pills("Wire dates", list(RANGE_PRESETS), default="Since last request", key="fr_preset") \
-                or "Since last request"
+            preset = r[0].pills("Wire dates", list(RANGE_PRESETS), default="Since last Thursday", key="fr_preset") \
+                or "Since last Thursday"
             if preset == "Custom":
                 rng = r[1].date_input("From – to", value=(_thursday_before(today), today), key="fr_rng")
                 if len(rng) != 2:
@@ -3691,21 +3629,27 @@ def render_funding_request(inst, tok, rt):
                 lo, hi = today.replace(day=1), today
             elif preset == "Last 7 days":
                 lo, hi = today - timedelta(days=6), today
-            else:                         # the day the last request covered (its draws are left off), else Thursday
-                lo = (last or {}).get("last_day") or _thursday_before(today)
-                lo, hi = min(max(lo, today.replace(day=1)), today), today
+            else:                                        # her lists run Thursday to the Wednesday she sends them
+                lo, hi = max(_thursday_before(today), today.replace(day=1)), today
+                r[1].caption(f"**{_mdy(lo)} – {_mdy(hi)}** · from last Thursday, never before the 1st of the month")
             window = _window_text(lo, hi)
-            if preset == "Since last request":
-                r[1].caption(f"**{_mdy(lo)} – {_mdy(hi)}** · " + (
-                    "from the last day on last week's file" if (last or {}).get("last_day")
-                    else "from last Thursday (upload last week's file to start where it ended)")
-                    + "; never before the 1st of the month")
             where = f"{WIRE_FIELD}>={lo:%Y-%m-%d} AND {WIRE_FIELD}<={hi:%Y-%m-%d}"
             scope = f"wired {_mdy(lo)} – {_mdy(hi)}"
         else:
             where, scope = OPEN_WHERE, "not yet wired"
     with st.spinner("Loading draws…"):
         rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
+        reqs, _hist = open_requests(inst, tok, rt, sel, same_day)
+    live = reqs[reqs["_why"] == ""] if not reqs.empty else reqs
+    if mode != "Wired" and not rows.empty:           # live draw requests only, one row each at the requested amount
+        asked = live.set_index("Id")["_amount"] if len(live) else pd.Series(dtype=float)
+        rows = _per_draw(rows[rows["Id"].isin(set(asked.index))])
+        if not rows.empty:
+            rows["U"] = rows["Id"].map(asked).values
+        aside = reqs["_why"].ne("").sum() if not reqs.empty else 0
+        if aside:
+            st.caption(f"{aside} not-wired records aren't live draw requests (paid off, cancelled, nothing requested, "
+                       "no activity) and are left out — see Find a draw → Not wired yet → Also show.")
     if rows.empty and mode != "Wired":
         st.info(f"No draws {scope}."); return
     if not rows.empty:
@@ -3731,7 +3675,7 @@ def render_funding_request(inst, tok, rt):
 
     total_from, top = None, pd.DataFrame()
     if mode == "Wired":
-        why = _left_off(rows, last)
+        why = _left_off(rows)
         if (why != "").any():
             off = rows[why != ""].assign(_why=why[why != ""])
             off = off.drop_duplicates("Id") if "Id" in off else off
@@ -3743,30 +3687,30 @@ def render_funding_request(inst, tok, rt):
                     "Add back": False, "Loan #": _col(off, "B").values, "Draw #": _draw_nos(off),
                     "Deal": _col(off, "C").values, "Why": off["_why"].values,
                     "Net": pd.to_numeric(_col(off, NET_FIELD), errors="coerce").values, "Id": _col(off, "Id").values}),
-                    key=f"fr_off_{where}", hide_index=True, width="stretch", disabled=["Loan #", "Draw #", "Deal", "Why", "Net"],
+                    key=f"fr_off_{where}", hide_index=True, width="stretch",
+                    disabled=["Loan #", "Draw #", "Deal", "Why", "Net"],
                     column_order=["Add back", "Loan #", "Draw #", "Deal", "Why", "Net"],
                     column_config={"Net": st.column_config.NumberColumn(format="dollar", help="Net funding")})
                 why[_col(rows, "Id").isin(set(back.loc[back["Add back"].astype(bool), "Id"]))] = ""
-        rows = rows[why == ""]
-        tops = {r["loan"] for r in (last or {}).get("rows", []) if _is_top(r)}
-        rows = rows.assign(_label=["Funded - Approved last week" if _loan_key(b) in tops else "Funded"
-                                   for b in _col(rows, "B")])
+        rows = rows[why == ""].assign(_label="Funded")
         one, otypes = upcoming_draws(inst, tok, rt, hi)
+        if not one.empty:                    # live requests, plus draws already given a wire date after the window
+            one = one[one["Id"].isin(set(_col(live, "Id"))) | (_col(one, WIRE_FIELD).map(_txt) != "")]
         if not one.empty:
             ticked = int(one["Deal_RecordType__c"].eq("LOC_Loan").sum()) if "Deal_RecordType__c" in one else 0
             with st.expander(f"Upcoming draws for the top of the file ({len(one)} in play)",
-                             icon=":material/upcoming:", expanded=bool(ticked or tops)):
-                st.caption("Draws not wired yet, or with a planned wire date after the window. Credit-line loans "
-                           "and last week's upcoming loans start ticked. Ticked draws go on top, one row each.")
-                pick = _upcoming_picker(one, last, key=f"fr_up_{hi}")
-            sel = pick[pick["Put on top"].astype(bool)]
-            if len(sel):
-                top = one.set_index("Id").loc[sel["Id"]].reset_index()
-                top["U"] = pd.to_numeric(sel["Amount"], errors="coerce").values
-                top["_label"] = [(_txt(x) or "Upcoming") for x in sel["Label"]]
-                top["_comment"] = [_txt(x) for x in sel["Comment"]]
-                top["_funding_to"] = [_txt(x) for x in sel["Funding to"]]
-                counted = sel["Count in total"].map(lambda x: x is True or x is np.True_).values
+                             icon=":material/upcoming:", expanded=bool(ticked)):
+                st.caption("Live draw requests not wired yet, or with a planned wire date after the window. "
+                           "Credit-line loans start ticked. Ticked draws go on top, one row each.")
+                pick = _upcoming_picker(one, key=f"fr_up_{hi}")
+            sel_ = pick[pick["Put on top"].astype(bool)]
+            if len(sel_):
+                top = one.set_index("Id").loc[sel_["Id"]].reset_index()
+                top["U"] = pd.to_numeric(sel_["Amount"], errors="coerce").values
+                top["_label"] = [(_txt(x) or "Upcoming") for x in sel_["Label"]]
+                top["_comment"] = [_txt(x) for x in sel_["Comment"]]
+                top["_funding_to"] = [_txt(x) for x in sel_["Funding to"]]
+                counted = sel_["Count in total"].map(lambda x: x is True or x is np.True_).values
                 top["_count"] = counted
                 top = pd.concat([top[~counted], top[counted]], ignore_index=True)
                 total_from = TEMPLATE_HEADER_ROW + 1 + int((~counted).sum())
@@ -3774,18 +3718,25 @@ def render_funding_request(inst, tok, rt):
     if rows.empty and top.empty:
         st.info(f"No draws {scope}."); return
     funded = rows
-    rows = _carry_over(pd.concat([top, funded], ignore_index=True) if len(top) else funded, last)
+    rows = pd.concat([top, funded], ignore_index=True) if len(top) else funded
     u = pd.to_numeric(_col(funded, "U"), errors="coerce")
-    fnf = _col(funded, "Deal_RecordType__c").eq(FNF_TYPE)
-    m = st.columns(4)
-    m[0].metric("Wired draws", f"{funded['Id'].nunique() if 'Id' in funded else len(funded):,}", border=True)
-    m[1].metric("Loans", f"{funded['B'].nunique() if 'B' in funded else 0:,}", border=True)
-    m[2].metric("Wired total", money(u.sum()), border=True, help="Gross approved amounts, as in her Total")
-    m[3].metric("Upcoming on top", f"{len(top):,}", money(pd.to_numeric(_col(top, "U"), errors="coerce").sum())
-                if len(top) else None, delta_color="off", delta_arrow="off", border=True)
-    if mode == "Wired" and len(funded):
-        st.caption(f"For the running totals: FNF (single-asset bridge) draws on this list — "
-                   f"{_col(funded, 'Id')[fnf].nunique()} draws, {money(u[fnf].sum())}.".replace("$", "\\$"))
+    if mode == "Wired":
+        fnf = _col(funded, "Deal_RecordType__c").eq(FNF_TYPE)
+        m = st.columns(4)
+        m[0].metric("Wired draws", f"{funded['Id'].nunique() if 'Id' in funded else len(funded):,}", border=True)
+        m[1].metric("Loans", f"{funded['B'].nunique() if 'B' in funded else 0:,}", border=True)
+        m[2].metric("Wired total", money(u.sum()), border=True, help="Gross approved amounts, as in her Total")
+        m[3].metric("Upcoming on top", f"{len(top):,}", money(pd.to_numeric(_col(top, "U"), errors="coerce").sum())
+                    if len(top) else None, delta_color="off", delta_arrow="off", border=True)
+        if len(funded):
+            st.caption(f"For the running totals: FNF (single-asset bridge) draws on this list — "
+                       f"{_col(funded, 'Id')[fnf].nunique()} draws, {money(u[fnf].sum())}.".replace("$", "\\$"))
+    else:
+        m = st.columns(3)
+        m[0].metric("Draw requests", f"{len(funded):,}", border=True)
+        m[1].metric("Loans", f"{funded['B'].nunique() if 'B' in funded else 0:,}", border=True)
+        m[2].metric("Requested", money(u.sum()), border=True,
+                    help="What the draws ask for: Land Gorilla's requested totals, else Salesforce's approved totals")
     notes = st.checkbox("Also fill Comments and Funding to from Salesforce notes and Land Gorilla payees",
                         key="fr_notes", help="Melanie clears these on wired rows; both are on the Prep worksheet "
                                              "either way.")
@@ -3797,7 +3748,9 @@ def render_funding_request(inst, tok, rt):
                             "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name"),
                             "Held up by": [delay_labels(n) for n in _col(rows, "AF")]})
     st.dataframe(preview, hide_index=True, width="stretch", height=360,
-                 column_config={"Current draw": st.column_config.NumberColumn(format="dollar", step=1),
+                 column_config={"Current draw": st.column_config.NumberColumn(
+                                    format="dollar", step=1, help="Wired rows: the approved amount; not-wired draws: "
+                                                                  "what they ask for"),
                                 "Row": st.column_config.TextColumn(help="Column A: upcoming draws' labels, then "
                                                                         "Funded"),
                                 "Held up by": st.column_config.ListColumn(help="What the draw's notes say it was "
@@ -3875,7 +3828,7 @@ def main():
         sel = select_fields(inst, tok)
         find = st.Page(lambda: render_loan_detail(inst, tok, rt, sel, same_day), title="Find a draw",
                        icon=":material/search:", url_path="find", default=start == "find")
-        funding = st.Page(lambda: render_funding_request(inst, tok, rt), title="Funding request",
+        funding = st.Page(lambda: render_funding_request(inst, tok, rt, sel, same_day), title="Funding request",
                           icon=":material/request_quote:", url_path="funding-request",
                           default=start == "funding-request")
         turn = st.Page(lambda: render_pipeline(inst, tok, rt, sel, same_day, links=(find, funding)),
