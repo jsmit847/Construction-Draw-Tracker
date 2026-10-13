@@ -832,6 +832,28 @@ TEMPLATE_CANDIDATES = ("Advance_template.xlsx", "melanie_template.xlsx",
                        "Construction-Renovation_Funding_Request_template.xlsx")
 TEMPLATE_SHEET, TEMPLATE_HEADER_ROW = "Combined Funding Request", 7
 PERSON_FIELDS = ("Advance_Coordinator__r.Name", "Advance_Analyst__r.Name")
+# Her current layout's people columns (CURRENT_TAIL), each a role on the deal's Deal Team (OpportunityTeamMember):
+# Construction Manager is the role of that name (on every loan in her files; her own example row names it). Asset
+# Manager 1 and 2 are the roles Salesforce's Generate File prints under those headers (the same person on 99 of 99 rows).
+DEAL_TEAM_COLUMNS = {"AK": "Construction Manager", "AL": "Asset Manager", "AM": "Asset Manager 2"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _deal_team(inst: str, tok: str, deal_ids: tuple) -> dict:
+    """{deal Id: {Deal Team role: 'Name' (or 'Name; Name')}}, from Salesforce's Deal Team — empty if this login can't
+       read it, so those columns just stay blank."""
+    try:
+        t = _soql_in(inst, tok, "OpportunityId, TeamMemberRole, User.Name", "OpportunityTeamMember", "OpportunityId",
+                     deal_ids)
+    except Exception:
+        return {}
+    out = {}
+    for deal, role, name in zip(_col(t, "OpportunityId"), _col(t, "TeamMemberRole"), _col(t, "User.Name")):
+        if _txt(deal) and _txt(role) and _txt(name):
+            names = out.setdefault(deal, {}).setdefault(_txt(role), [])
+            if _txt(name) not in names:
+                names.append(_txt(name))
+    return {d: {r: "; ".join(n) for r, n in roles.items()} for d, roles in out.items()}
 
 
 def _find_template() -> str | None:
@@ -966,6 +988,10 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
         out[f"chk:{label}"] = [m.get(f) if m else None for m in match]
         ftypes[f"chk:{label}"] = pmeta[f]["type"]
     out["F"] = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) or None if m else None for m in match]
+    team = _deal_team(inst, tok, tuple(dict.fromkeys(_col(out, "Deal__c").dropna())))
+    for col, role in DEAL_TEAM_COLUMNS.items():                # Construction Manager, Asset Manager 1 and 2
+        out[col] = [team.get(d, {}).get(role) for d in _col(out, "Deal__c")]
+        ftypes[col] = "string"
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
 
@@ -1303,8 +1329,8 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         ws["F4"] = window                                                    # the wire window, as she writes it
     _current_layout(ws)
     skip = set() if notes else {"AF", "AG"}
-    letters = [c for c in dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS))
-               if c not in skip]
+    letters = [c for c in dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS)
+                                        + list(DEAL_TEAM_COLUMNS)) if c not in skip]
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
         for col in letters:
             v = _xl(row.get(col), ftypes.get(col))
