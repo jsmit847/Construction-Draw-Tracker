@@ -43,7 +43,7 @@ import re
 import secrets
 import time
 from datetime import date, datetime, timedelta, timezone
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -2305,6 +2305,61 @@ def latest_entries(note, ref: date | None = None, lo: date | None = None, hi: da
     return best
 
 
+# ─────────────── estimated package date (before Aug 3, 2026, the date wasn't recorded) ───────────────
+_PKG_MARKS = tuple(DELAY_REASONS[k][2] for k in ("sent_for_approval", "approved"))
+_HOLDUPS = tuple(rx for _label, side, rx in DELAY_REASONS.values() if side in REASON_SIDES)
+
+
+@lru_cache(maxsize=65536)
+def _entry_tags(text: str) -> tuple:
+    """(the entry marks a step toward funding — sent for approval or approved —, it names something still missing:
+       a hold-up on the borrower, a third party, CoreVest or a loan change, with no such mark)."""
+    mark = any(rx.search(text) for rx in _PKG_MARKS)
+    return mark, not mark and any(rx.search(text) for rx in _HOLDUPS)
+
+
+def _chrono_entries(note, req: date | None, wire: date) -> list:
+    """A note log's dated entries in time order, between the request and the wire, as [(date, text)]. A date with no
+       year goes in the year nearest the wire; a log written newest-first is read bottom-up, and entries on the same
+       day keep their reading order."""
+    ents = []
+    for when, text in note_entries(_txt(note)):
+        text = text.lstrip(";:,-–— ").strip()
+        if not when or not text:
+            continue
+        p = [int(x) for x in when.split("/")]
+        cands = []
+        for y in ([p[2] + (2000 if p[2] < 100 else 0)] if len(p) == 3 else (wire.year - 1, wire.year, wire.year + 1)):
+            try:
+                cands.append(date(y, p[0], p[1]))
+            except ValueError:
+                pass
+        if cands:
+            ents.append((min(cands, key=lambda x: abs((x - wire).days)), text))
+    days = [d for d, _t in ents]
+    if sum(b < a for a, b in zip(days, days[1:])) > sum(b > a for a, b in zip(days, days[1:])):
+        ents = ents[::-1]
+    ents = sorted(enumerate(ents), key=lambda kv: (kv[1][0], kv[0]))
+    return [(d, t) for _k, (d, t) in ents if (req is None or d >= req) and d <= wire]
+
+
+def package_from_notes(note, req: date | None, wire: date | None) -> tuple:
+    """The notes' estimate of when the full package was in: the first entry marked "sent for approval" or "approved"
+       after the last entry naming something still missing, between the request and the wire. Returns (date or None,
+       the last such hold-up's date or None, 'M/D: the entry used')."""
+    if wire is None:
+        return None, None, ""
+    ents = _chrono_entries(note, req, wire)
+    tags = [_entry_tags(t) for _d, t in ents]
+    last = max((k for k, (_mark, hold) in enumerate(tags) if hold), default=-1)
+    held = ents[last][0] if last >= 0 else None
+    for k in range(last + 1, len(ents)):
+        if tags[k][0]:
+            d, t = ents[k]
+            return d, held, f"{d.month}/{d.day}: " + (t if len(t) <= 90 else t[:87] + "…")
+    return None, held, ""
+
+
 REQUEST_STEP = {"Land Gorilla": "Requested in Land Gorilla",
                 "Salesforce record created": "Requested (the day Salesforce's record was created)",
                 "Salesforce request date": "Requested (Salesforce's request date)",
@@ -2353,10 +2408,14 @@ def _timeline(row: pd.Series, a, h: pd.DataFrame | None = None) -> pd.DataFrame:
             ev.append((fixed, "status", "Record reopened and corrected after funding", "", ""))
     else:
         ev += [(_d(row.get(field)), "review", label, "", "") for label, field in MILESTONES[4:6]]
-    pkg = _d(row.get("_pkg"))
-    likely = _likely_package(trail, ic) if trail and not pkg else None
+    pkg, how = _d(row.get("_pkg")), _txt(row.get("_pkg_src"))
+    likely = None if pkg else _d(row.get("_pkg_est")) if how else _likely_package(trail, ic) if trail else None
     if pkg or likely:
         ev.append((pkg or likely, "package", "Full draw package received" if pkg else
+                   f"Full package likely in — estimated from the notes: “{_txt(row.get('_pkg_why'))}” (not recorded)"
+                   if how == "Notes" else
+                   "Full package likely in — estimated from the Date Submitted For Internal Review (not recorded)"
+                   if how == "Submitted for review" else
                    "Full package likely in (estimated from status history — not recorded)", "", ""))
     if a is not None:
         sent, at = a.get("_ic_sent"), a.get("_ic_at")
@@ -2449,6 +2508,12 @@ def _table_config() -> dict:
         "Approved on": C.DateColumn(format="M/D/YYYY"),
         "Likely package date (status history)": C.DateColumn(
             format="M/D/YYYY", help="Estimated from the draw's status history — never used for turn-time"),
+        "Package received (est.)": C.DateColumn(
+            format="M/D/YYYY", help="No package date was recorded: estimated from the notes, else the status history, "
+                                    "else the Date Submitted For Internal Review"),
+        "Estimate from": C.TextColumn(help="Where the estimated package date comes from"),
+        "Turn-time est. (bd)": C.NumberColumn("Turn-time (est.)", format="%d bd",
+                                              help="Business days from the estimated package date to the wire"),
         "IC": C.TextColumn(help="Where the draw's IC approval stands, from its IC batch in Salesforce"),
         "Held up by": C.ListColumn(help="What the draw's notes say it was waiting on"),
         "What the notes say": C.TextColumn(width="large", help="The note entries behind those hold-ups"),
@@ -2493,6 +2558,12 @@ def _excel_table(fg: pd.DataFrame, table: pd.DataFrame, hist: dict | None = None
              pd.to_numeric(_col(fg, "_wait_bd"), errors="coerce"))
     x.insert(x.columns.get_loc("Days to a full package (bd)") + 1, "Request → wire (bd)",
              pd.to_numeric(_col(fg, "_days"), errors="coerce"))
+    if "Estimate from" in x:                                  # draws with an estimated package date only
+        est = x["Estimate from"].map(_txt) != ""
+        x.insert(x.columns.get_loc("Estimate from") + 1, "Estimate evidence",
+                 _col(fg, "_pkg_why").map(_txt).where(est.values).values)
+        x.insert(x.columns.get_loc("Turn-time est. (bd)") + 1, "Days to a full package est. (bd)",
+                 pd.to_numeric(_col(fg, "_wait_bd_est"), errors="coerce").where(est.values).values)
     x.insert(x.columns.get_loc("Borrower") + 1, "Account", _col(fg, "Deal__r.Account.Name"))
     return x
 
@@ -2515,14 +2586,129 @@ def _span_start(gran: str, n: int) -> date:
     return date(today.year - (n - 1), 1, 1)
 
 
+# Where an estimated package date can come from, in the order tried, and how the app says it.
+EST_SOURCES = {"Notes": "the notes", "Status history": "the status history",
+               "Submitted for review": "the Date Submitted For Internal Review"}
+EST_MIN_DRAWS, EST_MIN_COVERAGE = 30, 75      # below either, an estimated period figure isn't shown
+
+
+def estimate_package(df: pd.DataFrame, hist: dict | None, same_day: int) -> pd.DataFrame:
+    """Each wired draw's estimated full-package date, from what Salesforce kept before the date was recorded (Aug 3,
+       2026): package_from_notes, else the status history's move from waiting into review, else the Date Submitted For
+       Internal Review — the first that falls between the request and the wire. A status-history or review date
+       earlier than the notes' last hold-up is moved up to it. Adds _pkg_est, _pkg_src (an EST_SOURCES key, blank when
+       none), _pkg_why (the evidence), _fund_bd_est (estimated package → wire) and _wait_bd_est (request → estimated
+       package), in business days. Every draw gets one, recorded date or not, so months compare on the same footing;
+       recorded dates (_pkg) are left alone and estimates never feed recorded turn-time."""
+    if df.empty:
+        return df
+    df = df.copy()
+    req, wire, sfa = (_dates(_col(df, c)) for c in ("_lg_req", "_wire", "Date_Submitted_For_Approval__c"))
+    est, src, why = [], [], []
+    for (_, r), q, w, s in zip(df.iterrows(), req, wire, sfa):
+        got = (None, "", "")
+        if pd.notna(w):
+            qd, wd = (q.date() if pd.notna(q) else None), w.date()
+
+            def ok(d):
+                return d is not None and (qd is None or d >= qd) and d <= wd
+            n, held, ev = package_from_notes(r.get(NOTES_FIELD), qd, wd)
+            if ok(n):
+                got = (n, "Notes", ev)
+            else:
+                h = (hist or {}).get(r.get("Id"))
+                for d, label in ((_likely_package(_status_trail(h), _ic_trail(h)), "Status history"),
+                                 (s.date() if pd.notna(s) else None, "Submitted for review")):
+                    if ok(d):
+                        moved = held is not None and d < held <= wd
+                        got = (held if moved else d, label, f"moved up to the last note about something missing "
+                                                            f"({held.month}/{held.day})" if moved else "")
+                        break
+        est.append(got[0])
+        src.append(got[1])
+        why.append(got[2])
+    df["_pkg_est"] = _dates(pd.Series(est, index=df.index, dtype=object))
+    df["_pkg_src"], df["_pkg_why"] = src, why
+    df["_fund_bd_est"] = bdays(df["_pkg_est"], wire, same_day)
+    df["_wait_bd_est"] = bdays(req, df["_pkg_est"], 0)
+    return df
+
+
+def estimate_accuracy(df: pd.DataFrame, same_day: int) -> dict | None:
+    """How the estimate compares with the recorded package date, on draws that have both (None if none do): the share
+       on the same business day and within one, the average gap (estimate − recorded), the turn-time and same-day share
+       each gives, and the same-day share by source."""
+    rec, est = _dates(_col(df, "_pkg")), _dates(_col(df, "_pkg_est"))
+    both = rec.notna() & est.notna()
+    if not both.any():
+        return None
+    a, b = rec[both].values.astype("datetime64[D]"), est[both].values.astype("datetime64[D]")
+    gap = pd.Series(np.where(b >= a, 1, -1) * np.busday_count(np.minimum(a, b), np.maximum(a, b), holidays=_HOLS),
+                    index=rec[both].index)
+    t_rec = pd.to_numeric(_col(df, "_fund_bd"), errors="coerce")[both]
+    t_est = pd.to_numeric(_col(df, "_fund_bd_est"), errors="coerce")[both]
+    src = _col(df, "_pkg_src").map(_txt)[both]
+    return {"n": int(both.sum()), "same": (gap == 0).mean() * 100, "within1": (gap.abs() <= 1).mean() * 100,
+            "gap": float(gap.mean()), "turn_rec": float(t_rec.mean()), "turn_est": float(t_est.mean()),
+            "same_rec": (t_rec == same_day).mean() * 100, "same_est": (t_est == same_day).mean() * 100,
+            "by_src": {s: (int((src == s).sum()), (gap[src == s] == 0).mean() * 100) for s in EST_SOURCES
+                       if (src == s).any()}}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def pkg_calibration(inst: str, tok: str, rt: str, sel: str, same_day: int) -> dict | None:
+    """estimate_accuracy over every draw wired since the package date began (Aug 3, 2026): the check behind the
+       estimated figures shown for earlier periods. Refreshed daily."""
+    df = run_soql(inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' "
+                             f"AND {WIRE_FIELD}>={PKG_LAUNCH:%Y-%m-%d} AND {WIRE_FIELD}<={_today():%Y-%m-%d}")
+    if df.empty:
+        return None
+    df = apply_lg_correction(add_intervals(df), lg_config(), same_day)
+    hist = _history_by_draw(draw_history(inst, tok, tuple(_col(df, "Id").dropna())))
+    return estimate_accuracy(estimate_package(df, hist, same_day), same_day)
+
+
+def _est_check_text(acc: dict) -> str:
+    """How the estimate did against recorded dates, in a sentence or two."""
+    lean = acc["turn_est"] - acc["turn_rec"]
+    return (f"Checked against the {acc['n']:,} draws that do have the recorded date: the same business day on "
+            f"{acc['same']:.0f}%, within one business day on {acc['within1']:.0f}%."
+            + (f" Estimates read a little {'quick' if lean < 0 else 'slow'} ({_bd(acc['turn_est'])} vs "
+               f"{_bd(acc['turn_rec'])} recorded), so compare estimated months with estimated months."
+               if abs(lean) >= 0.05 else ""))
+
+
+def _with_estimates(t: pd.DataFrame, d: pd.DataFrame) -> pd.DataFrame:
+    """The draws table plus the estimated package date, where it came from and the turn-time it gives — for draws with
+       no recorded package date, and only when there are any (the recorded columns stay as they are)."""
+    est = _dates(_col(d, "_pkg_est")).where(_dates(_col(d, "_pkg")).isna())
+    if not est.notna().any() or "Turn-time (bd)" not in t:
+        return t
+    t, at = t.copy(), t.columns.get_loc("Turn-time (bd)") + 1
+    t.insert(at, "Package received (est.)", est.values)
+    t.insert(at + 1, "Estimate from", _col(d, "_pkg_src").map(_txt).where(est.notna()).values)
+    t.insert(at + 2, "Turn-time est. (bd)",
+             pd.to_numeric(_col(d, "_fund_bd_est"), errors="coerce").where(est.notna()).values)
+    return t
+
+
 def _turn_stats(fg: pd.DataFrame, same_day: int) -> dict:
-    """The package-received -> wire numbers for a set of draws, plus how many could be measured."""
+    """The package-received -> wire numbers for a set of draws, plus how many could be measured — and the same from
+       the estimated package dates (est_*), kept apart."""
     turn = fg["_fund_bd"].dropna()
     eligible = int((pd.to_datetime(fg["_wire"], errors="coerce") >= PKG_LAUNCH).sum())
+    est = pd.to_numeric(_col(fg, "_fund_bd_est"), errors="coerce").dropna()
+    wired = int(pd.to_datetime(fg["_wire"], errors="coerce").notna().sum())
+    src = _col(fg, "_pkg_src").map(_txt)
     return {"turn": turn, "n": len(turn), "eligible": eligible,
             "coverage": len(turn) / eligible * 100 if eligible else None,
             "same": (turn == same_day).mean() * 100 if len(turn) else None,
-            "fast": (turn <= 3 + same_day).mean() * 100 if len(turn) else None}
+            "fast": (turn <= 3 + same_day).mean() * 100 if len(turn) else None,
+            "est": est, "est_n": len(est), "est_wired": wired, "est_cov": len(est) / wired * 100 if wired else None,
+            "est_same": (est == same_day).mean() * 100 if len(est) else None,
+            "est_fast": (est <= 3 + same_day).mean() * 100 if len(est) else None,
+            "est_mix": src[src != ""].value_counts().to_dict(),
+            "est_ok": len(est) >= EST_MIN_DRAWS and bool(wired) and len(est) / wired * 100 >= EST_MIN_COVERAGE}
 
 
 def render_pipeline(inst, tok, rt, sel, same_day, links=()):
@@ -2576,15 +2762,42 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     with st.spinner(f"Loading {feat}…"):
         fg = apply_lg_correction(add_intervals(run_soql(
             inst, tok, f"SELECT {sel} FROM Advance__c WHERE RecordTypeId='{rt}' AND {period_where}")), cfg, same_day)
+        if not fg.empty:
+            ids = tuple(_col(fg, "Id").dropna())
+            ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
+            fg = estimate_package(fg, hist, same_day)        # package dates estimated for draws without one
     if fg.empty:
         st.info(f"No draws were wired in {feat}."); return
 
     s = _turn_stats(fg, same_day)
+    acc = estimate_accuracy(fg, same_day)                  # how the estimate matched recorded dates: this period's
+    if not acc or acc["n"] < EST_MIN_DRAWS:                # own draws, else every draw since Aug 3 (checked daily)
+        try:
+            acc = pkg_calibration(inst, tok, rt, sel, same_day) or acc
+        except Exception:
+            pass
     funded = pd.to_numeric(fg.get(AMT), errors="coerce").sum() if AMT else None
     holds = int(flight["Status__c"].astype(str).str.contains("Hold|Pending Borrower|Revision", case=False,
                                                               na=False).sum()) if "Status__c" in flight else 0
     k = st.columns(4)
-    if s["eligible"]:
+    if not s["eligible"] and s["est_ok"]:                  # before Aug 3, 2026: estimated, and labelled so
+        mix = " · ".join(f"{EST_SOURCES[x]} {n}" for x, n in s["est_mix"].items())
+        k[0].metric("Turn-time · full package → wire (est.)", "≈" + _bd(s["est"].mean()),
+                    f"≈{s['est_same']:.0f}% same day", delta_color="off", delta_arrow="off", border=True,
+                    help="Average business days from each draw's estimated full-package date to the wire.")
+        k[1].metric("Funded within 3 days of a full package (est.)", f"{s['est_fast']:.0f}%", border=True)
+        k[2].metric("Median turn-time (est.)", _bd(s["est"].median()), border=True)
+        k[3].metric("Estimated on", f"{s['est_n']:,} of {s['est_wired']:,} draws",
+                    f"{s['est_cov']:.0f}% dated" + (" · indicative" if s["est_cov"] < 90 else ""),
+                    delta_color="off", delta_arrow="off", border=True,
+                    help=f"Draws whose package date could be estimated, from {mix}. Under 90% dated, read the period's "
+                         "figure as indicative.")
+        st.caption("**Estimated.** The *Full Draw Package Received* date only started on Aug 3, 2026, so here each "
+                   "draw's package date is estimated from what Salesforce kept: its notes (the first “sent for "
+                   "approval” or “approved” entry after the last one about something still missing), else its status "
+                   "history, else its Date Submitted For Internal Review — always between the request and the Land "
+                   "Gorilla wire date." + (f" {_est_check_text(acc)}" if acc else "") + " See the Package date check tab.")
+    elif s["eligible"]:
         k[0].metric("Turn-time · full package → wire", _bd(s["turn"].mean()) if s["n"] else "—",
                     f"{s['same']:.0f}% same day" if s["same"] is not None else None, delta_color="off",
                     delta_arrow="off", border=True,
@@ -2599,7 +2812,10 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                          "See the Package date check tab.")
     else:
         st.info("Turn-time starts with draws wired on or after **Aug 3, 2026**, when the *Full Draw Package "
-                "Received* date began being recorded. Pick a period from August 2026 on.", icon=":material/info:")
+                "Received* date began being recorded." + (
+                    f" Too few of these draws could be dated from their notes and status history to estimate it "
+                    f"({s['est_n']} of {s['est_wired']})." if s["est_wired"] else "")
+                + " Pick a period from August 2026 on.", icon=":material/info:")
     k2 = st.columns(4)
     k2[0].metric(f"Draws funded · {feat}", f"{len(fg):,}", money(funded) if funded is not None else None,
                  delta_color="off", delta_arrow="off", border=True)
@@ -2610,7 +2826,10 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                       "loan aren't counted (see Find a draw → Not wired yet).")
     if s["n"]:
         st.caption(f"In **{feat}**, once a full draw package was in, draws were wired in **{_bd(s['turn'].mean())}** "
-                   f"on average" + (f" — **{s['same']:.0f}% the same day**" if s["same"] else "") + ".")
+                   f"on average" + (f" — **{s['same']:.0f}% the same day**" if s["same"] else "") + "."
+                   + (f" Estimated the way months before Aug 3, 2026 are: ≈{_bd(s['est'].mean())}, ≈{s['est_same']:.0f}% "
+                      "the same day — compare that figure, not the recorded one, with earlier months."
+                      if s["est_ok"] else ""))
 
     _period_funding_file(inst, tok, rt, feat, period_where, p_end)      # the template, right where it's needed
 
@@ -2622,9 +2841,7 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                      "Loans": g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None,
                      "Funded ($)": amt, "Average draw ($)": round(amt / len(g)) if amt is not None and len(g) else None})
     roll = pd.DataFrame(rows)
-    ids = tuple(_col(fg, "Id").dropna())
-    ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
-    table = _draw_table(fg, inst, ap)
+    table = _with_estimates(_draw_table(fg, inst, ap), fg)
 
     t_sum, t_draws, t_detail, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
                                                  ":material/manage_search: Draw & deal details",
@@ -2644,7 +2861,15 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
         with st.expander("How these numbers work"):
             st.markdown(
                 "- **Package received** — the *Full Draw Package Received* date in Salesforce: the day the borrower's "
-                "package was complete. It started being recorded on **Aug 3, 2026**, so turn-time begins there.\n"
+                "package was complete. It started being recorded on **Aug 3, 2026**, so recorded turn-time begins "
+                "there.\n"
+                "- **Estimated package date** — for draws without a recorded date (everything before Aug 3, 2026): the "
+                "first note entry marking the draw sent for approval or approved after the last entry about something "
+                "still missing; else the day its status history shows it moving from waiting into review; else its "
+                "Date Submitted For Internal Review. Only dates between the request and the wire count, and the "
+                "figures say *est.*\n"
+                "- **Recorded and estimated are never mixed** — compare months before Aug 3 on the estimated figure; "
+                "later months show the same estimate next to the recorded one.\n"
                 "- **Wired** — the draw's funding date in Land Gorilla.\n"
                 "- **Turn-time** = package received → wired, in business days (weekends and federal holidays skipped).\n"
                 "- How long borrowers take to get to a full package is their responsibility, so it isn't an overview "
@@ -2664,7 +2889,7 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     with t_detail:
         _draw_details(inst, tok, rt, sel, fg, ap, feat, hist)
     with t_check:
-        _package_check(fg, table, same_day, hist)
+        _package_check(fg, table, same_day, hist, acc)
 
 
 DEAL_FACTS = (("C", "Deal"), ("D", "Borrower"), ("E", "Sponsor"), ("J", "Project type"), ("AJ", "RM / LO"),
@@ -2756,14 +2981,55 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
     return lg["loans"].get(_txt(first.get("B")) or _txt(row.get("Loan_Number__c")))
 
 
-def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: dict | None = None):
+def _estimate_check(fg: pd.DataFrame, table: pd.DataFrame, s: dict, acc: dict | None):
+    """Before Aug 3, 2026: how many draws could be given an estimated package date, from where, and how closely the
+       estimate matches recorded dates (on draws that have both) — plus the draws that couldn't be dated."""
+    st.markdown("Before Aug 3, 2026 the date wasn't recorded, so each draw's package date is estimated from its notes, "
+                "else its status history, else its Date Submitted For Internal Review. These checks show how far that "
+                "can be trusted for this period.")
+    if not s["est_wired"]:
+        st.info("No draws were wired in this period."); return
+    cov = s["est_cov"] or 0
+    rows = [("Draws dated", f"{cov:.0f}%  ({s['est_n']} of {s['est_wired']})",
+             "Too few draws to judge" if s["est_wired"] < EST_MIN_DRAWS else
+             "Good — nearly every draw could be dated" if cov >= 90 else
+             "Fair — read the period's turn-time as indicative" if cov >= EST_MIN_COVERAGE else
+             "Low — too few draws could be dated for turn-time to speak for the period"),
+            ("Dated from", " · ".join(f"{EST_SOURCES[x]} {n}" for x, n in s["est_mix"].items()) or "—",
+             "The notes are the most direct; Salesforce's status history only starts in late May 2026")]
+    if acc:
+        lean = acc["turn_est"] - acc["turn_rec"]
+        rows.append(("Matches recorded dates", f"same business day {acc['same']:.0f}% · within one "
+                     f"{acc['within1']:.0f}%  ({acc['n']} draws)",
+                     "Checked on draws that have the recorded date"
+                     + (f"; estimates read a little {'quick' if lean < 0 else 'slow'} ({_bd(acc['turn_est'])} vs "
+                        f"{_bd(acc['turn_rec'])} recorded), so compare estimated months with estimated months"
+                        if abs(lean) >= 0.05 else "")))
+        rows += [(f"… dated from {EST_SOURCES[x]}", f"same business day {same:.0f}%  ({n} draws)", "")
+                 for x, (n, same) in acc["by_src"].items()]
+    st.dataframe(pd.DataFrame(rows, columns=["Check", "Result", "What it means"]), hide_index=True, width="stretch",
+                 column_config={"What it means": st.column_config.TextColumn(width="large")})
+    none_ = ((_col(fg, "_pkg_src").map(_txt) == "") & pd.to_datetime(fg["_wire"], errors="coerce").notna()).values
+    if none_.any():
+        with st.expander(f"Draws with no estimate ({int(none_.sum())})", icon=":material/rule:"):
+            st.dataframe(table.loc[none_, [c for c in ("Loan #", "Draw #", "Deal", "Requested", "Wired", "Coordinator",
+                                                        "Held up by", "Salesforce") if c in table]],
+                         hide_index=True, width="stretch", column_config=_table_config())
+            st.caption("No note entry marks these sent for approval or approved after the last hold-up, Salesforce's "
+                       "status history doesn't reach them, and no Date Submitted For Internal Review falls between the "
+                       "request and the wire.")
+
+
+def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: dict | None = None,
+                   acc: dict | None = None):
     """Is the full-package date trustworthy for this period? Checked live, in plain English. Draws missing the date
-       get the date their status history suggests, so it can be filled in (estimates never count toward turn-time)."""
+       get the date their status history suggests, so it can be filled in (estimates never count toward turn-time).
+       Before Aug 3, 2026, the checks are on the estimated dates instead (acc: how the estimate matched recorded dates)."""
     s = _turn_stats(fg, same_day)
+    if not s["eligible"]:
+        _estimate_check(fg, table, s, acc); return
     st.markdown("The *Full Draw Package Received* date is new (Aug 3, 2026), so these checks show whether it's "
                 "being recorded well enough to measure turn-time.")
-    if not s["eligible"]:
-        st.info("No draws in this period were wired after Aug 3, 2026."); return
     wire = pd.to_datetime(fg["_wire"], errors="coerce")
     pkg = pd.to_datetime(fg["_pkg"], errors="coerce")
     req = pd.to_datetime(fg["_lg_req"], errors="coerce")
@@ -2802,6 +3068,12 @@ def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: d
                  "Fine — listed below" if share_bad <= 2 else "Data-entry problem — review the list below"))
     if old:
         rows.append(("Old values ignored", str(old), "Dates from before Aug 3, 2026 belong to the field's old use"))
+    here = estimate_accuracy(fg, same_day)
+    if here and here["n"] >= 10:
+        rows.append(("Estimate vs recorded", f"same business day {here['same']:.0f}% · within one "
+                     f"{here['within1']:.0f}%  ({here['n']} draws)",
+                     "How closely the package date estimated for months before Aug 3, 2026 (from notes and status "
+                     "history) matches the recorded date in this period"))
     st.dataframe(pd.DataFrame(rows, columns=["Check", "Result", "What it means"]), hide_index=True, width="stretch",
                  column_config={"What it means": st.column_config.TextColumn(width="large")})
 
@@ -2946,14 +3218,16 @@ def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: in
     if alt is None:
         st.bar_chart(roll.set_index("_raw")["Funded ($)"])
         return
-    turn = fg["_fund_bd"].dropna()
+    turn, est = fg["_fund_bd"].dropna(), ""
+    if not len(turn) and _turn_stats(fg, same_day)["est_ok"]:     # before Aug 3, 2026: the estimated dates
+        turn, est = pd.to_numeric(_col(fg, "_fund_bd_est"), errors="coerce").dropna(), " (estimated)"
     if len(turn):
         top = 10
         days = turn.clip(upper=top).astype(int)
         dist = days.value_counts().reindex(range(same_day, top + 1), fill_value=0).rename_axis("d").reset_index(
             name="Draws")
         dist["Business days"] = dist["d"].map(lambda d: f"{d}+" if d == top else str(d))
-        st.markdown(f"**Full package → wire, {feat}**")
+        st.markdown(f"**Full package → wire, {feat}{est}**")
         st.altair_chart(alt.Chart(dist).mark_bar(color="#4C78A8").encode(
             x=alt.X("Business days:N", sort=list(dist["Business days"]), axis=alt.Axis(labelAngle=0)),
             y=alt.Y("Draws:Q"), tooltip=["Business days", "Draws"]), width="stretch")
@@ -3339,6 +3613,7 @@ def _draw_search(inst, tok, rt, sel, same_day):
         df = _newest_first(apply_lg_correction(df, cfg, same_day))
         ids = tuple(_col(df, "Id").dropna())
         ap, hist = approvals_for(inst, tok, ids), _history_by_draw(draw_history(inst, tok, ids))
+        df = estimate_package(df, hist, same_day)          # for draws wired before the package date was recorded
     nloans = df["Loan_Number__c"].nunique(dropna=False) if "Loan_Number__c" in df else len(df)
     c = st.columns([1, 1, 2])
     oldest = (c[0].segmented_control(
@@ -3424,10 +3699,19 @@ def _render_draw(row: pd.Series, ap: pd.DataFrame, inst: str, h: pd.DataFrame | 
     reasons = delay_labels(row.get(NOTES_FIELD))
     m = st.columns(4)
     m[0].metric("Funded", money(row.get(NET_FIELD)) if pd.notna(row.get(NET_FIELD)) else "—", border=True)
-    m[1].metric("Turn-time", _bd(row.get("_fund_bd")), border=True,
-                help="Business days from full draw package received to wire")
-    m[2].metric("Days to a full package", _bd(row.get("_wait_bd")), border=True,
-                help="Business days from the request to a full package — the borrower's part")
+    fund, wait = pd.to_numeric(row.get("_fund_bd"), errors="coerce"), pd.to_numeric(row.get("_wait_bd"), errors="coerce")
+    est_from = EST_SOURCES.get(_txt(row.get("_pkg_src")))
+    if pd.isna(fund) and pd.isna(_d(row.get("_pkg"))) and est_from:     # no package date recorded: the estimate
+        fund_e, wait_e = (pd.to_numeric(row.get(c), errors="coerce") for c in ("_fund_bd_est", "_wait_bd_est"))
+        m[1].metric("Turn-time (est.)", ("≈" if pd.notna(fund_e) else "") + _bd(fund_e), border=True,
+                    help=f"No package date was recorded; estimated from {est_from}.")
+        m[2].metric("Days to a full package (est.)", ("≈" if pd.notna(wait_e) else "") + _bd(wait_e), border=True,
+                    help=f"Business days from the request to the package date estimated from {est_from} — the "
+                         "borrower's part")
+    else:
+        m[1].metric("Turn-time", _bd(fund), border=True, help="Business days from full draw package received to wire")
+        m[2].metric("Days to a full package", _bd(wait), border=True,
+                    help="Business days from the request to a full package — the borrower's part")
     m[3].metric("Request → wire", _bd(row.get("_days")), border=True)
     if a is not None and _txt(a.get("_ic_label")):
         tone = _txt(a.get("_ic_tone")) if _txt(a.get("_ic_tone")) in ("green", "orange", "red", "blue") else "gray"
