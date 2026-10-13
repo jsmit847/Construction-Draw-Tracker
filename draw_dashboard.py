@@ -1140,10 +1140,11 @@ def funded_by_quarter(inst: str, tok: str, rt: str, since: str, until: str) -> p
     return out.astype({"y": int, "q": int, "n": int, "fnf_n": int})[cols]
 
 
-def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame) -> dict:
+def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame, as_of: date | None = None) -> dict:
     """Figures for the workbook's Total Summary sheet: quarterly totals since 2021, this month to date, and this
-       request's wired draws — each with the FNF (single-asset bridge) share, all at gross approved amounts."""
-    today = _today()
+       request's wired draws — each with the FNF (single-asset bridge) share, all at gross approved amounts. As of
+       the list's submitted date (default today), so a rebuilt old list shows that month."""
+    today = as_of or _today()
     quarters = funded_by_quarter(inst, tok, rt, "2021-01-01", f"{today:%Y-%m-%d}")
     month = funded_by_quarter(inst, tok, rt, f"{today.replace(day=1):%Y-%m-%d}", f"{today:%Y-%m-%d}")
     u = pd.to_numeric(_col(rows, "U"), errors="coerce").fillna(0)
@@ -1156,7 +1157,7 @@ def file_summary(inst: str, tok: str, rt: str, rows: pd.DataFrame) -> dict:
         pending = ~wired
     fnf = _col(rows, "Deal_RecordType__c").eq(FNF_TYPE)
     ids = _col(rows, "Id")
-    return {"quarters": quarters, "mtd": float(month["amt"].sum()), "mtd_n": int(month["n"].sum()),
+    return {"as_of": today, "quarters": quarters, "mtd": float(month["amt"].sum()), "mtd_n": int(month["n"].sum()),
             "mtd_fnf": float(month["fnf_amt"].sum()), "mtd_fnf_n": int(month["fnf_n"].sum()),
             "pending": float(u[pending].sum()), "req": float(u[wired].sum()), "req_n": int(ids[wired].nunique()),
             "req_fnf": float(u[wired & fnf].sum()), "req_fnf_n": int(ids[wired & fnf].nunique())}
@@ -1175,7 +1176,7 @@ def _write_total_summary(wb, summary: dict) -> None:
     for row in ws.iter_rows(min_row=1, max_row=max(ws.max_row, 60), max_col=12):
         for c in row:
             c.value = None
-    today = _today()
+    today = summary.get("as_of") or _today()
     now = (today.year, (today.month - 1) // 3 + 1)
     bold = Font(bold=True)
 
@@ -1435,7 +1436,8 @@ def build_funding_file(inst: str, tok: str, rt: str, tpl: str, rows: pd.DataFram
     rows, ftypes, lg = lg_overlay(rows, ftypes, lg_config())
     ap = approvals_for(inst, tok, tuple(_col(rows, "Id").dropna()))
     xlsx = fill_melanie_template(tpl, rows, ftypes, submitted_by, funding_date,
-                                 file_summary(inst, tok, rt, rows), _prep_table(rows, lg, ap, ftypes), **layout)
+                                 file_summary(inst, tok, rt, rows, layout.get("submitted_on")),
+                                 _prep_table(rows, lg, ap, ftypes), **layout)
     return xlsx, len(rows)
 
 
@@ -4082,6 +4084,23 @@ def _upcoming_picker(one: pd.DataFrame, key: str, tick_loc: bool = False) -> pd.
                               "Funding to": C.TextColumn(help="The receiving bank")})
 
 
+def _keep(key: str, default, auto=None):
+    """Start a widget from its last value, so it survives not being drawn (a mode switch, another page). With auto,
+       the widget follows that automatic value until someone changes it by hand. Call before the widget; store the
+       widget's value afterwards with _kept."""
+    cur = st.session_state.get(key, st.session_state.get("_kept_" + key))
+    if auto is not None:
+        prev = st.session_state.get("_auto_" + key)
+        cur = auto if cur is None or cur == prev else cur
+        st.session_state["_auto_" + key] = auto
+    st.session_state[key] = default if cur is None else cur
+
+
+def _kept(key: str, value):
+    st.session_state["_kept_" + key] = value
+    return value
+
+
 def render_funding_request(inst, tok, rt, sel, same_day):
     st.header("Funding request")
     st.caption("Melanie's weekly *Construction/Renovation Funding Request*: upcoming draws for the team to OK on top, "
@@ -4093,29 +4112,30 @@ def render_funding_request(inst, tok, rt, sel, same_day):
     with st.container(border=True):
         c = st.columns([1.2, 1, 1, 1.6])
         who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name (E3)")
-        sent = c[1].date_input("Submitted date", value=today, key="fr_sent", format="MM/DD/YYYY",
-                               help="The day the list goes out — E4 on the file. The wire dates below count back from "
-                                    "it, so set it to an old date (e.g. 8/19/2026) to rebuild that week's list.")
-        auto = _next_business_day(sent)                    # E5 follows the submitted date until it's changed by hand
-        if st.session_state.get("fr_date") in (None, st.session_state.get("_fr_date_auto")):
-            st.session_state["fr_date"] = auto
-        st.session_state["_fr_date_auto"] = auto
-        fdate = c[2].date_input("Scheduled funding date", key="fr_date", format="MM/DD/YYYY",
-                                help="E5 on the file, and the date in its name. Starts as the business day after the "
-                                     "submitted date; Melanie sometimes uses the submitted date itself.")
+        _keep("fr_sent", today)
+        sent = _kept("fr_sent", c[1].date_input(
+            "Submitted date", key="fr_sent", format="MM/DD/YYYY",
+            help="The day the list goes out — E4 on the file. The wire dates below count back from it, so set it to an "
+                 "old date (e.g. 8/19/2026) to rebuild that week's list."))
+        _keep("fr_date", _next_business_day(sent), auto=_next_business_day(sent))   # follows the submitted date
+        fdate = _kept("fr_date", c[2].date_input(                                    # until changed by hand
+            "Scheduled funding date", key="fr_date", format="MM/DD/YYYY",
+            help="E5 on the file, and the date in its name. Starts as the business day after the submitted date; "
+                 "Melanie sometimes uses the submitted date itself."))
         mode = c[3].segmented_control("Draws", ["Wired", "Open (not yet wired)"], default="Wired", key="fr_mode",
                                       help="Wired: the draws wired in the dates below — Melanie's weekly list. Open: "
                                            "draw requests not wired yet.") or "Wired"
         window = None
         if mode == "Wired":
             r = st.columns([2, 1.4])
-            preset = r[0].pills("Wired between", list(RANGE_PRESETS), default="Since last Thursday", key="fr_preset",
-                                help="Which wire dates the list covers, counted back from the submitted date. The range "
-                                     "is printed next to the Submitted Date on the file (F4), the way Melanie writes "
-                                     "it.") or "Since last Thursday"
+            _keep("fr_preset", "Since last Thursday")
+            preset = _kept("fr_preset", r[0].pills(
+                "Wired between", list(RANGE_PRESETS), key="fr_preset",
+                help="Which wire dates the list covers, counted back from the submitted date. The range is printed "
+                     "next to the Submitted Date on the file (F4), the way Melanie writes it.")) or "Since last Thursday"
             if preset == "Custom":
-                rng = r[1].date_input("From – to", value=(_thursday_before(sent), sent), key="fr_rng",
-                                      format="MM/DD/YYYY")
+                _keep("fr_rng", (_thursday_before(sent), sent), auto=(_thursday_before(sent), sent))
+                rng = _kept("fr_rng", r[1].date_input("From – to", key="fr_rng", format="MM/DD/YYYY"))
                 if len(rng) != 2:
                     st.info("Pick a start and an end date."); return
                 lo, hi = rng
@@ -4136,6 +4156,8 @@ def render_funding_request(inst, tok, rt, sel, same_day):
             scope = f"wired {_mdy(lo)} – {_mdy(hi)}"
         else:
             where, scope = OPEN_WHERE, "not yet wired"
+            st.caption("Every live draw request not wired yet — not Melanie's weekly list. For her list, pick Wired; the "
+                       "draws she puts on top are picked there, under Upcoming draws for the top of the file.")
     with st.spinner("Loading draws…"):
         rows, ftypes, _ = funding_request_rows(inst, tok, rt, where)
         reqs, _hist = open_requests(inst, tok, rt, sel, same_day)
@@ -4195,12 +4217,12 @@ def render_funding_request(inst, tok, rt, sel, same_day):
                     column_config={"Net": st.column_config.NumberColumn(format="dollar", help="Net funding")})
                 why[_col(rows, "Id").isin(set(back.loc[back["Add back"].astype(bool), "Id"]))] = ""
         rows = rows[why == ""].assign(_label="Funded")
-        one, otypes = upcoming_draws(inst, tok, rt, hi)
+        one, otypes = upcoming_draws(inst, tok, rt, max(hi, today))     # a wire date already past isn't "planned"
         if not one.empty:                    # live requests, plus draws already given a wire date after the window
             one = one[one["Id"].isin(set(_col(live, "Id"))) | (_col(one, WIRE_FIELD).map(_txt) != "")]
         if not one.empty:
             past = sent < today
-            with st.expander(f"Upcoming draws for the top of the file ({len(one)} in play)",
+            with st.expander(f"Upcoming draws for the top of the file ({len(one)} open draws to pick from)",
                              icon=":material/upcoming:", expanded=not past):
                 if past:
                     st.warning(f"These are draws open **today**, not on {_mdy(sent)}. To rebuild that week's list, "
