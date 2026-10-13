@@ -2995,10 +2995,8 @@ MATURED = "Loan matured — waiting on an extension"
 # out of every open-draws count and list unless picked under "Also show".
 SET_ASIDE = ("Cancelled (no status)", "Loan paid off", "Cancelled in Land Gorilla", "Not submitted in Land Gorilla yet",
              "No amount ($0)", f"No activity in {STALE_BD} business days", MATURED)
-# A draw still waiting on the borrower or the inspection can't fund on a loan past its maturity until an extension is
-# booked. One already in approval most likely has it (Salesforce's maturity date can lag the extension), so it stays.
-WAITING_STATUSES = ("Received", "Pending Inspection", "Pending Inspection Report Revision", "Pending Borrower Response",
-                    "Hold")
+# (A draw still waiting — WAITING_STATUSES — can't fund on a loan past its maturity until an extension is booked. One
+# already in approval most likely has it, since Salesforce's maturity date can lag the extension, so it stays.)
 # Fields that tell a live request from the rest, each checked on its own so a missing one just drops out.
 OPEN_EXTRA = (GROSS_APPROVED, "Deal__r.StageName", "Deal__r.Servicer_Status__c", "Deal__r.Payoff_Date__c",
               "Deal__r.Updated_Loan_Maturity_Date__c", "Deal__r.Current_Line_Maturity_Date__c", "Loan_Type__c",
