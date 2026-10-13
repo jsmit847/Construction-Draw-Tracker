@@ -4156,7 +4156,10 @@ def render_funding_request(inst, tok, rt, sel, same_day):
     today = _today()
     with st.container(border=True):
         c = st.columns([1.2, 1, 1, 1.6])
-        who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name (E3)")
+        who = c[0].text_input("Submitted by", key="fr_by", placeholder="Your name (E3)",
+                              help="Whoever sends the list — the name is only printed at the top of the file (E3, "
+                                   "\"Submitted By:\"). It doesn't filter anything: every coordinator's draws are on "
+                                   "the list unless you pick someone under Coordinator / analyst.")
         _keep("fr_sent", today)
         sent = _kept("fr_sent", c[1].date_input(
             "Submitted date", key="fr_sent", format="MM/DD/YYYY",
