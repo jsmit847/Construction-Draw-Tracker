@@ -821,7 +821,8 @@ MELANIE_PROPERTY_MAP = {
 # The same draw's Property_Advance__c values beat the property's own (as of the draw): As-Is and As Complete.
 PA_FIRST = {"K": "_pa_bpo", "L": "_pa_arv"}
 ESTIMATED_COMPLETION_DAYS = 31                         # her Estimated Completion Date = Maturity Date − 31 days
-ZERO_IS_BLANK = {"K", "L", "O", "Q", "T", "AB"}        # a $0 / 0% here means "not filled in", never a real value
+ZERO_IS_BLANK = {"K", "L", "O", "T", "AB"}        # a $0 / 0% here means "not filled in", never a real value (Q's $0
+                                                   # is real: no initial funding — her files show $0, 176 of 176 match)
 STREET_PARTS = ("Street_Number__c", "Street_Name__c")   # F Property Street = number + name
 # Computed columns written as live Excel formulas — only where every input cell is filled.
 MELANIE_FORMULAS = {"R": "=Q{r}/K{r}",           # LTV% As-is = initial funding / as-is value
@@ -832,10 +833,12 @@ TEMPLATE_CANDIDATES = ("Advance_template.xlsx", "melanie_template.xlsx",
                        "Construction-Renovation_Funding_Request_template.xlsx")
 TEMPLATE_SHEET, TEMPLATE_HEADER_ROW = "Combined Funding Request", 7
 PERSON_FIELDS = ("Advance_Coordinator__r.Name", "Advance_Analyst__r.Name")
-# Her current layout's people columns (CURRENT_TAIL), each a role on the deal's Deal Team (OpportunityTeamMember):
-# Construction Manager is the role of that name (on every loan in her files; her own example row names it). Asset
-# Manager 1 and 2 are the roles Salesforce's Generate File prints under those headers (the same person on 99 of 99 rows).
-DEAL_TEAM_COLUMNS = {"AK": "Construction Manager", "AL": "Asset Manager", "AM": "Asset Manager 2"}
+# Her current layout's people columns (CURRENT_TAIL), from the deal's Deal Team (OpportunityTeamMember), the way her
+# weekly files have them: her "Construction Manager" is the Deal Team's "Asset Manager" (26 of 26 filled rows on her
+# 8/19 list; Salesforce's Generate File prints the same person as "Asset Manager 1", 99 of 99) and her "Asset Manager 1"
+# is the Deal Team's "Asset Manager 2" (11 of 11). She leaves Asset Manager 2 blank. (The Deal Team role named
+# "Construction Manager" is the draw coordinator; none of her 26 names match it.)
+DEAL_TEAM_COLUMNS = {"AK": "Asset Manager", "AL": "Asset Manager 2"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1402,8 +1405,9 @@ def _melanie_look(ws, first: int, last: int) -> None:
             if col in MEL_ALIGN or col in MEL_WRAP:
                 cell.alignment = Alignment(horizontal=MEL_ALIGN.get(col), vertical=cell.alignment.vertical,
                                            wrap_text=True if col in MEL_WRAP else None)
-        note = _txt(ws.cell(r, ci("AF")).value)
-        ws.row_dimensions[r].height = 15.75 if not note else min(150.0, 13.0 * math.ceil(len(note) / 34) + 3)
+        note, label = _txt(ws.cell(r, ci("AF")).value), _txt(ws.cell(r, ci("A")).value)
+        ws.row_dimensions[r].height = (15.75 if not note or label.startswith("Funded")     # wired rows stay compact,
+                                       else min(63.75, 13.0 * math.ceil(len(note) / 34) + 3))   # as hers are
     tail = range(max(last + 1, first), ws.max_row + 1)
     if tail and all(c.value in (None, "") for row in ws.iter_rows(min_row=tail.start, max_row=tail.stop - 1)
                     for c in row):
@@ -4199,6 +4203,9 @@ def render_funding_request(inst, tok, rt, sel, same_day):
                                            "before the 1st — Melanie's weekly window",
                     "Last 7 days": "the 7 days up to the submitted date",
                     "Month to date": "the 1st through the submitted date, like Salesforce's Generate File"}[preset])
+            if preset == "Since last Thursday" and sent.weekday() == 3 and lo < sent - timedelta(days=6):
+                r[1].caption("Sending on a Thursday? This reaches back 8 days, to last Thursday — if your last list "
+                             "already covered some of those days, pick Custom.")
             window = _window_text(lo, hi)
             where = f"{WIRE_FIELD}>={lo:%Y-%m-%d} AND {WIRE_FIELD}<={hi:%Y-%m-%d}"
             scope = f"wired {_mdy(lo)} – {_mdy(hi)}"
@@ -4314,6 +4321,12 @@ def render_funding_request(inst, tok, rt, sel, same_day):
         if len(funded):
             st.caption(f"For the running totals: FNF (single-asset bridge) draws on this list — "
                        f"{_col(funded, 'Id')[fnf].nunique()} draws, {money(u[fnf].sum())}.".replace("$", "\\$"))
+        if len(top):                                        # what the file's Total will say
+            tu = pd.to_numeric(_col(top, "U"), errors="coerce").fillna(0)
+            cnt = _col(top, "_count").map(lambda x: x is True or x is np.True_).astype(bool)
+            st.caption((f"File Total (E6): **{money(u.sum() + tu[cnt].sum())}** = wired {money(u.sum())} + "
+                        f"{int(cnt.sum())} of {len(top)} top rows ticked *Count in total* ({money(tu[cnt].sum())}). "
+                        "Melanie's Total usually includes her top rows.").replace("$", "\\$"))
     else:
         m = st.columns(3)
         m[0].metric("Draw requests", f"{len(funded):,}", border=True)
@@ -4321,9 +4334,12 @@ def render_funding_request(inst, tok, rt, sel, same_day):
         m[2].metric("Requested", money(u.sum()), border=True,
                     help="What the draws ask for: Land Gorilla's requested totals, else Salesforce's requested "
                          "amounts, else its approved totals")
-    notes = st.checkbox("Also fill Comments and Funding to from Salesforce notes and Land Gorilla payees",
-                        key="fr_notes", help="Melanie clears these on wired rows; both are on the Prep worksheet "
-                                             "either way.")
+    notes = st.checkbox("Also fill Comments and Funding to on the wired rows (Melanie leaves them blank)",
+                        key="fr_notes", help="Writes each wired draw's Salesforce notes into Comments (AF) and its Land "
+                                             "Gorilla payees into Funding to (AG). Melanie leaves both blank on wired "
+                                             "rows — her 8/19 list has none — so leave this unticked to match her file. "
+                                             "Both are on the Prep worksheet either way, and the comment you type for an "
+                                             "upcoming draw always goes in.")
     _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope,
                       {"window": window, "total_from": total_from, "notes": notes, "submitted_on": sent})
     # When each draw was requested: Land Gorilla's date, else the same request date Find a draw shows
