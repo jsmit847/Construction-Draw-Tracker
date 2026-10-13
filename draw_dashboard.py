@@ -2970,7 +2970,7 @@ STALE_BD = 20          # no status change, dated note or new record in this many
 # Why a not-wired record isn't a live draw request, checked in this order (blank = it is one). Set-aside records stay
 # out of every open-draws count and list unless picked under "Also show".
 SET_ASIDE = ("Cancelled (no status)", "Loan paid off", "Cancelled in Land Gorilla", "Not submitted in Land Gorilla yet",
-             "Nothing requested ($0)", f"No activity in {STALE_BD} business days")
+             "No amount ($0)", f"No activity in {STALE_BD} business days")
 # Fields that tell a live request from the rest, each checked on its own so a missing one just drops out.
 OPEN_EXTRA = (GROSS_APPROVED, "Deal__r.StageName", "Deal__r.Servicer_Status__c", "Deal__r.Payoff_Date__c",
               "Deal__r.Updated_Loan_Maturity_Date__c")
@@ -2983,9 +2983,11 @@ def _open_select(inst: str, tok: str, sel: str) -> str:
 
 
 def _requested_amount(df: pd.DataFrame) -> pd.Series:
-    """What each draw asks for: Land Gorilla's requested total, else Salesforce's approved total (blank if neither)."""
+    """What each draw asks for: Land Gorilla's requested total, else Salesforce's approved total — blank when neither
+       has an amount (a pending draw's Salesforce total stays $0 until it's approved, so $0 there means "not known")."""
     lg_req = pd.to_numeric(_col(df, "_lg_requested"), errors="coerce")
-    return lg_req.where(lg_req.notna(), pd.to_numeric(_col(df, GROSS_APPROVED), errors="coerce"))
+    sf = pd.to_numeric(_col(df, GROSS_APPROVED), errors="coerce")
+    return lg_req.where(lg_req.notna(), sf.where(sf > 0))
 
 
 def _quiet_bd(r: pd.Series, trail: list, today: date) -> int | None:
@@ -3001,20 +3003,24 @@ def _quiet_bd(r: pd.Series, trail: list, today: date) -> int | None:
 
 def _set_aside(df: pd.DataFrame, hist: dict, today: date) -> pd.Series:
     """Why each not-wired record isn't a live draw request (SET_ASIDE, first that applies), blank when it is: a cleared
-       status (how staff cancel a draw), a paid-off loan, a draw cancelled — or never submitted — in Land Gorilla,
-       nothing asked for, or nothing happening for STALE_BD business days."""
+       status (how staff cancel a draw), a paid-off loan, a draw cancelled — or never submitted — in Land Gorilla, no
+       dollar amount anywhere, or nothing happening for STALE_BD business days. "No amount" covers a Land Gorilla
+       draw Land Gorilla gives no amount for (e.g. one sent back to Unsubmitted) — except when Land Gorilla answered for
+       none of these draws (it's down), when only draws with no Land Gorilla link are judged by their amount."""
     why = pd.Series("", index=df.index, dtype=object)
     status = _col(df, "Status__c").map(_txt)
     lg_status = _col(df, "_lg_status").map(lambda s: _txt(s).lower())
     payoff = _dates(_col(df, "Deal__r.Payoff_Date__c"))
     asked = pd.to_numeric(_col(df, "_amount"), errors="coerce")
+    lg_up = pd.Series(bool(_col(df, "_lg_req").notna().any()), index=df.index)    # Land Gorilla answered at all
+    linked = _col(df, CONTAINER_FIELD).map(_txt) != ""
     quiet = pd.Series([_quiet_bd(r, _status_trail(hist.get(r.get("Id"))), today) for _, r in df.iterrows()],
                       index=df.index, dtype=float)
     rules = (status.eq(""),
              _col(df, "Deal__r.StageName").map(_txt).eq("Paid Off") | (payoff.notna() & (payoff <= pd.Timestamp(today))),
              lg_status.str.contains("cancel"),
              status.eq("Received") & lg_status.str.contains("unsubmitted") & _col(df, "_lg_sub").isna(),
-             pd.to_numeric(_col(df, "_lg_requested"), errors="coerce").notna() & asked.fillna(0).eq(0),
+             asked.fillna(0).eq(0) & (lg_up | ~linked),
              quiet.gt(STALE_BD))
     for mask, label in zip(rules, SET_ASIDE):
         why[(why == "") & mask.fillna(False).astype(bool)] = label
@@ -3071,16 +3077,17 @@ def _open_row(r: pd.Series, a, trail: list, today: date, inst: str) -> dict:
         ic += " · waiting on the wire" + (" (approved after 5 pm: usually wired the next business day)"
                                           if isinstance(at, pd.Timestamp) and pd.notna(at) and at.hour >= 17 else "")
     rid = r.get("Id")
-    return {"Loan #": r.get("Loan_Number__c"), "Draw #": _draw_no(r), "Deal": r.get("Deal__r.Name"),
+    return {"Loan #": r.get("Loan_Number__c"), "Draw #": _draw_no(r),
+            "Salesforce": f"{inst.rstrip('/')}/{rid}" if isinstance(rid, str) and rid else None,
+            "Deal": r.get("Deal__r.Name"), "Requested": req,
             "Amount requested": pd.to_numeric(r.get("_amount"), errors="coerce"),
             "Stage": _stage_text(r) or "(no status)", "In this stage (bd)": in_stage,
             "Longer than usual": bool(in_stage is not None and usual is not None and in_stage > usual),
             "Now": now_labels, "Held up by": delay_labels(note),
             "Latest note": f"{_mdy(newest[0])}: {newest[1][0]}" if newest else None,
-            "IC": ic or None, "Land Gorilla status": _txt(r.get("_lg_status")) or None, "Requested": req,
+            "IC": ic or None, "Land Gorilla status": _txt(r.get("_lg_status")) or None,
             "Open (bd)": _bd_between(req, today), "Moved here by": moved_by or None,
             "Coordinator": r.get("Advance_Coordinator__r.Name"),
-            "Salesforce": f"{inst.rstrip('/')}/{rid}" if isinstance(rid, str) and rid else None,
             "Set aside because": _txt(r.get("_why")) or None, "_group": _stage(status), "_now": now}
 
 
@@ -3648,12 +3655,13 @@ def render_funding_request(inst, tok, rt, sel, same_day):
             rows["U"] = rows["Id"].map(asked).values
         aside = reqs["_why"].ne("").sum() if not reqs.empty else 0
         if aside:
-            st.caption(f"{aside} not-wired records aren't live draw requests (paid off, cancelled, nothing requested, "
+            st.caption(f"{aside} not-wired records aren't live draw requests (paid off, cancelled, no dollar amount, "
                        "no activity) and are left out — see Find a draw → Not wired yet → Also show.")
     if rows.empty and mode != "Wired":
         st.info(f"No draws {scope}."); return
+    lgd = {"draws": {}, "loans": {}}
     if not rows.empty:
-        rows, ftypes, _ = lg_overlay(rows, ftypes, lg_config(), loans=False)      # Land Gorilla fills gaps
+        rows, ftypes, lgd = lg_overlay(rows, ftypes, lg_config(), loans=False)    # Land Gorilla fills gaps
 
     f = st.columns(2)
     people = sorted({p for col in PERSON_FIELDS if col in rows for p in rows[col].dropna()})
@@ -3742,19 +3750,30 @@ def render_funding_request(inst, tok, rt, sel, same_day):
                                              "either way.")
     _funding_download(inst, tok, rt, tpl, rows, ftypes, who, fdate, scope,
                       {"window": window, "total_from": total_from, "notes": notes})
-    preview = pd.DataFrame({"Row": _col(rows, "_label"), "Loan #": _col(rows, "B"), "Property": _col(rows, "F"),
-                            "Deal": _col(rows, "C"), "Status": _col(rows, "Status__c"),
-                            "Current draw": pd.to_numeric(_col(rows, "U"), errors="coerce"),
-                            "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name"),
-                            "Held up by": [delay_labels(n) for n in _col(rows, "AF")]})
-    st.dataframe(preview, hide_index=True, width="stretch", height=360,
-                 column_config={"Current draw": st.column_config.NumberColumn(
-                                    format="dollar", step=1, help="Wired rows: the approved amount; not-wired draws: "
-                                                                  "what they ask for"),
-                                "Row": st.column_config.TextColumn(help="Column A: upcoming draws' labels, then "
-                                                                        "Funded"),
-                                "Held up by": st.column_config.ListColumn(help="What the draw's notes say it was "
-                                                                                "waiting on")})
+    # When each draw was requested: Land Gorilla's date, else the same request date Find a draw shows
+    asked_on = _dates(_col(rows, CONTAINER_FIELD).map(
+        lambda c: (lgd["draws"].get(c) or {}).get("created") if isinstance(c, str) else None))
+    if len(reqs) and "Id" in rows:
+        asked_on = asked_on.fillna(_dates(_col(rows, "Id").map(reqs.drop_duplicates("Id").set_index("Id")["_req_day"])))
+    amount = "Current draw" if mode == "Wired" else "Amount requested"
+    preview = pd.DataFrame({
+        "Row": _col(rows, "_label"), "Loan #": _col(rows, "B"), "Draw #": pd.Series(_draw_nos(rows), index=rows.index),
+        "Salesforce": _col(rows, "Id").map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None),
+        "Property": _col(rows, "F"), "Deal": _col(rows, "C"), "Status": _col(rows, "Status__c"),
+        "Requested": asked_on, "Wired": _dates(_col(rows, WIRE_FIELD)),
+        amount: pd.to_numeric(_col(rows, "U"), errors="coerce"),
+        "Paid to": _col(rows, "AG"), "Coordinator": _col(rows, "Advance_Coordinator__r.Name"),
+        "Held up by": [delay_labels(n) for n in _col(rows, "AF")]})
+    if mode != "Wired":
+        preview = preview.drop(columns=["Wired"])
+    if not preview["Row"].map(_txt).ne("").any():
+        preview = preview.drop(columns=["Row"])
+    st.dataframe(preview, hide_index=True, width="stretch", height=360, column_config={
+        **_table_config(),
+        amount: st.column_config.NumberColumn(format="dollar", step=1, help="Wired rows: the approved amount; draws "
+                                                                            "not wired yet: what they ask for"),
+        "Row": st.column_config.TextColumn(help="Column A: upcoming draws' labels, then Funded"),
+        "Held up by": st.column_config.ListColumn(help="What the draw's notes say it was waiting on")})
 
 
 @sf_fragment
