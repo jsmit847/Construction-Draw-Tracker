@@ -1320,13 +1320,13 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
         if name in wb.sheetnames:
             wb[name]["D4"] = f"='{TEMPLATE_SHEET}'!E4"
             wb[name]["D5"] = f"='{TEMPLATE_SHEET}'!E5"
-            wb[name]["D4"].number_format = wb[name]["D5"].number_format = "m/d/yyyy"
+            wb[name]["D4"].number_format = wb[name]["D5"].number_format = MEL_DATE
     if "Sheet1" in wb.sheetnames:                                            # March-2024 servicer data, unused
         del wb["Sheet1"]
     if summary:
         _write_total_summary(wb, summary)
     ws["E4"], ws["E5"] = submitted_on or _today(), funding_date             # submitted date (default today, ET)
-    ws["E4"].number_format = ws["E5"].number_format = "m/d/yyyy"
+    ws["E4"].number_format = ws["E5"].number_format = MEL_DATE
     if window:
         ws["F4"] = window                                                    # the wire window, as she writes it
     _current_layout(ws)
@@ -1358,12 +1358,57 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
             if all(ws.cell(r, ci(c)).value not in (None, "", 0) for c in re.findall(r"([A-Z]+)\{r\}", pattern)):
                 ws.cell(r, ci(col)).value = pattern.format(r=r)
     first = TEMPLATE_HEADER_ROW + 1
-    if total_from and total_from > first:                 # leave the upcoming draws above it out of the total
-        ws["E6"] = f"=SUM(U{total_from}:U{max(first + len(rows) - 1, total_from)})"
+    last = max(first + len(rows) - 1, total_from or first)
+    ws["E6"] = f"=SUM(U{total_from if total_from and total_from > first else first}:U{last})"   # upcoming draws
+    _melanie_look(ws, first, first + len(rows) - 1)                                          # above it left out
     if prep is not None and not prep.empty:
         _write_prep_sheet(wb, prep)
     buf = io.BytesIO(); wb.save(buf)
     return buf.getvalue()
+
+
+# Melanie's own weekly files (7/22, 8/20, 10/02 checked) share every column width, number format and alignment on the
+# request sheet, Calibri 10, a 42.75pt header row and compact data rows; the template came from Salesforce's file.
+MEL_DATE, _MONEY = "mm-dd-yy", r"\$#,##0"
+_ACCT = '_("$"* #,##0_);_("$"* \\(#,##0\\);_("$"* "-"??_);_(@_)'
+MEL_WIDTHS = {"A": 14.43, "B": 16.14, "C": 38.57, "D": 23.0, "E": 15.57, "F": 21.86, "G": 14.0, "H": 3.86, "I": 10.43,
+              "J": 13.0, "K": 13.86, "L": 14.43, "M": 16.0, "N": 12.43, "O": 13.14, "P": 16.0, "Q": 13.57, "R": 7.86,
+              "S": 10.43, "T": 13.0, "U": 13.0, "V": 15.0, "W": 14.57, "X": 12.86, "Y": 11.86, "Z": 10.43, "AA": 12.43,
+              "AB": 1.57, "AC": 11.14, "AD": 11.57, "AE": 15.14, "AF": 28.57, "AG": 27.71, "AH": 19.29, "AI": 14.57,
+              "AJ": 12.86, "AK": 11.86, "AL": 12.57, "AM": 13.0, "AN": 9.43}   # AB (Current UPB): she keeps it narrow
+MEL_FORMATS = {**dict.fromkeys(("K", "L", "O", "P", "Q", "U", "AD"), _MONEY), **dict.fromkeys(("M", "N", "AA", "AC"), MEL_DATE),
+               **dict.fromkeys(("R", "S", "T", "X", "Y", "Z"), "0%"), **dict.fromkeys(("V", "W", "AB"), _ACCT),
+               "AE": '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);_("$"* "-"??_);_(@_)'}
+MEL_ALIGN = {**dict.fromkeys(("B", "H", "I", "J", "K", "L", "M", "N", "O", "Q", "R", "S", "T", "U", "V", "W", "X", "Y",
+                              "Z", "AA", "AH"), "center"), "C": "left", "AD": "right"}
+MEL_WRAP = {"I", "J", "AF", "AJ"}
+
+
+def _melanie_look(ws, first: int, last: int) -> None:
+    """Format the request sheet the way Melanie's own files are: her column widths, number formats and alignment on
+       the data rows, a 42.75pt header row, her mm-dd-yy dates, 15.75pt rows (taller where a comment wraps), and the
+       template's thousand empty formatted rows below the list removed."""
+    import math
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import column_index_from_string as ci
+    for col, width in MEL_WIDTHS.items():
+        ws.column_dimensions[col].width = width
+    ws.row_dimensions[TEMPLATE_HEADER_ROW].height = 42.75
+    for r in range(first, last + 1):
+        for col in MEL_WIDTHS:
+            cell = ws.cell(r, ci(col))
+            if col in MEL_FORMATS:
+                cell.number_format = MEL_FORMATS[col]
+            if col in MEL_ALIGN or col in MEL_WRAP:
+                cell.alignment = Alignment(horizontal=MEL_ALIGN.get(col), vertical=cell.alignment.vertical,
+                                           wrap_text=True if col in MEL_WRAP else None)
+        note = _txt(ws.cell(r, ci("AF")).value)
+        ws.row_dimensions[r].height = 15.75 if not note else min(150.0, 13.0 * math.ceil(len(note) / 34) + 3)
+    tail = range(max(last + 1, first), ws.max_row + 1)
+    if tail and all(c.value in (None, "") for row in ws.iter_rows(min_row=tail.start, max_row=tail.stop - 1)
+                    for c in row):
+        ws.delete_rows(tail.start, len(tail))
+    ws.freeze_panes = f"A{first}"
 
 
 # Melanie's current workbook (her weekly files from Jul 2026 on) adds "Construction Manager" at AK, which moves the
