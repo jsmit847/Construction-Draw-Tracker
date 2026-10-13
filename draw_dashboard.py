@@ -109,7 +109,7 @@ CONSTRUCTION_FIELDS = [
     ("Total_Fees__c",                       "Total fees"),
 ]
 WISH = (["Id", "Name", "Loan_Number__c", "Loan_Advance_Number__c",
-         "Deal__r.Name", "Deal__r.Account.Name", "Borrower_Name__c", "Borrower_Name_Text__c",
+         "Deal__c", "Deal__r.Name", "Deal__r.Account.Name", "Borrower_Name__c", "Borrower_Name_Text__c",
          "Lender__c", "Status__c", "Inspection_Method__c",
          "Advance_Coordinator__r.Name", "Advance_Analyst__r.Name", NOTES_FIELD, CONTAINER_FIELD,
          NET_FIELD, GROSS_FIELD, "LastModifiedBy.Name", "LastModifiedDate", "CreatedDate", "Close_Date__c"]
@@ -859,6 +859,13 @@ def _deal_team(inst: str, tok: str, deal_ids: tuple) -> dict:
     return {d: {r: "; ".join(n) for r, n in roles.items()} for d, roles in out.items()}
 
 
+def _one_person(names) -> str:
+    """One name from a Deal Team role's 'Name; Name': the first alphabetically, however Salesforce orders them. Her
+       Construction Manager column matches this on every row (two Asset Managers on one loan included); her Asset
+       Manager 1 column doesn't, so that one keeps every name. Blank when there's no one."""
+    return min((n.strip() for n in _txt(names).split(";") if n.strip()), default="")
+
+
 def _find_template() -> str | None:
     here = os.path.dirname(os.path.abspath(__file__))
     return next((p for p in (os.path.join(here, n) for n in TEMPLATE_CANDIDATES) if os.path.exists(p)), None)
@@ -993,7 +1000,8 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
     out["F"] = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) or None if m else None for m in match]
     team = _deal_team(inst, tok, tuple(dict.fromkeys(_col(out, "Deal__c").dropna())))
     for col, role in DEAL_TEAM_COLUMNS.items():                # Construction Manager, Asset Manager 1 and 2
-        out[col] = [team.get(d, {}).get(role) for d in _col(out, "Deal__c")]
+        names = [team.get(d, {}).get(role) for d in _col(out, "Deal__c")]
+        out[col] = [_one_person(n) or None for n in names] if col == "AK" else names   # see _one_person
         ftypes[col] = "string"
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
@@ -2622,6 +2630,8 @@ def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> p
     t["Approved on"] = _dates(t["Approved on"])
     t["Held up by"] = [delay_labels(n) for n in _col(d, NOTES_FIELD)]
     t["Coordinator"] = _col(d, "Advance_Coordinator__r.Name")
+    if "_cm" in d:                                       # the Turn-time page looks it up from the Deal Team
+        t["Construction manager"] = _col(d, "_cm")
     t["Notes"] = _col(d, NOTES_FIELD)
     t["Salesforce"] = ids.map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None)
     return t
@@ -2644,13 +2654,15 @@ def _table_config() -> dict:
         "Likely package date (status history)": C.DateColumn(
             format="M/D/YYYY", help="Estimated from the draw's status history — never used for turn-time"),
         "Package received (est.)": C.DateColumn(
-            format="M/D/YYYY", help="No package date was recorded: estimated from the notes, else the status history, "
-                                    "else the Date Submitted For Internal Review"),
+            format="M/D/YYYY", help="No package date was recorded: the Date Submitted For Internal Review, else "
+                                    "estimated from the notes, else the status history"),
         "Estimate from": C.TextColumn(help="Where the estimated package date comes from"),
         "Turn-time est. (bd)": C.NumberColumn("Turn-time (est.)", format="%d bd",
                                               help="Business days from the estimated package date to the wire"),
         "IC": C.TextColumn(help="Where the draw's IC approval stands, from its IC batch in Salesforce"),
         "Held up by": C.ListColumn(help="What the draw's notes say it was waiting on"),
+        "Construction manager": C.TextColumn(help="The Asset Manager on the loan's Deal Team in Salesforce — the name "
+                                                  "the funding file prints as Construction Manager"),
         "What the notes say": C.TextColumn(width="large", help="The note entries behind those hold-ups"),
         "Approval comments": C.TextColumn(width="large"),
         "Notes": C.TextColumn(width="large"),
@@ -2721,20 +2733,22 @@ def _span_start(gran: str, n: int) -> date:
     return date(today.year - (n - 1), 1, 1)
 
 
-# Where an estimated package date can come from, in the order tried, and how the app says it.
-EST_SOURCES = {"Notes": "the notes", "Status history": "the status history",
-               "Submitted for review": "the Date Submitted For Internal Review"}
+# Where an estimated package date can come from, in the order tried, and how the app says it. The review date comes
+# first, as the draw team asked: a draw goes to internal review once its package is complete.
+EST_SOURCES = {"Submitted for review": "the Date Submitted For Internal Review", "Notes": "the notes",
+               "Status history": "the status history"}
 EST_MIN_DRAWS, EST_MIN_COVERAGE = 30, 75      # below either, an estimated period figure isn't shown
 
 
 def estimate_package(df: pd.DataFrame, hist: dict | None, same_day: int) -> pd.DataFrame:
     """Each wired draw's estimated full-package date, from what Salesforce kept before the date was recorded (Aug 3,
-       2026): package_from_notes, else the status history's move from waiting into review, else the Date Submitted For
-       Internal Review — the first that falls between the request and the wire. A status-history or review date
-       earlier than the notes' last hold-up is moved up to it. Adds _pkg_est, _pkg_src (an EST_SOURCES key, blank when
-       none), _pkg_why (the evidence), _fund_bd_est (estimated package → wire) and _wait_bd_est (request → estimated
-       package), in business days. Every draw gets one, recorded date or not, so months compare on the same footing;
-       recorded dates (_pkg) are left alone and estimates never feed recorded turn-time."""
+       2026): the Date Submitted For Internal Review, else package_from_notes, else the status history's move from
+       waiting into review — the first that falls between the request and the wire. The review date is taken as it
+       stands; a status-history date earlier than the notes' last hold-up is moved up to it. Adds _pkg_est, _pkg_src
+       (an EST_SOURCES key, blank when none), _pkg_why (the evidence), _fund_bd_est (estimated package → wire) and
+       _wait_bd_est (request → estimated package), in business days. Every draw gets one, recorded date or not, so
+       months compare on the same footing; recorded dates (_pkg) are left alone and estimates never feed recorded
+       turn-time."""
     if df.empty:
         return df
     df = df.copy()
@@ -2747,18 +2761,19 @@ def estimate_package(df: pd.DataFrame, hist: dict | None, same_day: int) -> pd.D
 
             def ok(d):
                 return d is not None and (qd is None or d >= qd) and d <= wd
+            review = s.date() if pd.notna(s) else None
             n, held, ev = package_from_notes(r.get(NOTES_FIELD), qd, wd)
-            if ok(n):
+            if ok(review):
+                got = (review, "Submitted for review", "")
+            elif ok(n):
                 got = (n, "Notes", ev)
             else:
                 h = (hist or {}).get(r.get("Id"))
-                for d, label in ((_likely_package(_status_trail(h), _ic_trail(h)), "Status history"),
-                                 (s.date() if pd.notna(s) else None, "Submitted for review")):
-                    if ok(d):
-                        moved = held is not None and d < held <= wd
-                        got = (held if moved else d, label, f"moved up to the last note about something missing "
-                                                            f"({held.month}/{held.day})" if moved else "")
-                        break
+                d = _likely_package(_status_trail(h), _ic_trail(h))
+                if ok(d):
+                    moved = held is not None and d < held <= wd
+                    got = (held if moved else d, "Status history", f"moved up to the last note about something "
+                                                                   f"missing ({held.month}/{held.day})" if moved else "")
         est.append(got[0])
         src.append(got[1])
         why.append(got[2])
@@ -2868,8 +2883,10 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                               key=f"ov_n_{gran}")
         start, end = _span_start(gi, nper), _today()
 
-    # The rollup only needs four fields; full detail is fetched for the period being summarised alone.
-    span = ",".join(f for f in ("Id", "Loan_Number__c", WIRE_FIELD, NET_FIELD) if f in sel.split(","))
+    # The rollup (and who had each draw) needs only these fields; full detail is fetched for the period being
+    # summarised alone.
+    span = ",".join(f for f in ("Id", "Loan_Number__c", "Deal__c", "Advance_Coordinator__r.Name", WIRE_FIELD,
+                                NET_FIELD) if f in sel.split(","))
     with st.spinner("Loading draws…"):
         done = run_soql(inst, tok, f"SELECT {span} FROM Advance__c WHERE RecordTypeId='{rt}' "
                                    f"AND {WIRE_FIELD}>={start:%Y-%m-%d} AND {WIRE_FIELD}<={end:%Y-%m-%d}")
@@ -2928,10 +2945,11 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                     help=f"Draws whose package date could be estimated, from {mix}. Under 90% dated, read the period's "
                          "figure as indicative.")
         st.caption("**Estimated.** The *Full Draw Package Received* date only started on Aug 3, 2026, so here each "
-                   "draw's package date is estimated from what Salesforce kept: its notes (the first “sent for "
+                   "draw's package date is estimated from what Salesforce kept: its Date Submitted For Internal Review "
+                   "(a draw goes to review once its package is complete), else its notes (the first “sent for "
                    "approval” or “approved” entry after the last one about something still missing), else its status "
-                   "history, else its Date Submitted For Internal Review — always between the request and the Land "
-                   "Gorilla wire date." + (f" {_est_check_text(acc)}" if acc else "") + " See the Package date check tab.")
+                   "history — always between the request and the Land Gorilla wire date."
+                   + (f" {_est_check_text(acc)}" if acc else "") + " See the Package date check tab.")
     elif s["eligible"]:
         k[0].metric("Turn-time · full package → wire", _bd(s["turn"].mean()) if s["n"] else "—",
                     f"{s['same']:.0f}% same day" if s["same"] is not None else None, delta_color="off",
@@ -2948,8 +2966,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     else:
         st.info("Turn-time starts with draws wired on or after **Aug 3, 2026**, when the *Full Draw Package "
                 "Received* date began being recorded." + (
-                    f" Too few of these draws could be dated from their notes and status history to estimate it "
-                    f"({s['est_n']} of {s['est_wired']})." if s["est_wired"] else "")
+                    f" Too few of these draws could be dated from their Date Submitted For Internal Review, notes or "
+                    f"status history to estimate it ({s['est_n']} of {s['est_wired']})." if s["est_wired"] else "")
                 + " Pick a period from August 2026 on.", icon=":material/info:")
     k2 = st.columns(4)
     k2[0].metric(f"Draws funded · {feat}", f"{len(fg):,}", money(funded) if funded is not None else None,
@@ -2976,6 +2994,9 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                      "Loans": g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None,
                      "Funded ($)": amt, "Average draw ($)": round(amt / len(g)) if amt is not None and len(g) else None})
     roll = pd.DataFrame(rows)
+    with st.spinner("Looking up construction managers…"):                # the span's Deal Team lookup, reused below
+        cm = dict(zip(_col(done, "Id"), _people(inst, tok, done, "Construction manager")))
+    fg["_cm"] = _col(fg, "Id").map(cm).where(lambda s: s != PEOPLE["Construction manager"])   # the Draws table's
     table = _with_estimates(_draw_table(fg, inst, ap), fg)
 
     t_sum, t_draws, t_detail, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
@@ -2991,6 +3012,7 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                                                                                           format="dollar", step=1)})
         with right:
             _render_charts(roll, fg, feat, same_day)
+        _people_charts(inst, tok, done, AMT, gi, feat, p_start, p_end, cur_key)
         _holdups_chart(fg, f"What held draws up · {feat}")
         _stuck_table(fg, hist, feat)
         with st.expander("How these numbers work"):
@@ -2998,11 +3020,11 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                 "- **Package received** — the *Full Draw Package Received* date in Salesforce: the day the borrower's "
                 "package was complete. It started being recorded on **Aug 3, 2026**, so recorded turn-time begins "
                 "there.\n"
-                "- **Estimated package date** — for draws without a recorded date (everything before Aug 3, 2026): the "
+                "- **Estimated package date** — for draws without a recorded date (everything before Aug 3, 2026): its "
+                "Date Submitted For Internal Review, since a draw goes to review once its package is complete; else the "
                 "first note entry marking the draw sent for approval or approved after the last entry about something "
-                "still missing; else the day its status history shows it moving from waiting into review; else its "
-                "Date Submitted For Internal Review. Only dates between the request and the wire count, and the "
-                "figures say *est.*\n"
+                "still missing; else the day its status history shows it moving from waiting into review. Only dates "
+                "between the request and the wire count, and the figures say *est.*\n"
                 "- **Recorded and estimated are never mixed** — compare months before Aug 3 on the estimated figure; "
                 "later months show the same estimate next to the recorded one.\n"
                 "- **Wired** — the draw's funding date in Land Gorilla.\n"
@@ -3020,7 +3042,8 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
     with t_draws:
         st.dataframe(table, hide_index=True, width="stretch", height=460, column_config=_table_config())
         _period_workbook(feat, _excel_table(fg, table, hist),
-                         roll.drop(columns="_raw").rename(columns={"Draws": "Draws funded"}))
+                         roll.drop(columns="_raw").rename(columns={"Draws": "Draws funded"}),
+                         _people_tables(inst, tok, done, AMT, cur_key))
     with t_detail:
         _draw_details(inst, tok, rt, sel, fg, ap, feat, hist)
     with t_check:
@@ -3119,9 +3142,9 @@ def _deal_details(inst, tok, rt, row: pd.Series) -> dict | None:
 def _estimate_check(fg: pd.DataFrame, table: pd.DataFrame, s: dict, acc: dict | None):
     """Before Aug 3, 2026: how many draws could be given an estimated package date, from where, and how closely the
        estimate matches recorded dates (on draws that have both) — plus the draws that couldn't be dated."""
-    st.markdown("Before Aug 3, 2026 the date wasn't recorded, so each draw's package date is estimated from its notes, "
-                "else its status history, else its Date Submitted For Internal Review. These checks show how far that "
-                "can be trusted for this period.")
+    st.markdown("Before Aug 3, 2026 the date wasn't recorded, so each draw's package date is estimated from its Date "
+                "Submitted For Internal Review, else its notes, else its status history. These checks show how far "
+                "that can be trusted for this period.")
     if not s["est_wired"]:
         st.info("No draws were wired in this period."); return
     cov = s["est_cov"] or 0
@@ -3131,7 +3154,8 @@ def _estimate_check(fg: pd.DataFrame, table: pd.DataFrame, s: dict, acc: dict | 
              "Fair — read the period's turn-time as indicative" if cov >= EST_MIN_COVERAGE else
              "Low — too few draws could be dated for turn-time to speak for the period"),
             ("Dated from", " · ".join(f"{EST_SOURCES[x]} {n}" for x, n in s["est_mix"].items()) or "—",
-             "The notes are the most direct; Salesforce's status history only starts in late May 2026")]
+             "The review date comes first; the notes and the status history (which only starts in late May 2026) "
+             "date draws without one")]
     if acc:
         lean = acc["turn_est"] - acc["turn_rec"]
         rows.append(("Matches recorded dates", f"same business day {acc['same']:.0f}% · within one "
@@ -3150,9 +3174,9 @@ def _estimate_check(fg: pd.DataFrame, table: pd.DataFrame, s: dict, acc: dict | 
             st.dataframe(table.loc[none_, [c for c in ("Loan #", "Draw #", "Deal", "Requested", "Wired", "Coordinator",
                                                         "Held up by", "Salesforce") if c in table]],
                          hide_index=True, width="stretch", column_config=_table_config())
-            st.caption("No note entry marks these sent for approval or approved after the last hold-up, Salesforce's "
-                       "status history doesn't reach them, and no Date Submitted For Internal Review falls between the "
-                       "request and the wire.")
+            st.caption("No Date Submitted For Internal Review falls between the request and the wire, no note entry "
+                       "marks these sent for approval or approved after the last hold-up, and Salesforce's status "
+                       "history doesn't reach them.")
 
 
 def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: dict | None = None,
@@ -3207,8 +3231,8 @@ def _package_check(fg: pd.DataFrame, table: pd.DataFrame, same_day: int, hist: d
     if here and here["n"] >= 10:
         rows.append(("Estimate vs recorded", f"same business day {here['same']:.0f}% · within one "
                      f"{here['within1']:.0f}%  ({here['n']} draws)",
-                     "How closely the package date estimated for months before Aug 3, 2026 (from notes and status "
-                     "history) matches the recorded date in this period"))
+                     "How closely the package date estimated for months before Aug 3, 2026 (from "
+                     + ", else ".join(EST_SOURCES.values()) + ") matches the recorded date in this period"))
     st.dataframe(pd.DataFrame(rows, columns=["Check", "Result", "What it means"]), hide_index=True, width="stretch",
                  column_config={"What it means": st.column_config.TextColumn(width="large")})
 
@@ -3277,10 +3301,10 @@ def _period_funding_file(inst, tok, rt, feat, period_where, p_start, p_end):
 
 
 @sf_fragment
-def _period_workbook(feat, xtable, roll):
+def _period_workbook(feat, xtable, roll, people: dict | None = None):
     if st.button("Build turn-time workbook (Excel)", icon=":material/table_view:", key=f"xls_{feat}"):
         with st.spinner("Building the workbook…"):
-            xlsx = build_excel({"Summary": roll, "Draws": xtable})
+            xlsx = build_excel({"Summary": roll, "Draws": xtable, **(people or {})})
         st.download_button("Download turn-time workbook", xlsx, mime=XLSX_MIME, icon=":material/download:",
                            file_name=f"Draw turn-time {feat}.xlsx", key=f"dl_{feat}", on_click="ignore")
 
@@ -3383,6 +3407,163 @@ def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: in
         x=alt.X("Period:N", sort=list(r["Period"]), title=None, axis=alt.Axis(labelAngle=-45)),
         y=alt.Y("Funded ($):Q", title=None, axis=alt.Axis(format="$.2~s")),   # $18M, $2.5M — no repeats
         tooltip=["Period", alt.Tooltip("Funded ($):Q", format="$,.0f"), "Draws"]), width="stretch")
+
+
+# Who a draw belongs to under "Draws and dollars by …": the loan's Construction Manager as the funding file prints it
+# (the Deal Team's Asset Manager, DEAL_TEAM_COLUMNS["AK"]) or the draw's own coordinator — and what draws Salesforce
+# names no one on are called.
+PEOPLE = {"Construction manager": "No construction manager", "Draw coordinator": "No coordinator"}
+# The page's chart colors: blue for numbers of draws and green for dollars, as above; end labels in a muted gray that
+# reads on the light and the dark theme alike (the server can't reliably tell which one a viewer has).
+DRAW_BLUE, MONEY_GREEN, LABEL_INK = "#4C78A8", "#54A24B", "#898781"
+FIT_X = {"type": "fit-x", "contains": "padding"}   # fill the width; rows keep their height and the axes add theirs
+
+
+def _legend_steps(vmax: float, whole: bool) -> list:
+    """A few round values (1, 2 or 5 × a power of ten) up to the largest, which is always included — a heat map's
+       legend, so it never repeats a label or leaves out what the strongest cells mean."""
+    raw = vmax / 3
+    mag = float(10 ** np.floor(np.log10(raw)))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    step = max(1, int(round(step))) if whole else step
+    vals = {step * k for k in range(1, int(vmax // step) + 1)} | {vmax}
+    return sorted(int(v) if whole else float(v) for v in vals)
+
+
+def _people(inst: str, tok: str, d: pd.DataFrame, by: str) -> pd.Series:
+    """Each draw's construction manager (the Asset Manager on its loan's Deal Team — the funding file's Construction
+       Manager column, one person per loan as there) or draw coordinator (the draw's Advance Coordinator); PEOPLE[by]
+       where Salesforce has no one."""
+    if by == "Draw coordinator":
+        names = _col(d, "Advance_Coordinator__r.Name").map(_txt)
+    else:
+        deals = _col(d, "Deal__c").map(_txt)
+        ids = tuple(sorted({x for x in deals if x}))
+        team = _deal_team(inst, tok, ids) if ids else {}
+        names = deals.map(lambda x: _one_person((team.get(x) or {}).get(DEAL_TEAM_COLUMNS["AK"])))
+    return names.where(names != "", PEOPLE[by])
+
+
+def _people_tables(inst: str, tok: str, done: pd.DataFrame, amt: str | None, cur_key: str) -> dict:
+    """Draws funded and dollars per period for each construction manager and each draw coordinator — sheets for the
+       turn-time workbook, in period order as on its Summary sheet. A grouping Salesforce names no one for (a Deal
+       Team this login can't read, say) gets no sheet, and dollars stay blank when the net amount can't be read."""
+    out = {}
+    for by in PEOPLE:
+        who = _people(inst, tok, done, by)
+        if (who == PEOPLE[by]).all():
+            continue
+        t = pd.DataFrame({"Period": done["Period"].values, by: who.values,
+                          "Funded ($)": pd.to_numeric(done[amt], errors="coerce").fillna(0).values if amt else 0.0})
+        g = t.groupby(["Period", by]).agg(**{"Draws funded": (by, "size"),
+                                            "Funded ($)": ("Funded ($)", "sum")}).reset_index()
+        g = g.sort_values(["Period", "Draws funded", by], ascending=[True, False, True])
+        g["Period"] = g["Period"].map(lambda p: p + ("  (in progress)" if p == cur_key else ""))
+        if not amt:
+            g["Funded ($)"] = None
+        out[f"By {by.lower()}"] = g
+    return out
+
+
+@sf_fragment
+def _people_charts(inst: str, tok: str, done: pd.DataFrame, amt: str | None, gi: str, feat: str, p_start: date,
+                   p_end: date, cur_key: str):
+    """How many draws each construction manager (or draw coordinator) had wired, and the dollars: the summary's
+       period as bars, every period on the page as a heat map, and the same numbers as a table. A fragment, so
+       switching the grouping doesn't reload the page."""
+    head = st.empty()
+    c = st.columns([1.6, 1, 2.4])
+    by = c[0].segmented_control(
+        "Group by", list(PEOPLE), default="Construction manager", key="ov_by",
+        help="Count each draw under its loan's construction manager, as the funding file names them, or under the "
+             "draw's own coordinator."
+    ) or "Construction manager"
+    show = (c[1].segmented_control("Show", ["Draws", "Funded"], default="Draws", key="ov_show") or "Draws"
+            if amt else "Draws")
+    who, none_ = by.lower(), PEOPLE[by]
+    head.markdown(f"**Draws and dollars by {who}**" if amt else f"**Draws by {who}**")
+    w = pd.to_datetime(done[WIRE_FIELD], errors="coerce")
+    d = pd.DataFrame({"Person": _people(inst, tok, done, by).values, "Period": done["Period"].values,
+                      "Funded": pd.to_numeric(done[amt], errors="coerce").fillna(0).values if amt else 0.0,
+                      "_now": ((w >= pd.Timestamp(p_start)) & (w <= pd.Timestamp(p_end))).values})
+    if d.empty or (d["Person"] == none_).all():
+        st.info(f"Salesforce names no {who} on these draws" + (
+            " — its Deal Team may not be readable with this login; try Draw coordinator." if by == "Construction manager"
+            else "."), icon=":material/info:")
+        return
+    cur = d[d["_now"]]
+    g = cur.groupby("Person").agg(Draws=("Person", "size"), Funded=("Funded", "sum")).reset_index()
+    g["Share"] = g["Draws"] / max(len(cur), 1)
+    g = g[g["Person"] != none_].sort_values([show, "Person"], ascending=[False, True])   # no one named: the table
+    money_ = show == "Funded"
+    ink = MONEY_GREEN if money_ else DRAW_BLUE
+    axis_fmt, label_fmt = ("$.2~s", "$.3~s") if money_ else ("d", ",")
+    tips = ([alt.Tooltip("Person:N", title=by), alt.Tooltip("Draws:Q", format=",")]
+            + ([alt.Tooltip("Funded:Q", format="$,.0f")] if amt else [])) if alt is not None else []
+
+    st.markdown(f"{show} by {who} · {feat}")
+    top = float(g[show].max()) if not g.empty else 0.0
+    if g.empty:
+        st.caption(f"No draw wired in {feat} has a {who} in Salesforce.")
+    elif money_ and top <= 0:
+        st.caption(f"Salesforce shows no net amount on these draws in {feat}.")
+    elif alt is None:
+        st.bar_chart(g.set_index("Person")[show])
+    else:
+        base = alt.Chart(g).encode(
+            y=alt.Y("Person:N", sort=list(g["Person"]), title=None, axis=alt.Axis(labelLimit=220)),
+            x=alt.X(f"{show}:Q", title=None,
+                    scale=alt.Scale(domain=[0, top * 1.2 if money_ else max(top * 1.2, top + 1)]),   # room for the
+                    axis=alt.Axis(format=axis_fmt, tickCount=6, **({} if money_ else {"tickMinStep": 1}))))   # labels
+        bars = base.mark_bar(cornerRadiusEnd=4, size=16, color=ink).encode(
+            tooltip=tips + [alt.Tooltip("Share:Q", format=".0%", title="Share of the period's draws")])
+        ends = base.mark_text(align="left", baseline="middle", dx=4, color=LABEL_INK).encode(
+            text=alt.Text(f"{show}:Q", format=label_fmt))
+        st.altair_chart((bars + ends).properties(height=26 * len(g), autosize=FIT_X), width="stretch")
+
+    per = d.groupby(["Person", "Period"]).agg(Draws=("Person", "size"), Funded=("Funded", "sum")).reset_index()
+    periods = sorted(d["Period"].unique())
+    named = per[per["Person"] != none_]
+    tot = named.groupby("Person")[show].sum().sort_values(ascending=False, kind="stable")
+    rows_ = list(tot.index) + ([none_] if (per["Person"] == none_).any() else [])
+    word = {"Monthly": "month", "Quarterly": "quarter", "Yearly": "year"}[gi]
+    if len(periods) > 1 and not named.empty and float(named[show].max()) > 0:
+        st.markdown(f"{show} per {word} by {who}")
+        if alt is None:
+            st.dataframe(named.pivot_table(index="Person", columns="Period", values=show, aggfunc="sum"))
+        else:
+            angled = len(periods) > 6
+            keys = _legend_steps(float(named[show].max()), whole=not money_)
+            st.altair_chart(alt.Chart(named).mark_rect(cornerRadius=2, color=ink).encode(
+                x=alt.X("Period:O", title=None, scale=alt.Scale(domain=periods, paddingInner=0.08),   # every period
+                        axis=alt.Axis(labelAngle=-45 if angled else 0, labelLimit=220,   # the one under way says
+                                      labelOverlap=not angled,                       # so, and no label is dropped
+                                      labelExpr=f"datum.value === '{cur_key}' ? datum.value + ' (in progress)' "
+                                                f": datum.value")),
+                y=alt.Y("Person:N", sort=list(tot.index), title=None, scale=alt.Scale(paddingInner=0.08),
+                        axis=alt.Axis(labelLimit=220)),
+                opacity=alt.Opacity(f"{show}:Q", title=show, scale=alt.Scale(domainMin=0, range=[0.12, 1]),
+                                    legend=alt.Legend(format=axis_fmt, values=keys, symbolType="square",
+                                                      symbolFillColor=ink, symbolStrokeWidth=0)),   # near zero fades
+                tooltip=tips + [alt.Tooltip("Period:O")])                                           # into either theme
+                .properties(height=max(24 * len(tot), 18 * len(keys) + 30), autosize=FIT_X), width="stretch")
+    with st.expander(f"Table: {show.lower()} by {who} and {word}", icon=":material/table:"):
+        pv = per.pivot_table(index="Person", columns="Period", values=show, aggfunc="sum", fill_value=0).reindex(
+            index=rows_, columns=periods, fill_value=0)
+        pv["Total"] = pv.sum(axis=1)
+        fmt = {"format": "dollar", "step": 1} if money_ else {"format": "%d"}
+        st.dataframe(pv.rename_axis(index=by, columns=None).reset_index(), hide_index=True, width="stretch",
+                     column_config={p: st.column_config.NumberColumn(p + ("  (in progress)" if p == cur_key else ""),
+                                                                     **fmt) for p in periods + ["Total"]})
+    n0 = int((cur["Person"] == none_).sum())
+    share = (f"{n0 / len(cur):.0%}" if n0 * 100 >= len(cur) else "under 1%") if n0 else ""
+    st.caption(("Construction manager = the Asset Manager on the loan's Deal Team in Salesforce, the name the funding "
+                "file prints as Construction Manager." if by == "Construction manager"
+                else "Draw coordinator = the coordinator on the draw in Salesforce.")
+               + (f" {n0:,} of {len(cur):,} draws in {feat} ({share}) have none." if n0 and not g.empty else "")
+               + (f" Draws with no {who} are left out of the charts and listed in the table as “{none_}”."
+                  if none_ in rows_ else "")
+               + (" Funded = the net amount wired, as elsewhere on this page." if money_ else ""))
 
 
 # ───────────────────────────── Find a draw ──────────────────────────────────
