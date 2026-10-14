@@ -833,12 +833,15 @@ TEMPLATE_CANDIDATES = ("Advance_template.xlsx", "melanie_template.xlsx",
                        "Construction-Renovation_Funding_Request_template.xlsx")
 TEMPLATE_SHEET, TEMPLATE_HEADER_ROW = "Combined Funding Request", 7
 PERSON_FIELDS = ("Advance_Coordinator__r.Name", "Advance_Analyst__r.Name")
-# Her current layout's people columns (CURRENT_TAIL), from the deal's Deal Team (OpportunityTeamMember), the way her
-# weekly files have them: her "Construction Manager" is the Deal Team's "Asset Manager" (26 of 26 filled rows on her
-# 8/19 list; Salesforce's Generate File prints the same person as "Asset Manager 1", 99 of 99) and her "Asset Manager 1"
-# is the Deal Team's "Asset Manager 2" (11 of 11). She leaves Asset Manager 2 blank. (The Deal Team role named
-# "Construction Manager" is the draw coordinator; none of her 26 names match it.)
-DEAL_TEAM_COLUMNS = {"AK": "Asset Manager", "AL": "Asset Manager 2"}
+# Her current layout's people columns (CURRENT_TAIL). The Construction Manager (AK) is the draw desk: the coordinator on
+# the draw in Salesforce, else the loan's Deal Team (OpportunityTeamMember) "Construction Manager" — the same person on
+# nearly every draw. Asset Manager 1 and 2 are the Deal Team's "Asset Manager" and "Asset Manager 2", as her April file
+# and Salesforce's Generate File have them. (Her weekly files from July on carry these one column early, because
+# Salesforce's file lists the Asset Managers before the Construction Manager: their Construction Manager column holds
+# the loan's Asset Manager.)
+CM_ROLE = "Construction Manager"
+DEAL_TEAM_COLUMNS = {"AL": "Asset Manager", "AM": "Asset Manager 2"}
+PEOPLE_COLUMNS = ("AK", *DEAL_TEAM_COLUMNS)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -860,10 +863,19 @@ def _deal_team(inst: str, tok: str, deal_ids: tuple) -> dict:
 
 
 def _one_person(names) -> str:
-    """One name from a Deal Team role's 'Name; Name': the first alphabetically, however Salesforce orders them. Her
-       Construction Manager column matches this on every row (two Asset Managers on one loan included); her Asset
-       Manager 1 column doesn't, so that one keeps every name. Blank when there's no one."""
+    """One name from a Deal Team role's 'Name; Name': the first alphabetically, however Salesforce orders them. Blank
+       when there's no one."""
     return min((n.strip() for n in _txt(names).split(";") if n.strip()), default="")
+
+
+def _construction_manager(d: pd.DataFrame, team: dict) -> pd.Series:
+    """Each draw's construction manager: the coordinator on the draw in Salesforce, else the loan's Deal Team
+       "Construction Manager" (_deal_team's {deal: {role: names}}; one person where it lists two). They agree on nearly
+       every draw, and the draw's own coordinator says who had it where a loan lists two. Blank where neither names
+       anyone."""
+    coord = _col(d, "Advance_Coordinator__r.Name").map(_txt)
+    deal = _col(d, "Deal__c").map(lambda x: _one_person((team.get(_txt(x)) or {}).get(CM_ROLE)))
+    return coord.where(coord != "", deal)
 
 
 def _find_template() -> str | None:
@@ -999,10 +1011,11 @@ def funding_request_rows(inst: str, tok: str, rt: str, where: str) -> tuple[pd.D
         ftypes[f"chk:{label}"] = pmeta[f]["type"]
     out["F"] = [" ".join(_txt(m.get(f)) for f in street if _txt(m.get(f))) or None if m else None for m in match]
     team = _deal_team(inst, tok, tuple(dict.fromkeys(_col(out, "Deal__c").dropna())))
-    for col, role in DEAL_TEAM_COLUMNS.items():                # Construction Manager, Asset Manager 1 and 2
-        names = [team.get(d, {}).get(role) for d in _col(out, "Deal__c")]
-        out[col] = [_one_person(n) or None for n in names] if col == "AK" else names   # see _one_person
+    for col, role in DEAL_TEAM_COLUMNS.items():                # Asset Manager 1 and 2
+        out[col] = [team.get(d, {}).get(role) for d in _col(out, "Deal__c")]
         ftypes[col] = "string"
+    out["AK"] = [x or None for x in _construction_manager(out, team)]
+    ftypes["AK"] = "string"
     return out.reset_index(drop=True), ftypes, sorted(set(unavailable), key=lambda c: (len(c), c))
 
 
@@ -1361,7 +1374,7 @@ def fill_melanie_template(template: str, rows: pd.DataFrame, ftypes: dict, submi
     _current_layout(ws)
     skip = set() if notes else {"AF", "AG"}
     letters = [c for c in dict.fromkeys(list(MELANIE_MAP) + list(MELANIE_PROPERTY_MAP) + ["F"] + list(LG_COLUMNS)
-                                        + list(DEAL_TEAM_COLUMNS)) if c not in skip]
+                                        + list(PEOPLE_COLUMNS)) if c not in skip]
     for r, (_, row) in enumerate(rows.iterrows(), TEMPLATE_HEADER_ROW + 1):
         for col in letters:
             v = _xl(row.get(col), ftypes.get(col))
@@ -2629,9 +2642,7 @@ def _draw_table(d: pd.DataFrame, inst: str, ap: pd.DataFrame | None = None) -> p
         t[c] = ids.map(ap[src]) if ap is not None and src in ap else None
     t["Approved on"] = _dates(t["Approved on"])
     t["Held up by"] = [delay_labels(n) for n in _col(d, NOTES_FIELD)]
-    t["Coordinator"] = _col(d, "Advance_Coordinator__r.Name")
-    if "_cm" in d:                                       # the Turn-time page looks it up from the Deal Team
-        t["Construction manager"] = _col(d, "_cm")
+    t["Construction manager"] = _col(d, "_cm") if "_cm" in d else _col(d, "Advance_Coordinator__r.Name")
     t["Notes"] = _col(d, NOTES_FIELD)
     t["Salesforce"] = ids.map(lambda i: f"{inst.rstrip('/')}/{i}" if isinstance(i, str) and i else None)
     return t
@@ -2661,8 +2672,8 @@ def _table_config() -> dict:
                                               help="Business days from the estimated package date to the wire"),
         "IC": C.TextColumn(help="Where the draw's IC approval stands, from its IC batch in Salesforce"),
         "Held up by": C.ListColumn(help="What the draw's notes say it was waiting on"),
-        "Construction manager": C.TextColumn(help="The Asset Manager on the loan's Deal Team in Salesforce — the name "
-                                                  "the funding file prints as Construction Manager"),
+        "Construction manager": C.TextColumn(help="The coordinator on the draw in Salesforce, else the Construction "
+                                                  "Manager on the loan's Deal Team"),
         "What the notes say": C.TextColumn(width="large", help="The note entries behind those hold-ups"),
         "Approval comments": C.TextColumn(width="large"),
         "Notes": C.TextColumn(width="large"),
@@ -2994,9 +3005,9 @@ def render_pipeline(inst, tok, rt, sel, same_day, links=()):
                      "Loans": g["Loan_Number__c"].nunique() if "Loan_Number__c" in g else None,
                      "Funded ($)": amt, "Average draw ($)": round(amt / len(g)) if amt is not None and len(g) else None})
     roll = pd.DataFrame(rows)
-    with st.spinner("Looking up construction managers…"):                # the span's Deal Team lookup, reused below
-        cm = dict(zip(_col(done, "Id"), _people(inst, tok, done, "Construction manager")))
-    fg["_cm"] = _col(fg, "Id").map(cm).where(lambda s: s != PEOPLE["Construction manager"])   # the Draws table's
+    with st.spinner("Looking up construction managers…"):                # the span's lookup, reused below
+        cm = dict(zip(_col(done, "Id"), _people(inst, tok, done)))
+    fg["_cm"] = _col(fg, "Id").map(cm).where(lambda s: s != NO_CM)       # the Draws table's Construction manager
     table = _with_estimates(_draw_table(fg, inst, ap), fg)
 
     t_sum, t_draws, t_detail, t_check = st.tabs([":material/insights: Summary", f":material/list: Draws ({len(fg):,})",
@@ -3171,7 +3182,8 @@ def _estimate_check(fg: pd.DataFrame, table: pd.DataFrame, s: dict, acc: dict | 
     none_ = ((_col(fg, "_pkg_src").map(_txt) == "") & pd.to_datetime(fg["_wire"], errors="coerce").notna()).values
     if none_.any():
         with st.expander(f"Draws with no estimate ({int(none_.sum())})", icon=":material/rule:"):
-            st.dataframe(table.loc[none_, [c for c in ("Loan #", "Draw #", "Deal", "Requested", "Wired", "Coordinator",
+            st.dataframe(table.loc[none_, [c for c in ("Loan #", "Draw #", "Deal", "Requested", "Wired",
+                                                        "Construction manager",
                                                         "Held up by", "Salesforce") if c in table]],
                          hide_index=True, width="stretch", column_config=_table_config())
             st.caption("No Date Submitted For Internal Review falls between the request and the wire, no note entry "
@@ -3409,10 +3421,7 @@ def _render_charts(roll: pd.DataFrame, fg: pd.DataFrame, feat: str, same_day: in
         tooltip=["Period", alt.Tooltip("Funded ($):Q", format="$,.0f"), "Draws"]), width="stretch")
 
 
-# Who a draw belongs to under "Draws and dollars by …": the loan's Construction Manager as the funding file prints it
-# (the Deal Team's Asset Manager, DEAL_TEAM_COLUMNS["AK"]) or the draw's own coordinator — and what draws Salesforce
-# names no one on are called.
-PEOPLE = {"Construction manager": "No construction manager", "Draw coordinator": "No coordinator"}
+NO_CM = "No construction manager"     # draws Salesforce names no construction manager on (_construction_manager)
 # The page's chart colors: blue for numbers of draws and green for dollars, as above; end labels in a muted gray that
 # reads on the light and the dark theme alike (the server can't reliably tell which one a viewer has).
 DRAW_BLUE, MONEY_GREEN, LABEL_INK = "#4C78A8", "#54A24B", "#898781"
@@ -3420,76 +3429,60 @@ FIT_X = {"type": "fit-x", "contains": "padding"}   # fill the width; rows keep t
 
 
 def _legend_steps(vmax: float, whole: bool) -> list:
-    """A few round values (1, 2 or 5 × a power of ten) up to the largest, which is always included — a heat map's
-       legend, so it never repeats a label or leaves out what the strongest cells mean."""
-    raw = vmax / 3
-    mag = float(10 ** np.floor(np.log10(raw)))
-    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
-    step = max(1, int(round(step))) if whole else step
-    vals = {step * k for k in range(1, int(vmax // step) + 1)} | {vmax}
-    return sorted(int(v) if whole else float(v) for v in vals)
+    """A heat map's legend: a third, two thirds and all of the largest value (two significant figures; whole numbers
+       for counts), so it reads the scale's low, middle and top without repeating a label or leaving out what the
+       strongest cells mean."""
+    def two_figures(x: float) -> float:
+        mag = float(10 ** (np.floor(np.log10(x)) - 1))
+        return round(x / mag) * mag
+    vals = [two_figures(vmax / 3), two_figures(2 * vmax / 3), vmax]
+    return sorted({max(1, int(round(v))) for v in vals} if whole else {float(v) for v in vals})
 
 
-def _people(inst: str, tok: str, d: pd.DataFrame, by: str) -> pd.Series:
-    """Each draw's construction manager (the Asset Manager on its loan's Deal Team — the funding file's Construction
-       Manager column, one person per loan as there) or draw coordinator (the draw's Advance Coordinator); PEOPLE[by]
-       where Salesforce has no one."""
-    if by == "Draw coordinator":
-        names = _col(d, "Advance_Coordinator__r.Name").map(_txt)
-    else:
-        deals = _col(d, "Deal__c").map(_txt)
-        ids = tuple(sorted({x for x in deals if x}))
-        team = _deal_team(inst, tok, ids) if ids else {}
-        names = deals.map(lambda x: _one_person((team.get(x) or {}).get(DEAL_TEAM_COLUMNS["AK"])))
-    return names.where(names != "", PEOPLE[by])
+def _people(inst: str, tok: str, d: pd.DataFrame) -> pd.Series:
+    """Each draw's construction manager (_construction_manager), NO_CM where Salesforce names no one. The Deal Team is
+       read only for draws with no coordinator."""
+    coord = _col(d, "Advance_Coordinator__r.Name").map(_txt)
+    need = tuple(sorted({x for x in _col(d, "Deal__c")[coord.eq("")].map(_txt) if x}))
+    names = _construction_manager(d, _deal_team(inst, tok, need) if need else {})
+    return names.where(names != "", NO_CM)
 
 
 def _people_tables(inst: str, tok: str, done: pd.DataFrame, amt: str | None, cur_key: str) -> dict:
-    """Draws funded and dollars per period for each construction manager and each draw coordinator — sheets for the
-       turn-time workbook, in period order as on its Summary sheet. A grouping Salesforce names no one for (a Deal
-       Team this login can't read, say) gets no sheet, and dollars stay blank when the net amount can't be read."""
-    out = {}
-    for by in PEOPLE:
-        who = _people(inst, tok, done, by)
-        if (who == PEOPLE[by]).all():
-            continue
-        t = pd.DataFrame({"Period": done["Period"].values, by: who.values,
-                          "Funded ($)": pd.to_numeric(done[amt], errors="coerce").fillna(0).values if amt else 0.0})
-        g = t.groupby(["Period", by]).agg(**{"Draws funded": (by, "size"),
-                                            "Funded ($)": ("Funded ($)", "sum")}).reset_index()
-        g = g.sort_values(["Period", "Draws funded", by], ascending=[True, False, True])
-        g["Period"] = g["Period"].map(lambda p: p + ("  (in progress)" if p == cur_key else ""))
-        if not amt:
-            g["Funded ($)"] = None
-        out[f"By {by.lower()}"] = g
-    return out
+    """Draws funded and dollars per period for each construction manager — a sheet for the turn-time workbook, in
+       period order as on its Summary sheet (none if Salesforce names no one), with dollars blank when the net amount
+       can't be read."""
+    who = _people(inst, tok, done)
+    if (who == NO_CM).all():
+        return {}
+    t = pd.DataFrame({"Period": done["Period"].values, "Construction manager": who.values,
+                      "Funded ($)": pd.to_numeric(done[amt], errors="coerce").fillna(0).values if amt else 0.0})
+    g = t.groupby(["Period", "Construction manager"]).agg(**{"Draws funded": ("Construction manager", "size"),
+                                                             "Funded ($)": ("Funded ($)", "sum")}).reset_index()
+    g = g.sort_values(["Period", "Draws funded", "Construction manager"], ascending=[True, False, True])
+    g["Period"] = g["Period"].map(lambda p: p + ("  (in progress)" if p == cur_key else ""))
+    if not amt:
+        g["Funded ($)"] = None
+    return {"By construction manager": g}
 
 
 @sf_fragment
 def _people_charts(inst: str, tok: str, done: pd.DataFrame, amt: str | None, gi: str, feat: str, p_start: date,
                    p_end: date, cur_key: str):
-    """How many draws each construction manager (or draw coordinator) had wired, and the dollars: the summary's
-       period as bars, every period on the page as a heat map, and the same numbers as a table. A fragment, so
-       switching the grouping doesn't reload the page."""
-    head = st.empty()
-    c = st.columns([1.6, 1, 2.4])
-    by = c[0].segmented_control(
-        "Group by", list(PEOPLE), default="Construction manager", key="ov_by",
-        help="Count each draw under its loan's construction manager, as the funding file names them, or under the "
-             "draw's own coordinator."
-    ) or "Construction manager"
-    show = (c[1].segmented_control("Show", ["Draws", "Funded"], default="Draws", key="ov_show") or "Draws"
-            if amt else "Draws")
-    who, none_ = by.lower(), PEOPLE[by]
-    head.markdown(f"**Draws and dollars by {who}**" if amt else f"**Draws by {who}**")
+    """How many draws each construction manager had wired, and the dollars: the summary's period as bars, every period
+       on the page as a heat map, and the same numbers as a table. A fragment, so switching between draws and dollars
+       doesn't reload the page."""
+    by, who, none_ = "Construction manager", "construction manager", NO_CM
+    st.markdown("**Draws and dollars by construction manager**" if amt else "**Draws by construction manager**")
+    show = (st.columns([1, 3])[0].segmented_control("Show", ["Draws", "Funded"], default="Draws", key="ov_show")
+            or "Draws") if amt else "Draws"
     w = pd.to_datetime(done[WIRE_FIELD], errors="coerce")
-    d = pd.DataFrame({"Person": _people(inst, tok, done, by).values, "Period": done["Period"].values,
+    d = pd.DataFrame({"Person": _people(inst, tok, done).values, "Period": done["Period"].values,
                       "Funded": pd.to_numeric(done[amt], errors="coerce").fillna(0).values if amt else 0.0,
                       "_now": ((w >= pd.Timestamp(p_start)) & (w <= pd.Timestamp(p_end))).values})
     if d.empty or (d["Person"] == none_).all():
-        st.info(f"Salesforce names no {who} on these draws" + (
-            " — its Deal Team may not be readable with this login; try Draw coordinator." if by == "Construction manager"
-            else "."), icon=":material/info:")
+        st.info("Salesforce names no construction manager on these draws: no coordinator on the draw, and no "
+                "Construction Manager on the loan's Deal Team.", icon=":material/info:")
         return
     cur = d[d["_now"]]
     g = cur.groupby("Person").agg(Draws=("Person", "size"), Funded=("Funded", "sum")).reset_index()
@@ -3557,9 +3550,8 @@ def _people_charts(inst: str, tok: str, done: pd.DataFrame, amt: str | None, gi:
                                                                      **fmt) for p in periods + ["Total"]})
     n0 = int((cur["Person"] == none_).sum())
     share = (f"{n0 / len(cur):.0%}" if n0 * 100 >= len(cur) else "under 1%") if n0 else ""
-    st.caption(("Construction manager = the Asset Manager on the loan's Deal Team in Salesforce, the name the funding "
-                "file prints as Construction Manager." if by == "Construction manager"
-                else "Draw coordinator = the coordinator on the draw in Salesforce.")
+    st.caption("Construction manager = the coordinator on the draw in Salesforce, else the Construction Manager on the "
+               "loan's Deal Team."
                + (f" {n0:,} of {len(cur):,} draws in {feat} ({share}) have none." if n0 and not g.empty else "")
                + (f" Draws with no {who} are left out of the charts and listed in the table as “{none_}”."
                   if none_ in rows_ else "")
